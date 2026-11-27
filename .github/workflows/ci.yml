@@ -31,7 +31,8 @@ jobs:
         run: dotnet build -c Release
 
       - name: Backend tests
-        run: dotnet test -c Release --no-build
+        # Failures show up as annotations on the run (readable without downloading logs).
+        run: dotnet test -c Release --no-build --logger GitHubActions --logger "console;verbosity=normal"
 
       - name: Frontend unit tests
         working-directory: frontend
