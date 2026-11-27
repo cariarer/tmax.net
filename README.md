@@ -1,6 +1,6 @@
 # tmax.net
 
-Port of [tmax](https://github.com/cariarer/tmax) from Electron to **C# (.NET 10) + React**.
+Port of [tmax](https://github.com/InbarR/tmax) by Inbar Rotem from Electron to **C# (.NET 10) + React**.
 Runs on Windows, macOS and Linux. Building needs only the .NET SDK and Node.js — no Visual Studio, no node-gyp.
 
 ## Architecture
@@ -93,6 +93,12 @@ Known gaps:
 
 Next: an MCP server on top of `Tmax.Core`, so agents running in a tmax pane can drive tmax.
 
-## License
+## Credits and license
 
-MIT, see [LICENSE](LICENSE). Based on tmax.
+tmax.net is based on [tmax](https://github.com/InbarR/tmax) by Inbar Rotem and contributors, licensed
+under MIT. The React UI (`frontend/src/renderer`, `frontend/src/shared`) is taken from tmax largely
+unchanged; the backend was rewritten in C# following the original's behaviour.
+
+tmax.net is licensed under the MIT License, see [LICENSE](LICENSE). Third-party components shipped
+with the app and their licenses are listed in [THIRD-PARTY-NOTICES.md](THIRD-PARTY-NOTICES.md)
+(regenerate with `node scripts/generate-third-party-notices.mjs` after dependency updates).

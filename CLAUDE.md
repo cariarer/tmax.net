@@ -7,3 +7,4 @@
 - RPC channel names mirror `../tmax/src/shared/ipc-channels.ts` so the original renderer can be ported with minimal changes.
 - Never weaken the backend auth (loopback bind, per-launch token, Origin check).
 - Verify with `dotnet build`, `dotnet test` and `cd frontend && npm run test:rpc`.
+- After adding/updating npm or NuGet dependencies, regenerate THIRD-PARTY-NOTICES.md: `node scripts/generate-third-party-notices.mjs` (after `dotnet build`).
