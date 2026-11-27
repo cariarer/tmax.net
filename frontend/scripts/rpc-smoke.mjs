@@ -104,7 +104,18 @@ if (!output.includes('tmax-smoke-ok')) fail(`marker not seen; output:\n${output}
 console.log('ok  command output received');
 
 await invoke('pty:kill', 'smoke');
-ws.close();
+
+// Graceful shutdown must not hang on open connections (it did until the sockets were tied to app shutdown).
+if (process.platform !== 'win32') {
+  const exited = new Promise((resolve) => host.once('exit', resolve));
+  const closed = new Promise((resolve) => { ws.onclose = resolve; });
+  host.kill('SIGTERM');
+  const ok = await Promise.race([Promise.all([exited, closed]).then(() => true), new Promise((r) => setTimeout(() => r(false), 6000))]);
+  if (!ok) fail('backend did not shut down on SIGTERM with a client connected');
+  console.log('ok  SIGTERM shuts down and closes client connections');
+} else {
+  ws.close();
+}
 cleanup();
 console.log('PASS');
 process.exit(0);

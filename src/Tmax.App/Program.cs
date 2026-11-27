@@ -3,8 +3,8 @@ using System.Security.Cryptography;
 using System.Text;
 using Microsoft.AspNetCore.Hosting.Server;
 using Microsoft.AspNetCore.Hosting.Server.Features;
-using Photino.NET;
 using Tmax.App.Rpc;
+using Tmax.App.Windows;
 using Tmax.Core.Config;
 using Tmax.Core.Pty;
 
@@ -27,7 +27,18 @@ public static class Program
         var port = new Uri(backendUrl).Port;
 
         // The token travels in the fragment, which browsers never send over the network or into logs.
-        var uiUrl = $"{devUrl ?? backendUrl}/#port={port}&token={token}";
+        var fragment = $"port={port}&token={token}";
+        var uiUrl = $"{devUrl ?? backendUrl}/#{fragment}";
+        var windows = app.Services.GetRequiredService<WindowManager>();
+
+        // Ctrl+C / SIGTERM / host shutdown: close the window so WaitForClose returns and we exit cleanly.
+        using var sigTerm = PosixSignalRegistration.Create(PosixSignal.SIGTERM, ctx => { ctx.Cancel = true; Shutdown(); });
+        using var sigInt = PosixSignalRegistration.Create(PosixSignal.SIGINT, ctx => { ctx.Cancel = true; Shutdown(); });
+        void Shutdown()
+        {
+            if (windows.HasWindows) windows.CloseMain();
+            else app.Lifetime.StopApplication();
+        }
 
         try
         {
@@ -40,7 +51,10 @@ public static class Program
             }
             else
             {
-                RunWindow(uiUrl, devUrl is not null);
+                // Dev/test aid only: lets scripts connect to a desktop instance. Off unless explicitly set.
+                if (Environment.GetEnvironmentVariable("TMAX_PRINT_URL") == "1") Console.WriteLine($"TMAX_UI_URL={uiUrl}");
+                windows.RunMain(devUrl ?? backendUrl, fragment, devTools: devUrl is not null,
+                    iconFile: Path.Combine(AppContext.BaseDirectory, "wwwroot", "icon.png"));
             }
         }
         finally
@@ -61,6 +75,7 @@ public static class Program
         // Loopback only, OS-assigned port: nothing outside this machine can reach the terminals.
         builder.WebHost.UseUrls("http://127.0.0.1:0");
         builder.Services.AddSingleton<RpcServer>();
+        builder.Services.AddSingleton<WindowManager>();
         builder.Services.AddSingleton(_ => new ConfigStore());
         builder.Services.AddSingleton(_ => new SessionStore());
         builder.Services.AddSingleton(_ => new KeybindingsFile(AppPaths.DataDir));
@@ -87,6 +102,7 @@ public static class Program
             app.Services.GetRequiredService<KeybindingsFile>(), diag,
             app.Services.GetRequiredService<ILoggerFactory>().CreateLogger("tmax"));
         GitFileChannels.Register(rpc);
+        WindowChannels.Register(rpc, app.Services.GetRequiredService<WindowManager>());
         PendingChannels.Register(rpc);
 
         app.UseWebSockets();
@@ -96,7 +112,10 @@ public static class Program
             if (!IsAuthorized(ctx, token, devUrl)) return Results.StatusCode(StatusCodes.Status403Forbidden);
 
             using var socket = await ctx.WebSockets.AcceptWebSocketAsync();
-            await rpc.RunConnectionAsync(socket, ctx.RequestAborted);
+            // End connections when the app stops; otherwise an open window/client blocks shutdown forever.
+            using var lifetime = CancellationTokenSource.CreateLinkedTokenSource(ctx.RequestAborted,
+                ctx.RequestServices.GetRequiredService<IHostApplicationLifetime>().ApplicationStopping);
+            await rpc.RunConnectionAsync(socket, lifetime.Token);
             return Results.Empty;
         });
         app.UseDefaultFiles();
@@ -120,19 +139,6 @@ public static class Program
 
         var self = $"{ctx.Request.Scheme}://{ctx.Request.Host}";
         return origin == self || (devUrl is not null && origin == devUrl);
-    }
-
-    private static void RunWindow(string url, bool devTools)
-    {
-        var window = new PhotinoWindow()
-            .SetTitle("tmax")
-            .SetUseOsDefaultSize(false)
-            .SetSize(1280, 800)
-            .Center()
-            .SetDevToolsEnabled(devTools)
-            .SetContextMenuEnabled(devTools)
-            .Load(url);
-        window.WaitForClose();
     }
 }
 

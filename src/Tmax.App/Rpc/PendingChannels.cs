@@ -29,8 +29,7 @@ public static class PendingChannels
             "claude-code:startWatching", "claude-code:stopWatching", "ai:invalidateCaches", "ai:getSessionTimeline",
             "version:getUpdate", "version:checkNow", "version:restartAndUpdate",
             "transparency:setMaterial",
-            "backlog:getTask", "backlog:pickFolder",
-            "detach:close", "detach:focus", "backlogWindow:close");
+            "backlog:getTask", "backlog:pickFolder");
 
         Value(rpc, "", "version:getChangelog");
         Value(rpc, false, "transparency:platformSupports");
@@ -39,9 +38,6 @@ public static class PendingChannels
             "backlog:editTask", "backlog:createTask", "backlog:archiveTask", "backlog:deleteTask",
             "backlog:validateProject", "backlog:initProject", "backlog:saveImage");
 
-        // Things the user explicitly triggered: fail visibly instead of silently doing nothing.
-        Fail(rpc,
-            "detach:create", "backlogWindow:open");
     }
 
     private static void Value(RpcServer rpc, object? value, params string[] channels)

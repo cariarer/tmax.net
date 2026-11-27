@@ -66,6 +66,13 @@ public sealed class RpcServer(ILogger<RpcServer> logger)
         }
         finally
         {
+            if (socket.State == WebSocketState.Open)
+            {
+                // Tell the client we're going away (app shutdown) instead of just dropping the TCP connection.
+                using var closeTimeout = new CancellationTokenSource(TimeSpan.FromSeconds(1));
+                try { await socket.CloseOutputAsync(WebSocketCloseStatus.EndpointUnavailable, "shutting down", closeTimeout.Token); }
+                catch (Exception ex) when (ex is WebSocketException or OperationCanceledException) { }
+            }
             _clients.TryRemove(id, out _);
             outbox.Writer.TryComplete();
             await cts.CancelAsync();
