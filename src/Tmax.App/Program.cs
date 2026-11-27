@@ -63,6 +63,8 @@ public static class Program
         builder.Services.AddSingleton<RpcServer>();
         builder.Services.AddSingleton(_ => new ConfigStore());
         builder.Services.AddSingleton(_ => new SessionStore());
+        builder.Services.AddSingleton(_ => new KeybindingsFile(AppPaths.DataDir));
+        builder.Services.AddSingleton(_ => new DiagLog());
         // Spawning is limited to the shells in the config, read fresh on every spawn.
         builder.Services.AddSingleton(sp =>
         {
@@ -79,7 +81,10 @@ public static class Program
         var config = app.Services.GetRequiredService<ConfigStore>();
         PtyChannels.Register(rpc, pty);
         PlatformChannels.Register(rpc, pty);
+        var diag = app.Services.GetRequiredService<DiagLog>();
+        diag.Log("app:start", new { version = typeof(Program).Assembly.GetName().Version?.ToString(), os = Environment.OSVersion.ToString() });
         AppChannels.Register(rpc, config, app.Services.GetRequiredService<SessionStore>(),
+            app.Services.GetRequiredService<KeybindingsFile>(), diag,
             app.Services.GetRequiredService<ILoggerFactory>().CreateLogger("tmax"));
         GitFileChannels.Register(rpc);
         PendingChannels.Register(rpc);

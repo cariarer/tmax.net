@@ -10,7 +10,7 @@ namespace Tmax.App.Rpc;
 /// <summary>Config, session, keybindings, clipboard images and other small main-process handlers.</summary>
 public static class AppChannels
 {
-    public static void Register(RpcServer rpc, ConfigStore config, SessionStore session, ILogger logger)
+    public static void Register(RpcServer rpc, ConfigStore config, SessionStore session, KeybindingsFile keybindings, DiagLog diag, ILogger logger)
     {
         // ── Config ───────────────────────────────────────────────────
         rpc.Handle("config:get", (_, _) => Task.FromResult<object?>(config.GetAll()));
@@ -25,19 +25,30 @@ public static class AppChannels
             return Task.CompletedTask;
         });
 
-        // ── Keybindings (stored in the config; no separate keybindings file yet) ──
-        rpc.Handle("keybindings:get", (_, _) => Task.FromResult<object?>(config.Get("keybindings") ?? new JsonArray()));
+        // ── Keybindings (keybindings.json is authoritative; seeded from the config once) ──
+        var seed = config.Get<List<Keybinding>>("keybindings") ?? [];
+        config.Set("keybindings", JsonSerializer.SerializeToNode(keybindings.Init(seed, w => logger.LogWarning("{Warning}", w)), RpcServer.Json));
+        keybindings.Changed += bindings =>
+        {
+            var node = JsonSerializer.SerializeToNode(bindings, RpcServer.Json);
+            config.Set("keybindings", node);
+            rpc.Broadcast("keybindings:changed", node);
+        };
+        keybindings.StartWatching();
+        rpc.Handle("keybindings:get", (_, _) => Task.FromResult<object?>(keybindings.Read()));
         rpc.Handle("keybindings:openFile", (_, _) =>
         {
-            OsShell.OpenPath(config.Path);
+            OsShell.OpenPath(keybindings.Path);
             return Task.CompletedTask;
         });
         rpc.Handle("keybindings:reset", (_, _) =>
         {
-            var defaults = config.Defaults["keybindings"]?.DeepClone();
-            config.Set("keybindings", defaults);
-            rpc.Broadcast("keybindings:changed", defaults);
-            return Task.FromResult<object?>(defaults);
+            var defaults = config.Defaults["keybindings"].Deserialize<List<Keybinding>>(RpcServer.Json) ?? [];
+            var bindings = keybindings.ResetToDefaults(defaults);
+            var node = JsonSerializer.SerializeToNode(bindings, RpcServer.Json);
+            config.Set("keybindings", node);
+            rpc.Broadcast("keybindings:changed", node);
+            return Task.FromResult<object?>(bindings);
         });
 
         // ── Session ──────────────────────────────────────────────────
@@ -102,9 +113,13 @@ public static class AppChannels
         rpc.Handle("version:getAppVersion", (_, _) => Task.FromResult<object?>(version));
         rpc.Handle("diag:log", (args, _) =>
         {
-            logger.LogDebug("diag {Event} {Data}", args.Length > 0 ? args[0].ToString() : "", args.Length > 1 ? args[1].ToString() : "");
+            if (args.Length > 0 && args[0].ValueKind == JsonValueKind.String)
+                diag.Log(args[0].GetString()!, args.Length > 1 ? ToNode(args, 1) : null);
             return Task.CompletedTask;
         });
+        rpc.Handle("diag:getLogPath", (_, _) => Task.FromResult<object?>(diag.Path));
+        rpc.Handle("diag:readTail", (args, _) => Task.FromResult<object?>(diag.ReadTail(args.Opt<int?>(0) ?? 25 * 1024)));
+        rpc.Handle("system:getFonts", (_, _) => Task.Run<object?>(SystemFonts.List));
     }
 
     private static JsonNode? ToNode(JsonElement[] args, int index) =>

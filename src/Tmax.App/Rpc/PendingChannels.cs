@@ -21,9 +21,7 @@ public static class PendingChannels
             "copilot:listSessions", "copilot:searchSessions", "copilot:getPrompts", "copilot:searchPrompts",
             "copilot:getRecentPrompts", "claude-code:listSessions", "claude-code:searchSessions",
             "claude-code:getPrompts",
-            // process tree, fonts
-"system:getFonts",
-            // files, git, backlog
+            // backlog
             "backlog:listTasks");
 
         Value(rpc, null,
@@ -34,7 +32,7 @@ public static class PendingChannels
             "backlog:getTask", "backlog:pickFolder",
             "detach:close", "detach:focus", "backlogWindow:close");
 
-        Value(rpc, "", "version:getChangelog", "diag:getLogPath", "diag:readTail");
+        Value(rpc, "", "version:getChangelog");
         Value(rpc, false, "transparency:platformSupports");
 
         Value(rpc, notOk,
