@@ -9,12 +9,20 @@
     <!-- No console window on Windows; plain executable elsewhere. -->
     <OutputType Condition="$([MSBuild]::IsOSPlatform('Windows')) Or $(RuntimeIdentifier.StartsWith('win'))">WinExe</OutputType>
     <OutputType Condition="'$(OutputType)' == ''">Exe</OutputType>
+    <Version>0.1.0</Version>
+    <!-- GitHub repo whose releases the app updates from, e.g. -p:TmaxUpdateRepo=https://github.com/owner/tmax.net -->
     <FrontendDir>$(MSBuildThisFileDirectory)..\..\frontend\</FrontendDir>
   </PropertyGroup>
 
   <ItemGroup>
     <ProjectReference Include="..\Tmax.Core\Tmax.Core.csproj" />
     <PackageReference Include="Photino.NET" Version="4.0.16" />
+    <PackageReference Include="Velopack" Version="1.2.161" />
+  </ItemGroup>
+
+  <ItemGroup>
+    <AssemblyMetadata Include="TmaxUpdateRepo" Value="$(TmaxUpdateRepo)" />
+    <None Include="..\..\CHANGELOG.md" Link="CHANGELOG.md" CopyToOutputDirectory="PreserveNewest" CopyToPublishDirectory="PreserveNewest" />
   </ItemGroup>
 
   <!--

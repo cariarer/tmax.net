@@ -4,7 +4,9 @@ using System.Text;
 using Microsoft.AspNetCore.Hosting.Server;
 using Microsoft.AspNetCore.Hosting.Server.Features;
 using Tmax.App.Rpc;
+using Tmax.App.Updates;
 using Tmax.App.Windows;
+using Velopack;
 using Tmax.Core.Config;
 using Tmax.Core.Pty;
 
@@ -15,6 +17,9 @@ public static class Program
     [STAThread] // WebView2 on Windows requires an STA main thread.
     public static int Main(string[] argv)
     {
+        // Velopack install/update/uninstall hooks run here and may exit the process; must be first.
+        VelopackApp.Build().Run();
+
         var headless = argv.Contains("--headless");
         // Frontend dev server (Vite). When set, the window loads it instead of the bundled wwwroot.
         var devUrl = Environment.GetEnvironmentVariable("TMAX_DEV_URL")?.TrimEnd('/');
@@ -76,6 +81,7 @@ public static class Program
         builder.WebHost.UseUrls("http://127.0.0.1:0");
         builder.Services.AddSingleton<RpcServer>();
         builder.Services.AddSingleton<WindowManager>();
+        builder.Services.AddSingleton<UpdateService>();
         builder.Services.AddSingleton(_ => new ConfigStore());
         builder.Services.AddSingleton(_ => new SessionStore());
         builder.Services.AddSingleton(_ => new KeybindingsFile(AppPaths.DataDir));
@@ -106,6 +112,9 @@ public static class Program
         BacklogChannels.Register(rpc, app.Services.GetRequiredService<WindowManager>());
         AiSessionChannels.Register(rpc, config, app.Services.GetRequiredService<SessionStore>(), pty,
             app.Services.GetRequiredService<WindowManager>(), app.Services.GetRequiredService<ILoggerFactory>().CreateLogger("ai-sessions"));
+        var updates = app.Services.GetRequiredService<UpdateService>();
+        VersionChannels.Register(rpc, updates);
+        updates.Start();
         PendingChannels.Register(rpc);
 
         app.UseWebSockets();

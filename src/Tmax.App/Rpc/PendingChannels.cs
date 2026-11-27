@@ -13,8 +13,7 @@ public static class PendingChannels
 
     public static void Register(RpcServer rpc)
     {
-        Value(rpc, null, "version:getUpdate", "version:checkNow", "version:restartAndUpdate", "transparency:setMaterial");
-        Value(rpc, "", "version:getChangelog");
+        Value(rpc, null, "transparency:setMaterial");
         Value(rpc, false, "transparency:platformSupports");
     }
 

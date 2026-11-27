@@ -106,9 +106,6 @@ public static class AppChannels
         });
 
         // ── Misc ─────────────────────────────────────────────────────
-        var version = typeof(AppChannels).Assembly.GetCustomAttribute<AssemblyInformationalVersionAttribute>()
-            ?.InformationalVersion.Split('+')[0] ?? "0.0.0";
-        rpc.Handle("version:getAppVersion", (_, _) => Task.FromResult<object?>(version));
         rpc.Handle("diag:log", (args, _) =>
         {
             if (args.Length > 0 && args[0].ValueKind == JsonValueKind.String)
