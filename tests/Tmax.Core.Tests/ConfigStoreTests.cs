@@ -83,4 +83,15 @@ public sealed class ConfigStoreTests : IDisposable
         Assert.Equal(2, b.Load()!["tabs"]!.AsArray().Count);
         Assert.Contains("\"session\"", File.ReadAllText(path));
     }
+
+    [Fact]
+    public async Task Session_writes_are_reported()
+    {
+        using var store = new SessionStore(Path.Combine(_dir, "tmax-session.json"));
+        var changed = new TaskCompletionSource();
+        store.Watch(() => changed.TrySetResult());
+        await Task.Delay(100);
+        store.Save(JsonNode.Parse("""{ "a": 1 }"""));
+        await changed.Task.WaitAsync(TimeSpan.FromSeconds(10));
+    }
 }

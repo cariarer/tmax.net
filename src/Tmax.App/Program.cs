@@ -59,7 +59,8 @@ public static class Program
                 // Dev/test aid only: lets scripts connect to a desktop instance. Off unless explicitly set.
                 if (Environment.GetEnvironmentVariable("TMAX_PRINT_URL") == "1") Console.WriteLine($"TMAX_UI_URL={uiUrl}");
                 windows.RunMain(devUrl ?? backendUrl, fragment, devTools: devUrl is not null,
-                    iconFile: Path.Combine(AppContext.BaseDirectory, "wwwroot", "icon.png"));
+                    iconFile: Path.Combine(AppContext.BaseDirectory, "wwwroot", "icon.png"),
+                    material: app.Services.GetRequiredService<ConfigStore>().Get<string>("backgroundMaterial") ?? "none");
             }
         }
         finally
@@ -108,14 +109,13 @@ public static class Program
             app.Services.GetRequiredService<KeybindingsFile>(), diag,
             app.Services.GetRequiredService<ILoggerFactory>().CreateLogger("tmax"));
         GitFileChannels.Register(rpc);
-        WindowChannels.Register(rpc, app.Services.GetRequiredService<WindowManager>());
+        WindowChannels.Register(rpc, app.Services.GetRequiredService<WindowManager>(), config);
         BacklogChannels.Register(rpc, app.Services.GetRequiredService<WindowManager>());
         AiSessionChannels.Register(rpc, config, app.Services.GetRequiredService<SessionStore>(), pty,
             app.Services.GetRequiredService<WindowManager>(), app.Services.GetRequiredService<ILoggerFactory>().CreateLogger("ai-sessions"));
         var updates = app.Services.GetRequiredService<UpdateService>();
         VersionChannels.Register(rpc, updates);
         updates.Start();
-        PendingChannels.Register(rpc);
 
         app.UseWebSockets();
         app.Map("/ws", async (HttpContext ctx) =>

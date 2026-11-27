@@ -34,6 +34,15 @@
     that exist at evaluation time and rejects ones injected later.
   -->
   <Target Name="BuildFrontend" AfterTargets="Build" Condition="'$(SkipFrontend)' != 'true'">
+    <Exec Command="node --version" ConsoleToMSBuild="true" StandardOutputImportance="low" IgnoreExitCode="true">
+      <Output TaskParameter="ConsoleOutput" PropertyName="_NodeVersion" />
+      <Output TaskParameter="ExitCode" PropertyName="_NodeExit" />
+    </Exec>
+    <PropertyGroup>
+      <_NodeMajor Condition="'$(_NodeExit)' == '0'">$([System.Text.RegularExpressions.Regex]::Match('$(_NodeVersion)', '\d+').Value)</_NodeMajor>
+    </PropertyGroup>
+    <Error Condition="'$(_NodeExit)' != '0'" Text="Node.js was not found on PATH. The frontend needs Node.js 20 or newer (or build with -p:SkipFrontend=true)." />
+    <Error Condition="'$(_NodeExit)' == '0' And $(_NodeMajor) &lt; 20" Text="Node.js $(_NodeVersion) is too old; the frontend needs Node.js 20 or newer (e.g. 'nvm use 22')." />
     <Exec Command="npm ci --no-audit --no-fund" WorkingDirectory="$(FrontendDir)" Condition="!Exists('$(FrontendDir)node_modules')" />
     <Exec Command="npm run build" WorkingDirectory="$(FrontendDir)" />
     <ItemGroup>

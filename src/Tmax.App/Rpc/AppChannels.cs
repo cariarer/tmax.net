@@ -59,6 +59,7 @@ public static class AppChannels
             return Task.CompletedTask;
         });
         rpc.Handle("session:load", (_, _) => Task.FromResult<object?>(noRestore ? null : session.Load()));
+        if (!noRestore) session.Watch(() => rpc.Broadcast("session:fileChanged"));
 
         // ── Shell ────────────────────────────────────────────────────
         rpc.Handle("shell:openPath", (args, _) =>

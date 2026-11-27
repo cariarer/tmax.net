@@ -24,9 +24,24 @@ public sealed class WindowManager(RpcServer rpc, ILogger<WindowManager> logger)
 
     public bool HasWindows => _main is not null;
 
-    /// <summary>Creates the main window and blocks until it is closed.</summary>
-    public void RunMain(string baseUrl, string fragment, bool devTools, string? iconFile)
+    /// <summary>Current backdrop material (Windows 11); applied to every window when it is created.</summary>
+    public string Material { get; private set; } = "none";
+
+    public void SetMaterial(string material)
     {
+        Material = material;
+        OnUi(() =>
+        {
+            if (_main is not null) WindowMaterial.Apply(_main.WindowHandle, material);
+            foreach (var w in _children.Values) WindowMaterial.Apply(w.WindowHandle, material);
+        });
+    }
+
+    /// <summary>Creates the main window and blocks until it is closed.</summary>
+    public void RunMain(string baseUrl, string fragment, bool devTools, string? iconFile, string material)
+    {
+        Material = material;
+        WindowMaterial.PrepareWebView(material);
         _baseUrl = baseUrl;
         _fragment = fragment;
         _devTools = devTools;
@@ -125,6 +140,9 @@ public sealed class WindowManager(RpcServer rpc, ILogger<WindowManager> logger)
             // navigator.clipboard (paste/copy in the terminal) needs this in WebKitGTK/WebView2.
             .SetJavascriptClipboardAccessEnabled(true);
         if (!string.IsNullOrEmpty(iconFile) && File.Exists(iconFile)) w.SetIconFile(iconFile);
+        w.WindowCreated += (_, _) => WindowMaterial.Apply(w.WindowHandle, Material);
+        w.WindowMaximized += (_, _) => WindowMaterial.Apply(w.WindowHandle, Material);
+        w.WindowRestored += (_, _) => WindowMaterial.Apply(w.WindowHandle, Material);
         return w;
     }
 
