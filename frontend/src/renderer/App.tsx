@@ -1,0 +1,380 @@
+import React, { useEffect, useState, useMemo } from 'react';
+import {
+  DndContext,
+  DragOverlay,
+  pointerWithin,
+} from '@dnd-kit/core';
+import { useTerminalStore, getEffectiveCwd, findSessionById, getSessionProvider } from './state/terminal-store';
+import { getTerminalDisplayTitle } from './state/types';
+import { subscribeToExternalTitles } from './utils/external-title-listener';
+import { getTerminalEntry } from './terminal-registry';
+import { applyChromeFromTheme } from './utils/theme-presets';
+import type { CopilotSessionSummary } from '../shared/copilot-types';
+import { useKeybindings } from './hooks/useKeybindings';
+import { useDragTerminal } from './hooks/useDragTerminal';
+import TabBar from './components/TabBar';
+import WorkspaceTabBar from './components/WorkspaceTabBar';
+import TilingLayout from './components/TilingLayout';
+import FloatingLayer from './components/FloatingLayer';
+import DropZoneOverlay from './components/DropZoneOverlay';
+import TerminalSwitcher from './components/TerminalSwitcher';
+import PromptSearchDialog from './components/PromptSearchDialog';
+import PaneHintOverlay from './components/PaneHintOverlay';
+import StatusBar from './components/StatusBar';
+import ShortcutsHelp from './components/ShortcutsHelp';
+import Settings from './components/Settings';
+import BacklogBoard from './components/BacklogBoard';
+import CommandPalette from './components/CommandPalette';
+import DirPanel from './components/DirPanel';
+import CopilotPanel from './components/CopilotPanel';
+import WorktreePanel from './components/WorktreePanel';
+import DiffReview from './components/DiffReview';
+import FileExplorer from './components/FileExplorer';
+import FloatingRenameInput from './components/FloatingRenameInput';
+import Toast from './components/Toast';
+import SessionSummary from './components/SessionSummary';
+import PromptComposer from './components/PromptComposer';
+import MarkdownPreviewOverlay from './components/MarkdownPreviewOverlay';
+import TranscriptPanel from './components/TranscriptPanel';
+import AppDialogHost from './components/AppDialog';
+
+const App: React.FC = () => {
+  const loadConfig = useTerminalStore((s) => s.loadConfig);
+  const createTerminal = useTerminalStore((s) => s.createTerminal);
+  const terminals = useTerminalStore((s) => s.terminals);
+  const draggedTerminalId = useTerminalStore((s) => s.draggedTerminalId);
+  const showShortcuts = useTerminalStore((s) => s.showShortcuts);
+  const broadcastMode = useTerminalStore((s) => s.broadcastMode);
+  // Apply chrome CSS variables whenever the xterm theme changes - keeps the
+  // tab bar / status bar / sidebar in sync with the active preset (TASK-149).
+  const themeColors = useTerminalStore((s) => s.config?.theme);
+  useEffect(() => {
+    if (themeColors) applyChromeFromTheme(themeColors as unknown as Record<string, string>);
+  }, [themeColors]);
+
+  // Toggle a body class so CSS can add a red outline to all terminal panes
+  // while broadcast is on.
+  useEffect(() => {
+    document.body.classList.toggle('broadcast-on', broadcastMode);
+  }, [broadcastMode]);
+
+  // External titles (TMAX_TITLE_FILE) rename the pane; the focused pane's
+  // external title also becomes the window title.
+  useEffect(subscribeToExternalTitles, []);
+  const focusedExternalTitle = useTerminalStore((s) =>
+    s.focusedTerminalId ? s.terminals.get(s.focusedTerminalId)?.externalTitle : undefined);
+  useEffect(() => {
+    document.title = focusedExternalTitle ? `${focusedExternalTitle} - tmax` : 'tmax';
+  }, [focusedExternalTitle]);
+
+  // Self-heal grid-mode layouts whenever the terminals map changes. If any
+  // code path added a tiled terminal without inserting it into tilingRoot,
+  // this catches the orphan on the next tick and rebuilds the grid so all
+  // panes render. The action is a no-op when viewMode !== 'grid' or when
+  // the tree already matches the map.
+  useEffect(() => {
+    useTerminalStore.getState().reconcileGridLayout();
+  }, [terminals]);
+  const showCommandPalette = useTerminalStore((s) => s.showCommandPalette);
+  const tabBarPosition = useTerminalStore((s) => s.tabBarPosition);
+  const hideTabBar = useTerminalStore((s) => s.hideTabTitles);
+  // Pick the tab-bar variant based on config.tabMode (TASK-40).
+  const tabMode = useTerminalStore((s) => s.config?.tabMode) ?? 'flat';
+  const TopBar = tabMode === 'workspaces' ? WorkspaceTabBar : TabBar;
+
+  // TASK-140: keep the global windowFocused flag in sync with OS focus.
+  // Per-pane shimmer logic lives in TerminalPanel and reads this flag.
+  useEffect(() => {
+    const sync = () => useTerminalStore.setState({ windowFocused: document.hasFocus() });
+    // Re-read on mount in case the store's module-load value was stale (the
+    // window may have gained focus before this effect attached its listeners).
+    sync();
+    const onFocus = () => useTerminalStore.setState({ windowFocused: true });
+    const onBlur = () => useTerminalStore.setState({ windowFocused: false });
+    window.addEventListener('focus', onFocus);
+    window.addEventListener('blur', onBlur);
+    document.addEventListener('visibilitychange', sync);
+    return () => {
+      window.removeEventListener('focus', onFocus);
+      window.removeEventListener('blur', onBlur);
+      document.removeEventListener('visibilitychange', sync);
+    };
+  }, []);
+
+  useKeybindings();
+
+  const {
+    activeId,
+    handleDragStart,
+    handleDragOver,
+    handleDragEnd,
+    handleDragCancel,
+    sensors,
+  } = useDragTerminal();
+
+  useEffect(() => {
+    let cancelled = false;
+    async function init() {
+      try {
+        await loadConfig();
+        if (cancelled) return;
+        // Restore session FIRST — terminal panes use the serialized
+        // startupCommand directly and don't need the AI session lists.
+        // Loading AI sessions (which scans hundreds of JSONL files) is
+        // deferred to run in parallel so the window appears with its
+        // terminals immediately instead of blocking on disk I/O.
+        if (useTerminalStore.getState().terminals.size === 0) {
+          await useTerminalStore.getState().restoreSession();
+          if (cancelled) return;
+        }
+        // Always land on a non-empty window - if nothing restored (first run,
+        // or user closed all terminals before quitting), auto-spawn a default
+        // terminal. Matches Windows Terminal / iTerm / Ghostty behavior.
+        if (useTerminalStore.getState().terminals.size === 0) {
+          await createTerminal();
+        }
+        // Load AI session lists after terminals are visible. These populate
+        // the CopilotPanel sidebar and enable checkStaleActiveSessions but
+        // are not needed for the initial terminal restore.
+        await Promise.all([
+          useTerminalStore.getState().loadCopilotSessions(),
+          useTerminalStore.getState().loadClaudeCodeSessions(),
+        ]);
+        if (cancelled) return;
+        // Check for stale active sessions (>30 days) after hydration
+        useTerminalStore.getState().checkStaleActiveSessions();
+      } catch (err) {
+        console.error('Init failed:', err);
+      } finally {
+        // TASK-117: always clear the loading flag so a thrown init doesn't
+        // leave the loading indicator on screen forever. restoreSession's
+        // own finally also clears it; this guards against early throws
+        // (loadConfig, AI-session loaders) before restoreSession is reached.
+        if (!cancelled) {
+          useTerminalStore.setState({ isRestoring: false });
+        }
+      }
+    }
+    init();
+
+    (window as any).__terminalStore = useTerminalStore;
+    (window as any).__getTerminalEntry = getTerminalEntry;
+    // Exposed for e2e tests so specs can exercise the real helper from a
+    // browser context (where ESM/CJS require() is unavailable).
+    (window as any).__getEffectiveCwd = getEffectiveCwd;
+    (window as any).__findSessionById = findSessionById;
+    (window as any).__getSessionProvider = getSessionProvider;
+
+    // Ctrl+wheel (Cmd+wheel on Mac): zoom the terminal font instead of letting
+    // Chromium do its CSS page-zoom. preventDefault MUST happen before the
+    // store call or Chromium will scale everything alongside us.
+    const handleGlobalWheel = (e: WheelEvent) => {
+      if (!(e.ctrlKey || e.metaKey)) return;
+      e.preventDefault();
+      const store = useTerminalStore.getState();
+      if (e.deltaY < 0) store.zoomIn();
+      else if (e.deltaY > 0) store.zoomOut();
+    };
+    document.addEventListener('wheel', handleGlobalWheel, { passive: false });
+
+    // The shell is a fixed, full-screen, overflow:hidden layout that must never
+    // scroll. But a focus()/scrollIntoView() on a descendant (xterm's hidden
+    // textarea is the classic culprit) can still nudge #root / body / html by a
+    // few px - and with no scrollbar that offset sticks forever, slicing the
+    // top of the UI off-screen. Snap any such scroll straight back to 0.
+    const scrollTargets = [document.getElementById('root'), document.body, document.documentElement]
+      .filter((el): el is HTMLElement => !!el);
+    const resetRootScroll = () => {
+      for (const t of scrollTargets) {
+        if (t.scrollTop !== 0) t.scrollTop = 0;
+        if (t.scrollLeft !== 0) t.scrollLeft = 0;
+      }
+    };
+    resetRootScroll();
+    for (const t of scrollTargets) t.addEventListener('scroll', resetRootScroll, { passive: true });
+
+    // Save session before window closes
+    const handleBeforeUnload = () => {
+      useTerminalStore.getState().saveSession();
+    };
+    window.addEventListener('beforeunload', handleBeforeUnload);
+
+    // Auto-save session every 5 seconds (crash recovery)
+    const autoSaveInterval = setInterval(() => {
+      if (useTerminalStore.getState().terminals.size > 0) {
+        useTerminalStore.getState().saveSession();
+      }
+    }, 5000);
+
+    // Renderer heartbeat — logs every 30s so we can detect renderer freezes
+    // vs machine sleep in diagnostic logs.
+    let heartbeatSeq = 0;
+    const heartbeatInterval = setInterval(() => {
+      const s = useTerminalStore.getState();
+      window.terminalAPI.diagLog('renderer:heartbeat', {
+        seq: ++heartbeatSeq,
+        terminals: s.terminals.size,
+        focused: s.focusedTerminalId ?? 'none',
+      });
+    }, 30000);
+
+    // Listen for detached windows being closed
+    const unsubDetached = window.terminalAPI.onDetachedClosed?.((id: string) => {
+      useTerminalStore.getState().reattachTerminal(id);
+    });
+
+    // TASK-163: when another tmax window writes to tmax-session.json, main
+    // sends a SESSION_FILE_CHANGED ping. Re-hydrate just the cross-window
+    // syncable maps so renames / archives / pins from window A appear in
+    // window B without a restart. The store's own-write ignore guard
+    // suppresses the echo from our own saveSession.
+    let pendingReloadTimer: ReturnType<typeof setTimeout> | null = null;
+    const unsubSessionFile = (window.terminalAPI as any).onSessionFileChanged?.(() => {
+      if (pendingReloadTimer) clearTimeout(pendingReloadTimer);
+      pendingReloadTimer = setTimeout(() => {
+        pendingReloadTimer = null;
+        try {
+          useTerminalStore.getState().reloadSessionSyncMaps?.();
+        } catch (err) {
+          console.warn('[session-sync] reload failed:', err);
+        }
+      }, 150);
+    });
+
+    // Periodic stale session check (every 6 hours)
+    const staleCheckInterval = setInterval(() => {
+      useTerminalStore.getState().checkStaleActiveSessions();
+    }, 6 * 60 * 60 * 1000);
+
+    return () => {
+      cancelled = true;
+      document.removeEventListener('wheel', handleGlobalWheel);
+      for (const t of scrollTargets) t.removeEventListener('scroll', resetRootScroll);
+      window.removeEventListener('beforeunload', handleBeforeUnload);
+      clearInterval(autoSaveInterval);
+      clearInterval(heartbeatInterval);
+      clearInterval(staleCheckInterval);
+      unsubDetached?.();
+      unsubSessionFile?.();
+      if (pendingReloadTimer) clearTimeout(pendingReloadTimer);
+    };
+  }, []); // eslint-disable-line react-hooks/exhaustive-deps
+
+  // Always watch AI sessions so tab titles update even when the panel is closed
+  useEffect(() => {
+    const api = window.terminalAPI as any;
+    api.startCopilotWatching?.();
+    api.startClaudeCodeWatching?.();
+
+    const store = useTerminalStore.getState;
+
+    // OS-level notifications are fired from main (copilot-notification.ts)
+    // on the same status transitions, so an in-app toast on top of that is
+    // just duplicate noise. The renderer just mirrors the session state.
+
+    const unsubCopilotUpdated = api.onCopilotSessionUpdated?.((session: CopilotSessionSummary) => {
+      store().updateCopilotSession(session);
+    });
+    const unsubCopilotAdded = api.onCopilotSessionAdded?.((session: CopilotSessionSummary) => {
+      store().addCopilotSession(session);
+    });
+    const unsubCopilotRemoved = api.onCopilotSessionRemoved?.((sessionId: string) => {
+      store().removeCopilotSession(sessionId);
+    });
+    const unsubClaudeUpdated = api.onClaudeCodeSessionUpdated?.((session: CopilotSessionSummary) => {
+      store().updateClaudeCodeSession(session);
+    });
+    const unsubClaudeAdded = api.onClaudeCodeSessionAdded?.((session: CopilotSessionSummary) => {
+      store().addClaudeCodeSession(session);
+    });
+    const unsubClaudeRemoved = api.onClaudeCodeSessionRemoved?.((sessionId: string) => {
+      store().removeClaudeCodeSession(sessionId);
+    });
+
+    // Hot-reload keybindings when the user edits keybindings.json on disk.
+    // The main process watches the file and pushes new bindings here. We
+    // patch the in-memory config directly (NOT updateConfig - that would
+    // round-trip back to disk and re-fire the watcher in a loop).
+    // useKeybindings reads config.keybindings on its next render. (TASK-39)
+    const unsubKeybindings = api.onKeybindingsChanged?.((bindings: { key: string; action: string }[]) => {
+      const current = store().config;
+      if (!current) return;
+      useTerminalStore.setState({ config: { ...current, keybindings: bindings } });
+      store().addToast('Keybindings reloaded');
+    });
+
+    return () => {
+      api.stopCopilotWatching?.();
+      api.stopClaudeCodeWatching?.();
+      unsubCopilotUpdated?.();
+      unsubCopilotAdded?.();
+      unsubCopilotRemoved?.();
+      unsubClaudeUpdated?.();
+      unsubClaudeAdded?.();
+      unsubClaudeRemoved?.();
+      unsubKeybindings?.();
+    };
+  }, []);
+
+  const draggedTerminal = draggedTerminalId
+    ? terminals.get(draggedTerminalId)
+    : null;
+
+  return (
+    <DndContext
+      sensors={sensors}
+      collisionDetection={pointerWithin}
+      onDragStart={handleDragStart}
+      onDragOver={handleDragOver}
+      onDragEnd={handleDragEnd}
+      onDragCancel={handleDragCancel}
+    >
+      <div className={`app-shell tab-bar-${tabBarPosition}`}>
+        {!hideTabBar && tabBarPosition === 'top' && <TopBar />}
+        <div className="content-row">
+          {!hideTabBar && tabBarPosition === 'left' && <TopBar vertical />}
+          <div className="main-area">
+            <DirPanel />
+            <CopilotPanel />
+            <WorktreePanel />
+            <FileExplorer />
+            <BacklogBoard />
+            <div className="layout-area">
+              <TilingLayout />
+              <FloatingLayer />
+            <DragOverlay>
+              {activeId && draggedTerminal ? (
+                <div className="drag-overlay-tab">
+                  {getTerminalDisplayTitle(draggedTerminal)}
+                </div>
+              ) : null}
+            </DragOverlay>
+              <DropZoneOverlay />
+            </div>
+            <TranscriptPanel />
+          </div>
+          {!hideTabBar && tabBarPosition === 'right' && <TopBar vertical side="right" />}
+        </div>
+        {!hideTabBar && tabBarPosition === 'bottom' && <TopBar />}
+        <StatusBar />
+        <TerminalSwitcher />
+        <PromptSearchDialog />
+        <PaneHintOverlay />
+        <CommandPalette />
+        <Settings />
+        {showShortcuts && (
+          <ShortcutsHelp onClose={() => useTerminalStore.getState().toggleShortcuts()} />
+        )}
+        <DiffReview />
+        <FloatingRenameInput />
+        <SessionSummary />
+        <PromptComposer />
+        <MarkdownPreviewOverlay />
+        <Toast />
+        <AppDialogHost />
+      </div>
+    </DndContext>
+  );
+};
+
+export default App;

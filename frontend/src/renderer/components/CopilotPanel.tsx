@@ -1,0 +1,1752 @@
+import React, { useState, useEffect, useRef, useCallback, useMemo } from 'react';
+import ReactDOM from 'react-dom';
+import { useTerminalStore } from '../state/terminal-store';
+import { getTerminalEntry } from '../terminal-registry';
+import { runJumpToPromptSearch } from '../utils/jump-to-prompt';
+import { renderWithMdLinks } from '../utils/md-link-parser';
+import { tokenizeAnd, matchesAllTokens } from '../../shared/and-filter';
+import type { CopilotSessionSummary, CopilotSessionStatus, SessionProvider, SessionLifecycle } from '../../shared/copilot-types';
+import { detectSessionHost, stripClawpilotContext } from '../../shared/copilot-types';
+
+const MIN_WIDTH = 180;
+const MAX_WIDTH = 600;
+const DEFAULT_WIDTH = 300;
+
+const STATUS_COLORS: Record<CopilotSessionStatus, string> = {
+  idle: '#a6adc8',
+  thinking: '#89b4fa',
+  executingTool: '#f9e2af',
+  awaitingApproval: '#f38ba8',
+  waitingForUser: '#a6e3a1',
+};
+
+const STATUS_LABELS: Record<CopilotSessionStatus, string> = {
+  idle: 'Idle',
+  thinking: 'Thinking',
+  executingTool: 'Running tool',
+  awaitingApproval: 'Needs approval',
+  waitingForUser: 'Waiting for input',
+};
+
+type FilterTab = 'all' | 'copilot' | 'claude-code';
+type LifecycleTab = 'active' | 'completed' | 'old';
+type SortColumn = 'title' | 'activity' | 'prompts';
+type SortDir = 'asc' | 'desc';
+type SortMode =
+  | 'title-asc' | 'title-desc'
+  | 'time-desc' | 'time-asc'
+  | 'prompts-desc' | 'prompts-asc';
+function sortModeToColumn(mode: SortMode): SortColumn {
+  if (mode === 'title-asc' || mode === 'title-desc') return 'title';
+  if (mode === 'prompts-asc' || mode === 'prompts-desc') return 'prompts';
+  return 'activity';
+}
+function sortModeToDir(mode: SortMode): SortDir {
+  return mode.endsWith('-asc') ? 'asc' : 'desc';
+}
+function columnDefault(col: SortColumn): SortMode {
+  if (col === 'title') return 'title-asc';
+  if (col === 'prompts') return 'prompts-desc';
+  return 'time-desc';
+}
+function flipMode(mode: SortMode): SortMode {
+  return (sortModeToDir(mode) === 'asc'
+    ? mode.replace('-asc', '-desc')
+    : mode.replace('-desc', '-asc')) as SortMode;
+}
+
+function isActiveStatus(status: CopilotSessionStatus): boolean {
+  return status !== 'idle';
+}
+
+// A session is considered "running" only if recently active too.
+const RUNNING_RECENT_MS = 30_000;
+
+// TASK-220 (revised): A session counts as "running" when its status is non-idle
+// AND it's actually live. "Live" means either backed by an open pane in tmax
+// (id in openSessionIds) OR it has emitted activity in the last RUNNING_RECENT_MS.
+// The recency clause matters because a genuinely-running session can be tagged
+// <synthetic> (reconstructed from logs, not spawned by tmax) yet still be active
+// - the original open-only check wrongly hid those. The recency window keeps a
+// stale last-log 'thinking' status (activity minutes ago) from reading as live.
+function isRunning(
+  session: { id: string; status: CopilotSessionStatus; lastActivityTime?: number },
+  openSessionIds: Set<string>,
+): boolean {
+  if (!isActiveStatus(session.status)) return false;
+  if (openSessionIds.has(session.id)) return true;
+  return !!session.lastActivityTime && Date.now() - session.lastActivityTime < RUNNING_RECENT_MS;
+}
+
+function relativeTime(ts: number): string {
+  if (!ts) return '';
+  const diff = Math.floor((Date.now() - ts) / 1000);
+  if (diff < 5) return 'now';
+  if (diff < 60) return `${diff}s`;
+  if (diff < 3600) return `${Math.floor(diff / 60)}m`;
+  if (diff < 86400) return `${Math.floor(diff / 3600)}h`;
+  return `${Math.floor(diff / 86400)}d`;
+}
+
+function shortPath(p: string): string {
+  if (!p) return '';
+  const parts = p.replace(/[/\\]+$/, '').split(/[/\\]/);
+  return parts[parts.length - 1] || p;
+}
+
+// TASK-163: build a cwd → display-label map for the sessions list, where
+// colliding leaves expand to the shortest unique suffix path. e.g. given
+//   C:\projects\Clawpilot
+//   C:\Users\me\Documents\Clawpilot
+//   C:\projects\tmax
+// the map returns:
+//   C:\projects\Clawpilot              -> "projects\Clawpilot"
+//   C:\Users\me\Documents\Clawpilot    -> "Documents\Clawpilot"
+//   C:\projects\tmax                   -> "tmax"
+// Case-folded comparison so the Windows-style "Clawpilot" vs "clawpilot"
+// collision still collapses (they're the same folder on Windows).
+function buildCwdDisambig(cwds: ReadonlyArray<string | undefined>): Map<string, string> {
+  const partsOf = (cwd: string) => cwd.replace(/[/\\]+$/, '').split(/[/\\]/).filter(Boolean);
+  const unique = new Set<string>();
+  for (const c of cwds) { if (c) unique.add(c); }
+  const cwdParts = new Map<string, string[]>();
+  for (const cwd of unique) cwdParts.set(cwd, partsOf(cwd));
+
+  const result = new Map<string, string>();
+  for (const cwd of unique) {
+    const parts = cwdParts.get(cwd)!;
+    const cwdLower = cwd.toLowerCase();
+    let chosen: string | null = null;
+    for (let n = 1; n <= parts.length; n++) {
+      const suffix = parts.slice(parts.length - n).join('\\');
+      const suffixLower = suffix.toLowerCase();
+      let conflict = false;
+      for (const [other, otherParts] of cwdParts) {
+        if (other.toLowerCase() === cwdLower) continue;
+        const otherSuffix = otherParts.slice(Math.max(0, otherParts.length - n)).join('\\').toLowerCase();
+        if (otherSuffix === suffixLower) { conflict = true; break; }
+      }
+      if (!conflict) { chosen = suffix; break; }
+    }
+    result.set(cwd, chosen ?? parts.join('\\'));
+  }
+  return result;
+}
+
+// Treat session summaries as missing when they're pure structural noise.
+// AI providers occasionally emit summaries like "|-" (a tree-render
+// artifact when the first response was think-only / cancelled), single
+// punctuation, or all-whitespace. These look worse in the sidebar than
+// the cwd/id fallback, so filter them out at the title step. (TASK-31)
+function isMeaninglessSummary(summary: string): boolean {
+  const trimmed = summary.trim();
+  if (trimmed.length < 3) return true;
+  // Strip common Markdown / tree-rendering noise and check what's left.
+  const stripped = trimmed.replace(/[|\-_*`#>~—–\s]/g, '');
+  return stripped.length === 0;
+}
+
+function getTitle(s: CopilotSessionSummary): string {
+  if (s.summary && !isMeaninglessSummary(s.summary)) {
+    // Strip ClawPilot's prompt preamble so it doesn't dominate the title.
+    return stripClawpilotContext(s.summary) || s.summary;
+  }
+  if (s.cwd) return shortPath(s.cwd);
+  if (s.repository) return shortPath(s.repository);
+  return s.id.slice(0, 8);
+}
+
+function getSubtitle(s: CopilotSessionSummary): string | null {
+  if (s.summary && !isMeaninglessSummary(s.summary) && s.cwd) return shortPath(s.cwd);
+  return null;
+}
+
+function sortSessions(
+  sessions: CopilotSessionSummary[],
+  openSessionIds: Set<string>,
+  pinned: Record<string, true>,
+  sortMode: SortMode = 'time-desc',
+): CopilotSessionSummary[] {
+  return [...sessions].sort((a, b) => {
+    // Pinned sessions float to the top regardless of sort mode.
+    const aPin = pinned[a.id] ? 1 : 0;
+    const bPin = pinned[b.id] ? 1 : 0;
+    if (aPin !== bPin) return bPin - aPin;
+    // Running (non-idle AND live in tmax) sessions float above the rest so
+    // active work is always visible at the top of the list. Synthetic /
+    // log-only sessions (not open in tmax) never count as running here.
+    const aActive = isRunning(a, openSessionIds) ? 1 : 0;
+    const bActive = isRunning(b, openSessionIds) ? 1 : 0;
+    if (aActive !== bActive) return bActive - aActive;
+    if (sortMode === 'time-desc') {
+      // Smart-sort behavior carried over from the old 'activity' mode:
+      // sessions open in tmax float above non-open ones at the same activity
+      // tier so the user's working set stays glued to the top of newest-first.
+      const aOpen = openSessionIds.has(a.id) ? 1 : 0;
+      const bOpen = openSessionIds.has(b.id) ? 1 : 0;
+      if (aOpen !== bOpen) return bOpen - aOpen;
+      return (b.lastActivityTime || 0) - (a.lastActivityTime || 0);
+    }
+    if (sortMode === 'time-asc') {
+      const at = a.lastActivityTime || 0;
+      const bt = b.lastActivityTime || 0;
+      return at - bt;
+    }
+    if (sortMode === 'prompts-desc' || sortMode === 'prompts-asc') {
+      const ap = a.messageCount || 0;
+      const bp = b.messageCount || 0;
+      if (ap !== bp) return sortMode === 'prompts-desc' ? bp - ap : ap - bp;
+      // Tie-break by recency so equal-count sessions remain meaningfully ordered.
+      return (b.lastActivityTime || 0) - (a.lastActivityTime || 0);
+    }
+    // title-asc / title-desc
+    const atitle = getTitle(a);
+    const btitle = getTitle(b);
+    const cmp = atitle.localeCompare(btitle, undefined, { sensitivity: 'base' });
+    if (cmp !== 0) return sortMode === 'title-asc' ? cmp : -cmp;
+    return (b.lastActivityTime || 0) - (a.lastActivityTime || 0);
+  });
+}
+
+const PROVIDER_LABEL: Record<SessionProvider, string> = {
+  copilot: 'Copilot',
+  'claude-code': 'Claude',
+};
+
+const CopilotPanel: React.FC = () => {
+  const show = useTerminalStore((s) => s.showCopilotPanel);
+  const copilotSessions = useTerminalStore((s) => s.copilotSessions);
+  const claudeCodeSessions = useTerminalStore((s) => s.claudeCodeSessions);
+  const terminals = useTerminalStore((s) => s.terminals);
+  const summaryOverrides = useTerminalStore((s) => s.sessionNameOverrides);
+  const lifecycleOverrides = useTerminalStore((s) => s.sessionLifecycleOverrides);
+  const pinnedSessions = useTerminalStore((s) => s.sessionPinned);
+  const focusedTerminalId = useTerminalStore((s) => s.focusedTerminalId);
+  const aiSessionHighlightRequest = useTerminalStore((s) => s.aiSessionHighlightRequest);
+  const prevFocusedIdRef = useRef<string | null>(null);
+  const prevHighlightRequestRef = useRef<number>(0);
+  const pendingHighlightRef = useRef<string | null>(null);
+  // TASK-166: transient flash applied to the row when 'Show in AI sessions'
+  // fires programmatically, so the user gets a distinct cue from a normal
+  // click-selection (which also adds .selected).
+  const [flashedSessionId, setFlashedSessionId] = useState<string | null>(null);
+  const flashTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null);
+
+  // Track which AI session IDs have open terminals
+  const openSessionIds = useMemo(() => {
+    const ids = new Set<string>();
+    for (const [, t] of terminals) {
+      if (t.aiSessionId) ids.add(t.aiSessionId);
+    }
+    return ids;
+  }, [terminals]);
+
+  // TASK-36: the AI session bound to the currently focused pane. Rendered
+  // with a distinct `pane-active` class so mouse hover (which mutates
+  // selectedIndex) can no longer stomp the "this is the running pane"
+  // highlight.
+  const activePaneSessionId = useMemo(() => {
+    if (!focusedTerminalId) return null;
+    return terminals.get(focusedTerminalId)?.aiSessionId ?? null;
+  }, [focusedTerminalId, terminals]);
+
+  // Map AI session id -> pane color so list items can mirror the pane's color
+  const tabGroups = useTerminalStore((s) => s.tabGroups);
+  const defaultTabColor = useTerminalStore((s) => (s.config as any)?.defaultTabColor);
+  const sessionColors = useMemo(() => {
+    const m = new Map<string, string>();
+    for (const [, t] of terminals) {
+      if (!t.aiSessionId) continue;
+      const groupColor = t.groupId ? tabGroups.get(t.groupId)?.color : undefined;
+      const color = groupColor || t.tabColor || defaultTabColor;
+      if (color) m.set(t.aiSessionId, color);
+    }
+    return m;
+  }, [terminals, tabGroups, defaultTabColor]);
+  const copilotSessionsTotal = useTerminalStore((s) => s.copilotSessionsTotal);
+  const claudeCodeSessionsTotal = useTerminalStore((s) => s.claudeCodeSessionsTotal);
+  const copilotSearching = useTerminalStore((s) => s.copilotSearching);
+  const copilotSqliteActive = useTerminalStore((s) => s.copilotSqliteActive);
+  const [loadingMore, setLoadingMore] = useState(false);
+  const [renderLimit, setRenderLimit] = useState(200);
+
+  const totalLoaded = copilotSessions.length + claudeCodeSessions.length;
+  const totalEligible = copilotSessionsTotal + claudeCodeSessionsTotal;
+  const hasMore = totalEligible > totalLoaded;
+
+  const handleLoadMore = async () => {
+    setLoadingMore(true);
+    try { await useTerminalStore.getState().loadMoreSessions(100); } finally { setLoadingMore(false); }
+  };
+  const handleLoadAll = async () => {
+    if (totalEligible > 1000) {
+      const ok = confirm(`Loading all ${totalEligible.toLocaleString()} sessions may use significant memory. Continue?`);
+      if (!ok) return;
+    }
+    setLoadingMore(true);
+    try { await useTerminalStore.getState().loadAllSessions(); } finally { setLoadingMore(false); }
+  };
+
+  const [query, setQuery] = useState('');
+  const [selectedIndex, setSelectedIndex] = useState(0);
+  const [selectedSessionIds, setSelectedSessionIds] = useState<Set<string>>(new Set());
+  const [width, setWidth] = useState(DEFAULT_WIDTH);
+  const [resizing, setResizing] = useState(false);
+  const [filterTab, setFilterTab] = useState<FilterTab>('all');
+  const [lifecycleTab, setLifecycleTab] = useState<LifecycleTab>('active');
+  const [ctxMenu, setCtxMenu] = useState<{ x: number; y: number; session: CopilotSessionSummary } | null>(null);
+  const [renaming, setRenaming] = useState<{ id: string; provider: SessionProvider; value: string } | null>(null);
+  const [promptsDialog, setPromptsDialog] = useState<{ title: string; prompts: string[]; terminalId: string | null; scrollToIndex?: number } | null>(null);
+  const [showRunningOnly, setShowRunningOnly] = useState(false);
+  // Header overflow menu (⋯) + the cleanup-low-prompts modal it triggers
+  // (TASK-37 follow-up: window.prompt is a no-op in Electron, plus the
+  // header was getting crowded with inline buttons - moved them here).
+  const [headerMenuOpen, setHeaderMenuOpen] = useState(false);
+  const [cleanupModal, setCleanupModal] = useState<{ thresholdStr: string } | null>(null);
+  // #69: collapsed groups - Set of repo keys the user has collapsed in-session.
+  // Not persisted intentionally: collapse state is ephemeral navigation, not a preference.
+  const [collapsedGroups, setCollapsedGroups] = useState<Set<string>>(new Set());
+  const toggleGroupCollapsed = (key: string) => {
+    setCollapsedGroups((prev) => {
+      const next = new Set(prev);
+      if (next.has(key)) next.delete(key); else next.add(key);
+      return next;
+    });
+  };
+  const inputRef = useRef<HTMLInputElement>(null);
+  const listRef = useRef<HTMLDivElement>(null);
+  const ctxRef = useRef<HTMLDivElement>(null);
+  const renameRef = useRef<HTMLInputElement>(null);
+
+  // Refresh session lists when panel opens
+  useEffect(() => {
+    if (!show) return;
+    useTerminalStore.getState().loadCopilotSessions();
+    useTerminalStore.getState().loadClaudeCodeSessions();
+  }, [show]);
+
+  useEffect(() => {
+    if (show) {
+      setQuery('');
+      setSelectedIndex(0);
+      requestAnimationFrame(() => inputRef.current?.focus());
+    }
+  }, [show]);
+
+  // Refresh time display every 10s
+  const [, setTick] = useState(0);
+  useEffect(() => {
+    if (!show) return;
+    const timer = setInterval(() => setTick((t) => t + 1), 10000);
+    return () => clearInterval(timer);
+  }, [show]);
+
+  // Helper to get lifecycle of a session
+  const config = useTerminalStore((s) => s.config);
+  const oldSessionDays = (config as any)?.oldSessionDays ?? 30;
+
+  const groupByRepo = (config as any)?.aiGroupByRepo !== false;
+  const sortMode: SortMode = (() => {
+    const v = (config as any)?.aiSessionListSortMode;
+    // Silent in-memory migration: the old 'activity' smart-sort is now folded
+    // into 'time-desc' (open-in-tmax bubbles above non-open of the same tier).
+    // Don't write the new value back unless the user clicks - the old key
+    // keeps working for anyone who hasn't touched their config since.
+    if (v === 'activity') return 'time-desc';
+    if (
+      v === 'time-desc' || v === 'time-asc' ||
+      v === 'prompts-desc' || v === 'prompts-asc' ||
+      v === 'title-asc' || v === 'title-desc'
+    ) return v;
+    return 'time-desc';
+  })();
+  const sortColumn = sortModeToColumn(sortMode);
+  const sortDir = sortModeToDir(sortMode);
+  const setSortMode = (next: SortMode) => {
+    useTerminalStore.getState().updateConfig({ aiSessionListSortMode: next } as any);
+  };
+  const onHeaderClick = (col: SortColumn) => {
+    if (sortColumn === col) setSortMode(flipMode(sortMode));
+    else setSortMode(columnDefault(col));
+  };
+  // TASK-35 / TASK-163: group key uses the FULL cwd, case-folded. This
+  // collapses cwds that differ only in case (same folder on Windows) while
+  // keeping sessions in distinct folders that happen to share a leaf name
+  // (e.g. C:\projects\Clawpilot vs C:\dev\Clawpilot) in separate groups.
+  // Display label runs through the cwdDisambig map so colliding leaves
+  // get a parent-prefix to tell them apart.
+  const repoDisplay = (s: CopilotSessionSummary): string => cwdLabel(s.cwd) || '(no repo)';
+  const repoKey = (s: CopilotSessionSummary): string => (s.cwd || '').toLowerCase() || '(no repo)';
+  // Pinned sessions get their own top-level pseudo-group so they sit above
+  // every repo group, regardless of which repo they belong to.
+  const PINNED_GROUP = '📌 Pinned';
+  const PINNED_GROUP_KEY = PINNED_GROUP.toLowerCase();
+  const effectiveRepoKey = (s: CopilotSessionSummary): string =>
+    pinnedSessions[s.id] ? PINNED_GROUP_KEY : repoKey(s);
+  const effectiveRepoDisplay = (s: CopilotSessionSummary): string =>
+    pinnedSessions[s.id] ? PINNED_GROUP : repoDisplay(s);
+
+  // Auto-collapse all groups on the transition from off → on, AND on initial
+  // mount when grouping is on (since the default is now "on"). Users asked
+  // for the initial grouped state to be compact; an expand-all button on the
+  // header lets them pop them open.
+  const wasGroupedRef = useRef(false);
+  useEffect(() => {
+    if (groupByRepo && !wasGroupedRef.current) {
+      const allSessions = [...copilotSessions, ...claudeCodeSessions].filter((s) => s.messageCount > 0);
+      setCollapsedGroups(new Set(allSessions.map((s) => repoKey(s))));
+    }
+    wasGroupedRef.current = groupByRepo;
+  }, [groupByRepo, copilotSessions, claudeCodeSessions]);
+
+  const toggleGroupByRepo = () => {
+    useTerminalStore.getState().updateConfig({ aiGroupByRepo: !groupByRepo } as any);
+  };
+
+  const getSessionLifecycle = useCallback((s: CopilotSessionSummary): SessionLifecycle => {
+    const override = lifecycleOverrides[s.id];
+    if (override) return override;
+    const thresholdMs = oldSessionDays * 24 * 60 * 60 * 1000;
+    if (s.lastActivityTime && s.lastActivityTime < Date.now() - thresholdMs) return 'old';
+    return 'active';
+  }, [lifecycleOverrides, oldSessionDays]);
+
+  // Merge, deduplicate, and filter sessions
+  const filtered = useMemo(() => {
+    // TASK-162 perf: preserve session identity when no transform is needed.
+    // The previous version did `{ ...s, provider: ... }` on every entry plus
+    // `{ ...s, summary: override }` on every entry, allocating fresh objects
+    // for all ~1500 sessions on every store update. Now we only spread when
+    // the entry actually needs mutation (missing provider OR has an override),
+    // so unchanged sessions keep referential identity through the filter.
+    // Row-level React.memo can then short-circuit on prop-identity (TASK-170).
+    const enrichProvider = (s: CopilotSessionSummary, fallback: 'copilot' | 'claude-code') =>
+      s.provider ? s : { ...s, provider: fallback };
+    let all = [
+      ...copilotSessions.filter((s) => s.messageCount > 0).map((s) => enrichProvider(s, 'copilot')),
+      ...claudeCodeSessions.filter((s) => s.messageCount > 0).map((s) => enrichProvider(s, 'claude-code')),
+    ].map((s) => {
+      // Sidebar override wins (user renamed in the sidebar directly).
+      if (summaryOverrides[s.id]) return { ...s, summary: summaryOverrides[s.id] };
+      // PR-#106: when a linked terminal has a deliberate user rename
+      // (customTitle && !aiAutoTitle), derive the sidebar display name
+      // from the terminal title so tab renames show up in the sidebar
+      // without needing the renderer to also write a summary override.
+      for (const [, t] of terminals) {
+        if (t.aiSessionId === s.id && t.customTitle && !t.aiAutoTitle) {
+          return { ...s, summary: t.title };
+        }
+      }
+      return s;
+    });
+
+    // Filter by provider
+    if (filterTab !== 'all') {
+      all = all.filter((s) => s.provider === filterTab);
+    }
+
+    // Filter to running (non-idle) sessions only
+    if (showRunningOnly) {
+      all = all.filter((s) => s.status !== 'idle');
+    }
+
+    // Deduplicate by session ID
+    const byId = new Map<string, CopilotSessionSummary>();
+    for (const s of all) {
+      const existing = byId.get(s.id);
+      if (!existing || (s.lastActivityTime || 0) > (existing.lastActivityTime || 0)) {
+        byId.set(s.id, s);
+      }
+    }
+
+    // Filter by lifecycle tab (skip when searching — show all matching results)
+    const deduped = Array.from(byId.values());
+    let lifecycleFiltered = query.trim()
+      ? deduped
+      : deduped.filter((s) => getSessionLifecycle(s) === lifecycleTab);
+
+    // Client-side exclusion for NOT-only queries that FTS can't express
+    // (TASK-257). FTS was reset to the normal list in handleSearch, so here we
+    // drop sessions whose title/cwd matches the excluded terms. Scoped to
+    // title/summary + cwd (not full turn content).
+    const q = query.trim();
+    if (q) {
+      const toks = tokenizeAnd(q);
+      if (toks.length > 0 && toks.every((t) => t.negate)) {
+        lifecycleFiltered = lifecycleFiltered.filter((s) =>
+          matchesAllTokens(`${s.summary ?? ''} ${s.cwd ?? ''}`.toLowerCase(), toks),
+        );
+      }
+    }
+
+    return sortSessions(lifecycleFiltered, openSessionIds, pinnedSessions, sortMode);
+  }, [copilotSessions, claudeCodeSessions, query, filterTab, showRunningOnly, summaryOverrides, terminals, lifecycleTab, getSessionLifecycle, openSessionIds, pinnedSessions, sortMode]);
+
+  // TASK-163: disambiguate display labels for cwds that share a leaf folder
+  // name. Computed once per visible-session-set change; consumed by both the
+  // group header and the per-row cwd subtitle. Falls back to shortPath when
+  // a cwd isn't in the map (defensive; map should be exhaustive).
+  const cwdDisambig = useMemo(() => buildCwdDisambig(filtered.map((s) => s.cwd)), [filtered]);
+  const cwdLabel = (cwd: string | undefined): string => {
+    if (!cwd) return '';
+    return cwdDisambig.get(cwd) ?? shortPath(cwd);
+  };
+
+  // #69: when groupByRepo is on, reorder filtered so sessions sharing a cwd
+  // folder are contiguous. Both group order AND within-group order follow
+  // the active column header (title / activity / prompts) and direction.
+  // Within-group order is already applied by sortSessions on `filtered`;
+  // here we sort the groups themselves the same way.
+  const displayList = useMemo(() => {
+    if (!groupByRepo) return filtered;
+    const groups = new Map<string, CopilotSessionSummary[]>();
+    for (const s of filtered) {
+      const key = effectiveRepoKey(s);
+      const bucket = groups.get(key);
+      if (bucket) bucket.push(s); else groups.set(key, [s]);
+    }
+    const sortedGroups = [...groups.entries()].sort(([ak, av], [bk, bv]) => {
+      // Pinned group always at the top; no-repo bucket always at the bottom,
+      // regardless of which column header is active.
+      if (ak === PINNED_GROUP_KEY) return -1;
+      if (bk === PINNED_GROUP_KEY) return 1;
+      if (ak === '(no repo)') return 1;
+      if (bk === '(no repo)') return -1;
+      // Groups containing a genuinely running session (non-idle AND live in
+      // tmax) float to the top. Synthetic/log-only sessions don't count.
+      const aActive = av.some((s) => isRunning(s, openSessionIds)) ? 1 : 0;
+      const bActive = bv.some((s) => isRunning(s, openSessionIds)) ? 1 : 0;
+      if (aActive !== bActive) return bActive - aActive;
+      if (sortColumn === 'title') {
+        // Sort by the visible group label (disambiguated leaf, e.g. "tmax")
+        // rather than the full lowercased cwd key, otherwise the user sees
+        // labels like PROJECTS / BACKLOG-HUB / TMAX shuffled by their hidden
+        // parent paths.
+        const aLabel = effectiveRepoDisplay(av[0]);
+        const bLabel = effectiveRepoDisplay(bv[0]);
+        const cmp = aLabel.localeCompare(bLabel, undefined, { sensitivity: 'base' });
+        return sortDir === 'asc' ? cmp : -cmp;
+      }
+      if (sortColumn === 'prompts') {
+        const aSum = av.reduce((acc, s) => acc + (s.messageCount || 0), 0);
+        const bSum = bv.reduce((acc, s) => acc + (s.messageCount || 0), 0);
+        if (aSum !== bSum) return sortDir === 'desc' ? bSum - aSum : aSum - bSum;
+        // Tie-break by recency so equal-sum groups stay meaningfully ordered.
+        const aRecent = Math.max(...av.map((s) => s.lastActivityTime || 0));
+        const bRecent = Math.max(...bv.map((s) => s.lastActivityTime || 0));
+        return bRecent - aRecent;
+      }
+      // activity column: group recency.
+      const aRecent = Math.max(...av.map((s) => s.lastActivityTime || 0));
+      const bRecent = Math.max(...bv.map((s) => s.lastActivityTime || 0));
+      return sortDir === 'desc' ? bRecent - aRecent : aRecent - bRecent;
+    });
+    return sortedGroups.flatMap(([, group]) => group);
+  }, [filtered, groupByRepo, pinnedSessions, sortMode, sortColumn, sortDir, openSessionIds]);
+
+  // TASK-35: per-group display label (preserves original casing from the
+  // first session encountered in each lowercase bucket).
+  const groupDisplayNames = useMemo(() => {
+    const m = new Map<string, string>();
+    if (!groupByRepo) return m;
+    for (const s of displayList) {
+      const key = effectiveRepoKey(s);
+      if (!m.has(key)) m.set(key, effectiveRepoDisplay(s));
+    }
+    return m;
+  }, [displayList, groupByRepo, pinnedSessions]);
+
+  // #69: counts per group key so the collapsible header can show `tmax · 3`.
+  const groupSizes = useMemo(() => {
+    const m = new Map<string, number>();
+    if (!groupByRepo) return m;
+    for (const s of displayList) {
+      const key = effectiveRepoKey(s);
+      m.set(key, (m.get(key) || 0) + 1);
+    }
+    return m;
+  }, [displayList, groupByRepo, pinnedSessions]);
+
+  // Sessions that share the exact same title - automation scripts often spawn
+  // many `claude` runs with the same initial prompt, making them visually
+  // indistinguishable. Flag duplicates so the render can append a short
+  // session-ID suffix to disambiguate.
+  const dupTitles = useMemo(() => {
+    const counts = new Map<string, number>();
+    for (const s of displayList) {
+      const t = getTitle(s);
+      counts.set(t, (counts.get(t) || 0) + 1);
+    }
+    const dups = new Set<string>();
+    for (const [t, n] of counts) if (n > 1) dups.add(t);
+    return dups;
+  }, [displayList]);
+
+  // Lifecycle counts (for tab badges) — computed from all sessions regardless of provider/running filter
+  const lifecycleCounts = useMemo(() => {
+    const allSessions = [
+      ...copilotSessions.filter((s) => s.messageCount > 0),
+      ...claudeCodeSessions.filter((s) => s.messageCount > 0),
+    ];
+    // Deduplicate
+    const byId = new Map<string, CopilotSessionSummary>();
+    for (const s of allSessions) {
+      const existing = byId.get(s.id);
+      if (!existing || (s.lastActivityTime || 0) > (existing.lastActivityTime || 0)) {
+        byId.set(s.id, s);
+      }
+    }
+    const counts = { active: 0, completed: 0, old: 0 };
+    for (const s of byId.values()) {
+      counts[getSessionLifecycle(s)]++;
+    }
+    return counts;
+  }, [copilotSessions, claudeCodeSessions, getSessionLifecycle]);
+
+  useEffect(() => {
+    if (selectedIndex >= filtered.length) {
+      setSelectedIndex(Math.max(0, filtered.length - 1));
+    }
+  }, [filtered.length, selectedIndex]);
+
+  // Only scroll the list when selection moved via keyboard. Hover-driven
+  // changes (onMouseEnter below) would otherwise fight the user's wheel
+  // scroll - they scroll up, hover hits item 3, selection updates, effect
+  // snaps the list back down to item 3.
+  const scrollOnSelectChange = useRef(false);
+  useEffect(() => {
+    if (!scrollOnSelectChange.current) return;
+    scrollOnSelectChange.current = false;
+    if (listRef.current) {
+      const items = listRef.current.querySelectorAll('.ai-session-item');
+      const item = items[selectedIndex] as HTMLElement | undefined;
+      item?.scrollIntoView({ block: 'nearest' });
+    }
+  }, [selectedIndex]);
+
+  // Auto-highlight the AI session belonging to the focused terminal pane.
+  // Edge-triggered on focusedTerminalId change; does not force-open the panel.
+  // If the session is in a different lifecycle tab, switches tab and uses a
+  // pending ref so the selection resolves after the tab-switch re-render.
+  useEffect(() => {
+    if (!show) return;
+    const focusChanged = focusedTerminalId !== prevFocusedIdRef.current;
+    const requestChanged = aiSessionHighlightRequest !== prevHighlightRequestRef.current;
+    if (!focusChanged && !requestChanged) return;
+    prevFocusedIdRef.current = focusedTerminalId;
+    prevHighlightRequestRef.current = aiSessionHighlightRequest;
+    if (!focusedTerminalId) return;
+
+    const store = useTerminalStore.getState();
+    const terminal = store.terminals.get(focusedTerminalId);
+    const aiSessionId = terminal?.aiSessionId;
+    if (!aiSessionId) return;
+
+    const session = [...store.copilotSessions, ...store.claudeCodeSessions].find((s) => s.id === aiSessionId);
+    if (!session) return;
+
+    // TASK-166: only flash when triggered by an explicit highlight request
+    // (the user clicked "Show in AI sessions"), not on every focus change.
+    // requestChanged is the edge signal that distinguishes the two.
+    if (requestChanged) {
+      if (flashTimerRef.current) clearTimeout(flashTimerRef.current);
+      setFlashedSessionId(aiSessionId);
+      flashTimerRef.current = setTimeout(() => {
+        setFlashedSessionId(null);
+        flashTimerRef.current = null;
+      }, 4000);
+    }
+
+    // Clear filters that would hide the target row entirely. Without
+    // this, setSelectedIndex picks the right idx in displayList but the
+    // matching .ai-session-item never renders - the user sees a stale
+    // .selected class on whichever row was selected before.
+    //   - showRunningOnly drops idle sessions from filtered (line 220
+    //     in the filtered useMemo). A pane with an idle Claude/Copilot
+    //     session would otherwise vanish from the list.
+    //   - query (search box) narrows filtered by substring; if the user
+    //     had a search active that excludes this session, clear it.
+    //   - filterTab restricts to one provider; switch back to 'all' if
+    //     it would exclude this session.
+    //   - collapsedGroups hides items via {!isCollapsed && ...} in the
+    //     render. Expand the target session's group.
+    if (showRunningOnly && session.status === 'idle') setShowRunningOnly(false);
+    if (query) {
+      const text = `${session.summary} ${session.cwd} ${session.branch}`.toLowerCase();
+      if (!text.includes(query.toLowerCase())) setQuery('');
+    }
+    if (filterTab !== 'all' && session.provider !== filterTab) setFilterTab('all');
+    const targetGroup = effectiveRepoKey(session);
+    setCollapsedGroups((prev) => {
+      if (!prev.has(targetGroup)) return prev;
+      const next = new Set(prev);
+      next.delete(targetGroup);
+      return next;
+    });
+
+    const sessionLifecycle = getSessionLifecycle(session);
+    if (sessionLifecycle !== lifecycleTab) {
+      pendingHighlightRef.current = aiSessionId;
+      setLifecycleTab(sessionLifecycle);
+    } else {
+      const idx = filtered.findIndex((s) => s.id === aiSessionId);
+      if (idx >= 0) {
+        scrollOnSelectChange.current = true;
+        setSelectedIndex(idx);
+      } else {
+        // After clearing filters above, filtered hasn't recomputed yet
+        // (state updates are batched). Defer the index lookup to the
+        // next render via the pending ref - the resolve effect runs on
+        // [filtered] change.
+        pendingHighlightRef.current = aiSessionId;
+      }
+    }
+  }, [focusedTerminalId, aiSessionHighlightRequest, show, lifecycleTab, filtered, getSessionLifecycle, showRunningOnly, query, filterTab]);
+
+  // Clear any pending flash timer on unmount so we don't try to setState
+  // on an unmounted component.
+  useEffect(() => () => {
+    if (flashTimerRef.current) clearTimeout(flashTimerRef.current);
+  }, []);
+
+  // Resolve a pending highlight after a tab switch has re-rendered `filtered`.
+  useEffect(() => {
+    const id = pendingHighlightRef.current;
+    if (!id) return;
+    const idx = filtered.findIndex((s) => s.id === id);
+    if (idx >= 0) {
+      scrollOnSelectChange.current = true;
+      setSelectedIndex(idx);
+      pendingHighlightRef.current = null;
+    }
+  }, [filtered]);
+
+  // Close context menu on outside click
+  useEffect(() => {
+    if (!ctxMenu) return;
+    const handler = (e: MouseEvent) => {
+      if (ctxRef.current && !ctxRef.current.contains(e.target as Node)) setCtxMenu(null);
+    };
+    document.addEventListener('mousedown', handler);
+    return () => document.removeEventListener('mousedown', handler);
+  }, [ctxMenu]);
+
+  // Focus rename input
+  useEffect(() => {
+    if (renaming) requestAnimationFrame(() => renameRef.current?.focus());
+  }, [renaming]);
+
+  const handleContextMenu = useCallback((e: React.MouseEvent, session: CopilotSessionSummary) => {
+    e.preventDefault();
+    e.stopPropagation();
+    setCtxMenu({ x: e.clientX, y: e.clientY, session });
+  }, []);
+
+  const handleRemoveSession = useCallback((session: CopilotSessionSummary) => {
+    if (session.provider === 'claude-code') {
+      useTerminalStore.getState().removeClaudeCodeSession(session.id);
+    } else {
+      useTerminalStore.getState().removeCopilotSession(session.id);
+    }
+    setCtxMenu(null);
+  }, []);
+
+  const handleStartRename = useCallback((session: CopilotSessionSummary) => {
+    setRenaming({ id: session.id, provider: session.provider, value: summaryOverrides[session.id] || session.summary || getTitle(session) });
+    setCtxMenu(null);
+  }, []);
+
+  const handleFinishRename = useCallback(() => {
+    if (!renaming) return;
+    const newSummary = renaming.value.trim();
+    if (newSummary) {
+      // setSessionNameOverride atomically writes the sidebar override AND
+      // updates every linked terminal's title/customTitle/aiAutoTitle in one
+      // set(). No need to call renameTerminal() — that would trigger a
+      // redundant second setSessionNameOverride via its side effect.
+      useTerminalStore.getState().setSessionNameOverride(renaming.id, newSummary);
+    }
+    setRenaming(null);
+  }, [renaming]);
+
+  const handleShowPrompts = useCallback(async (session: CopilotSessionSummary) => {
+    const api = window.terminalAPI as any;
+    let prompts: string[];
+    if (session.provider === 'claude-code') {
+      prompts = await api.getClaudeCodePrompts(session.id);
+    } else {
+      prompts = await api.getCopilotPrompts(session.id);
+    }
+    // Find terminal with matching aiSessionId
+    let matchedTerminalId: string | null = null;
+    const store = useTerminalStore.getState();
+    for (const [tid, t] of store.terminals) {
+      if (t.aiSessionId === session.id) {
+        matchedTerminalId = tid;
+        break;
+      }
+    }
+    setPromptsDialog({
+      title: summaryOverrides[session.id] || session.summary || getTitle(session),
+      prompts: prompts.length > 0 ? prompts : ['(no prompts found)'],
+      terminalId: matchedTerminalId,
+    });
+    setCtxMenu(null);
+  }, [summaryOverrides]);
+
+  const handleRefresh = useCallback(async () => {
+    await (window.terminalAPI as any).invalidateSessionCaches?.();
+    const store = useTerminalStore.getState();
+    store.loadCopilotSessions();
+    store.loadClaudeCodeSessions();
+  }, []);
+
+  const handleResizeStart = useCallback(
+    (e: React.MouseEvent) => {
+      e.preventDefault();
+      const startX = e.clientX;
+      const startWidth = width;
+      setResizing(true);
+
+      const handleMouseMove = (moveEvent: MouseEvent) => {
+        const newWidth = Math.max(MIN_WIDTH, Math.min(MAX_WIDTH, startWidth + moveEvent.clientX - startX));
+        setWidth(newWidth);
+      };
+
+      const handleMouseUp = () => {
+        setResizing(false);
+        window.removeEventListener('mousemove', handleMouseMove);
+        window.removeEventListener('mouseup', handleMouseUp);
+      };
+
+      window.addEventListener('mousemove', handleMouseMove);
+      window.addEventListener('mouseup', handleMouseUp);
+    },
+    [width],
+  );
+
+  const openSession = useCallback((session: CopilotSessionSummary) => {
+    const store = useTerminalStore.getState();
+    if (session.provider === 'claude-code') {
+      store.openClaudeCodeSession(session.id);
+    } else {
+      store.openCopilotSession(session.id);
+    }
+  }, []);
+
+  const handleKeyDown = useCallback(
+    (e: React.KeyboardEvent) => {
+      switch (e.key) {
+        case 'ArrowDown':
+          e.preventDefault();
+          scrollOnSelectChange.current = true;
+          setSelectedIndex((i) => Math.min(i + 1, filtered.length - 1));
+          break;
+        case 'ArrowUp':
+          e.preventDefault();
+          scrollOnSelectChange.current = true;
+          setSelectedIndex((i) => Math.max(i - 1, 0));
+          break;
+        case 'Enter':
+          e.preventDefault();
+          if (filtered[selectedIndex]) {
+            openSession(filtered[selectedIndex]);
+          }
+          break;
+        case 'Escape':
+          e.preventDefault();
+          useTerminalStore.getState().toggleCopilotPanel();
+          break;
+        default:
+          return;
+      }
+      e.stopPropagation();
+    },
+    [filtered, selectedIndex, openSession],
+  );
+
+  // Debounce the IPC search so we don't re-grep every .jsonl on each keystroke.
+  const searchDebounceRef = useRef<ReturnType<typeof setTimeout> | null>(null);
+  useEffect(() => () => {
+    if (searchDebounceRef.current) clearTimeout(searchDebounceRef.current);
+  }, []);
+
+  const handleSearch = useCallback((value: string) => {
+    setQuery(value);
+    setSelectedIndex(0);
+    if (searchDebounceRef.current) clearTimeout(searchDebounceRef.current);
+    searchDebounceRef.current = setTimeout(() => {
+      const store = useTerminalStore.getState();
+      // Exclusion-only queries (e.g. "NOT scheduled") can't be expressed in
+      // FTS5 - it needs a positive term to match against - so don't send them to
+      // the full-text search. Reset it to the normal list and let `filtered`
+      // apply the exclusion client-side over titles/cwd (TASK-257). Mixed
+      // queries like "step NOT scheduled" still go to FTS (binary NOT works).
+      const toks = tokenizeAnd(value);
+      const exclusionOnly = toks.length > 0 && toks.every((t) => t.negate);
+      const ftsValue = exclusionOnly ? '' : value;
+      store.searchCopilotSessions(ftsValue);
+      store.searchClaudeCodeSessions(ftsValue);
+    }, 500);
+  }, []);
+
+  // Listen for keybinding-triggered prompts dialog request
+  const promptsRequest = useTerminalStore((s) => s.promptsDialogRequest);
+  useEffect(() => {
+    if (!promptsRequest) return;
+    const { terminalId: tid, sessionId: sidExplicit, scrollToPromptIndex } = promptsRequest;
+    const store = useTerminalStore.getState();
+    store.clearPromptsDialogRequest();
+
+    const allSessions = [...store.copilotSessions, ...store.claudeCodeSessions];
+    let session: typeof allSessions[0] | undefined;
+    let matchedTerminalId: string | null = tid ?? null;
+
+    // If the request supplies a sessionId (e.g. from the session summary
+    // popover), prefer that. Otherwise resolve through the focused terminal.
+    if (sidExplicit) {
+      session = allSessions.find((s) => s.id === sidExplicit);
+      // Try to find a terminal linked to this session so the prompt-jump
+      // feature inside the dialog still works.
+      if (session && !matchedTerminalId) {
+        for (const [id, t] of store.terminals) {
+          if (t.aiSessionId === session.id) { matchedTerminalId = id; break; }
+        }
+      }
+    } else if (tid) {
+      const terminal = store.terminals.get(tid);
+      if (terminal?.aiSessionId) {
+        session = allSessions.find((s) => s.id === terminal.aiSessionId);
+      }
+      if (!session && terminal?.cwd) {
+        const cwd = terminal.cwd.replace(/\\/g, '/').toLowerCase();
+        session = allSessions
+          .filter((s) => s.cwd?.replace(/\\/g, '/').toLowerCase() === cwd)
+          .sort((a, b) => (b.lastActivityTime || 0) - (a.lastActivityTime || 0))[0];
+      }
+    }
+
+    if (!session) return;
+    const sessionId = session.id;
+    // Load prompts
+    const api = window.terminalAPI as any;
+    const loadPrompts = session.provider === 'claude-code'
+      ? api.getClaudeCodePrompts(sessionId)
+      : api.getCopilotPrompts(sessionId);
+    loadPrompts.then((prompts: string[]) => {
+      setPromptsDialog({
+        title: summaryOverrides[sessionId] || session.summary || getTitle(session),
+        prompts: prompts.length > 0 ? prompts : ['(no prompts found)'],
+        terminalId: matchedTerminalId,
+        scrollToIndex: scrollToPromptIndex,
+      });
+    });
+  }, [promptsRequest, summaryOverrides]);
+
+  // Always render the prompts dialog portal (even when panel is hidden)
+  const promptsPortal = promptsDialog && ReactDOM.createPortal(
+    <PromptsDialog
+      title={promptsDialog.title}
+      prompts={promptsDialog.prompts}
+      terminalId={promptsDialog.terminalId}
+      scrollToIndex={promptsDialog.scrollToIndex}
+      onClose={() => setPromptsDialog(null)}
+    />,
+    document.body,
+  );
+
+  if (!show) return promptsPortal || null;
+
+  // Counts for filter tabs (deduplicated)
+  const copilotCount = copilotSessions.filter((s) => s.messageCount > 0).length;
+  const claudeCount = claudeCodeSessions.filter((s) => s.messageCount > 0).length;
+  const allCount = copilotCount + claudeCount;
+
+  return (
+    <div className={`copilot-panel${resizing ? ' resizing' : ''}`} style={{ width, minWidth: width }}>
+      <div className="dir-panel-resize" onMouseDown={handleResizeStart} />
+
+      <div className="dir-panel-header">
+        <span>✨ AI Sessions</span>
+        <div style={{ display: 'flex', gap: '4px', alignItems: 'center', position: 'relative' }}>
+          {groupByRepo && (() => {
+            const allKeys = Array.from(groupSizes.keys());
+            const allCollapsed = allKeys.length > 0 && allKeys.every((k) => collapsedGroups.has(k));
+            const disabled = allKeys.length === 0;
+            return (
+              <button
+                className="dir-panel-close ai-session-collapse-toggle"
+                onClick={() => setCollapsedGroups(allCollapsed ? new Set() : new Set(allKeys))}
+                disabled={disabled}
+                data-tooltip={allCollapsed ? 'Expand all groups' : 'Collapse all groups'}
+                aria-label={allCollapsed ? 'Expand all groups' : 'Collapse all groups'}
+              >
+                {/* Two stacked chevrons make the all-toggle visually distinct
+                    from the per-group chevron next to each repo header. */}
+                <svg
+                  className="ai-session-collapse-icon"
+                  width="14"
+                  height="14"
+                  viewBox="0 0 14 14"
+                  fill="none"
+                  stroke="currentColor"
+                  strokeWidth="1.6"
+                  strokeLinecap="round"
+                  strokeLinejoin="round"
+                  aria-hidden="true"
+                  style={{ transform: allCollapsed ? 'rotate(0deg)' : 'rotate(180deg)', transition: 'transform 0.15s ease' }}
+                >
+                  <path d="M3 5 L7 9 L11 5" />
+                  <path d="M3 1 L7 5 L11 1" />
+                </svg>
+              </button>
+            );
+          })()}
+          <button
+            className="dir-panel-close"
+            onClick={handleRefresh}
+            data-tooltip="Refresh sessions"
+            aria-label="Refresh sessions"
+          >
+            <svg width="12" height="12" viewBox="0 0 16 16" fill="currentColor" aria-hidden="true"><path d="M8 3V1L4.5 4 8 7V5a3 3 0 1 1-3 3H3.5a4.5 4.5 0 1 0 4.5-5z"/></svg>
+          </button>
+          <button
+            className="dir-panel-close"
+            onClick={() => setHeaderMenuOpen((v) => !v)}
+            data-tooltip="More actions"
+            aria-label="More actions"
+          >
+            <svg width="12" height="12" viewBox="0 0 16 16" fill="currentColor"><circle cx="3" cy="8" r="1.5"/><circle cx="8" cy="8" r="1.5"/><circle cx="13" cy="8" r="1.5"/></svg>
+          </button>
+          <button className="dir-panel-close" onClick={() => useTerminalStore.getState().toggleCopilotPanel()} data-tooltip="Close">&#10005;</button>
+          {headerMenuOpen && (
+            <>
+              {/* click-away to close */}
+              <div
+                style={{ position: 'fixed', inset: 0, zIndex: 999 }}
+                onClick={() => setHeaderMenuOpen(false)}
+              />
+              <div
+                className="context-menu"
+                style={{
+                  position: 'absolute', top: '100%', right: 0, marginTop: 4,
+                  zIndex: 1000, minWidth: 230, whiteSpace: 'nowrap',
+                }}
+              >
+                <button
+                  className="context-menu-item"
+                  onClick={() => { toggleGroupByRepo(); setHeaderMenuOpen(false); }}
+                >
+                  <span style={{ display: 'inline-block', width: 16, color: groupByRepo ? 'var(--focus-border, #89b4fa)' : 'transparent' }}>✓</span>
+                  Group by repo
+                </button>
+                <button
+                  className="context-menu-item"
+                  onClick={() => { setShowRunningOnly((v) => !v); setHeaderMenuOpen(false); }}
+                >
+                  <span style={{ display: 'inline-block', width: 16, color: showRunningOnly ? 'var(--focus-border, #89b4fa)' : 'transparent' }}>✓</span>
+                  Show running only
+                </button>
+                <div className="context-menu-separator" />
+                <button
+                  className="context-menu-item"
+                  onClick={() => { setCleanupModal({ thresholdStr: '10' }); setHeaderMenuOpen(false); }}
+                >
+                  <span style={{ display: 'inline-block', width: 16 }}>🧹</span>
+                  Cleanup sessions…
+                </button>
+              </div>
+            </>
+          )}
+        </div>
+      </div>
+
+      {/* Cleanup modal (window.prompt is a no-op in Electron, so we use
+          our own dialog). Threshold input + projected count + Cancel/
+          Archive. */}
+      {cleanupModal && (() => {
+        const threshold = Number(cleanupModal.thresholdStr);
+        const valid = Number.isFinite(threshold) && threshold > 0;
+        const projectedCount = valid
+          ? useTerminalStore.getState().countLowPromptSessions(threshold)
+          : 0;
+        // TASK-162: per-prompt-count distribution so the user can pick a
+        // threshold against the actual shape of their session pool. Use a
+        // fixed cap of 15; sessions with >15 prompts land in the overflow
+        // bucket and are never archived by this dialog regardless of cap.
+        const HISTO_CAP = 15;
+        const histogram = useTerminalStore.getState().lowPromptHistogram(HISTO_CAP);
+        const histoMax = Math.max(1, ...histogram);
+        // Threshold-aware labelling: a bucket at messageCount === i is
+        // archived iff i < threshold (matches cleanupLowPromptSessions).
+        const isArchivedBucket = (idx: number) => valid && idx <= HISTO_CAP && idx < threshold;
+        return (
+          <div
+            style={{
+              position: 'fixed', inset: 0, background: 'rgba(0,0,0,0.5)',
+              display: 'flex', alignItems: 'center', justifyContent: 'center', zIndex: 2000,
+            }}
+          >
+            <div
+              style={{
+                background: 'var(--bg-secondary, #1e1e2e)', color: 'var(--fg, #cdd6f4)',
+                border: '1px solid var(--border, #45475a)', borderRadius: 6, padding: 20,
+                minWidth: 420, maxWidth: 500, boxShadow: '0 10px 30px rgba(0,0,0,0.5)',
+              }}
+            >
+              <div style={{ fontWeight: 600, marginBottom: 10 }}>🧹 Cleanup low-prompt sessions</div>
+              <div style={{ fontSize: 12, opacity: 0.8, marginBottom: 12 }}>
+                Archive sessions with fewer than this many prompts. Pinned and
+                already-archived sessions are skipped. Transcript files are
+                not deleted.
+              </div>
+              <label style={{ display: 'block', fontSize: 12, marginBottom: 4 }}>Prompt count threshold</label>
+              <input
+                type="number"
+                min={1}
+                value={cleanupModal.thresholdStr}
+                onChange={(e) => setCleanupModal({ thresholdStr: e.target.value })}
+                onKeyDown={(e) => {
+                  if (e.key === 'Enter' && valid && projectedCount > 0) {
+                    const n = useTerminalStore.getState().cleanupLowPromptSessions(threshold);
+                    if (n > 0) useTerminalStore.getState().addToast(`Archived ${n} low-prompt session${n === 1 ? '' : 's'}.`);
+                    setCleanupModal(null);
+                  } else if (e.key === 'Escape') {
+                    setCleanupModal(null);
+                  }
+                }}
+                autoFocus
+                style={{
+                  width: '100%', padding: '6px 8px',
+                  background: 'var(--bg, #11111b)', color: 'inherit',
+                  border: '1px solid var(--border, #45475a)', borderRadius: 4, fontSize: 14,
+                }}
+              />
+              <div style={{ fontSize: 12, opacity: 0.85, marginTop: 10, minHeight: 18 }}>
+                {!valid
+                  ? <span style={{ color: '#f38ba8' }}>Enter a positive number.</span>
+                  : projectedCount === 0
+                    ? <span>No sessions match (none below {threshold}, or matches are pinned / already archived).</span>
+                    : <span>Will archive <strong>{projectedCount}</strong> session{projectedCount === 1 ? '' : 's'} with fewer than {threshold} prompts.</span>}
+              </div>
+              <div style={{ marginTop: 12, marginBottom: 6 }}>
+                <div style={{ fontSize: 11, opacity: 0.7, marginBottom: 4 }}>
+                  Sessions by prompt count (red = archived at this threshold)
+                </div>
+                <div
+                  style={{
+                    display: 'flex', alignItems: 'flex-end', gap: 2,
+                    height: 60, padding: '4px 0',
+                    borderBottom: '1px solid var(--border, #45475a)',
+                  }}
+                  role="img"
+                  aria-label={`Prompt-count distribution, ${projectedCount} sessions below threshold ${threshold}`}
+                >
+                  {histogram.map((count, idx) => {
+                    const isOverflow = idx === HISTO_CAP + 1;
+                    const label = isOverflow ? `${HISTO_CAP + 1}+` : String(idx);
+                    const archived = isArchivedBucket(idx);
+                    const barHeightPct = Math.max(count > 0 ? 12 : 0, Math.round((count / histoMax) * 100));
+                    return (
+                      <div
+                        key={idx}
+                        title={`${count} session${count === 1 ? '' : 's'} with ${label} prompt${label === '1' ? '' : 's'}`}
+                        style={{
+                          flex: 1, display: 'flex', flexDirection: 'column',
+                          alignItems: 'center', justifyContent: 'flex-end',
+                          height: '100%', minWidth: 0,
+                        }}
+                      >
+                        <div style={{ fontSize: 9, opacity: count > 0 ? 0.85 : 0.4, lineHeight: 1 }}>
+                          {count > 0 ? count : ''}
+                        </div>
+                        <div
+                          style={{
+                            width: '100%', marginTop: 2,
+                            height: `${barHeightPct}%`,
+                            background: archived ? '#f38ba8' : 'var(--accent, #7aa2f7)',
+                            opacity: count > 0 ? (archived ? 0.9 : 0.6) : 0.15,
+                            borderRadius: '2px 2px 0 0',
+                            transition: 'background 0.12s, opacity 0.12s',
+                          }}
+                        />
+                      </div>
+                    );
+                  })}
+                </div>
+                <div style={{ display: 'flex', gap: 2, fontSize: 9, opacity: 0.55, marginTop: 2 }}>
+                  {histogram.map((_, idx) => (
+                    <div key={idx} style={{ flex: 1, textAlign: 'center', minWidth: 0 }}>
+                      {idx === HISTO_CAP + 1 ? `${HISTO_CAP + 1}+` : idx}
+                    </div>
+                  ))}
+                </div>
+              </div>
+              <div style={{ display: 'flex', gap: 8, justifyContent: 'flex-end', marginTop: 16 }}>
+                <button className="ai-session-tab" onClick={() => setCleanupModal(null)}>Cancel</button>
+                <button
+                  className="ai-session-tab active"
+                  disabled={!valid || projectedCount === 0}
+                  onClick={() => {
+                    const n = useTerminalStore.getState().cleanupLowPromptSessions(threshold);
+                    if (n > 0) useTerminalStore.getState().addToast(`Archived ${n} low-prompt session${n === 1 ? '' : 's'}.`);
+                    setCleanupModal(null);
+                  }}
+                >
+                  Archive {projectedCount > 0 ? `(${projectedCount})` : ''}
+                </button>
+              </div>
+            </div>
+          </div>
+        );
+      })()}
+
+      {/* Lifecycle tabs */}
+      <div className="ai-session-tabs">
+        <button
+          className={`ai-session-tab${lifecycleTab === 'active' ? ' active' : ''}`}
+          onClick={() => setLifecycleTab('active')}
+          title="Sessions currently in use or recently active"
+        >
+          Active{lifecycleCounts.active > 0 ? ` (${lifecycleCounts.active})` : ''}
+        </button>
+        <button
+          className={`ai-session-tab${lifecycleTab === 'completed' ? ' active' : ''}`}
+          onClick={() => setLifecycleTab('completed')}
+          title="Sessions you manually marked as done"
+        >
+          Completed{lifecycleCounts.completed > 0 ? ` (${lifecycleCounts.completed})` : ''}
+        </button>
+        <button
+          className={`ai-session-tab${lifecycleTab === 'old' ? ' active' : ''}`}
+          onClick={() => setLifecycleTab('old')}
+          title="Auto-archived: inactive 14+ days, or <2 prompts after 1+ day"
+        >
+          Archived{lifecycleCounts.old > 0 ? ` (${lifecycleCounts.old})` : ''}
+        </button>
+      </div>
+
+      <input
+        ref={inputRef}
+        className="dir-panel-search"
+        type="text"
+        placeholder={copilotSqliteActive ? "Search all sessions... (AND, OR, NOT supported)" : "Search sessions..."}
+        title={copilotSqliteActive ? "Full-text search across all sessions.\nExamples: auth bug, deploy AND fail, cathy OR ralph, step NOT scheduled.\nA NOT-only query (e.g. 'NOT scheduled') filters by title." : undefined}
+        value={query}
+        onChange={(e) => handleSearch(e.target.value)}
+        onKeyDown={handleKeyDown}
+      />
+
+      {hasMore && !query && !copilotSqliteActive && (
+        <div style={{ display: 'flex', gap: '6px', padding: '4px 8px', fontSize: '11px', alignItems: 'center' }}>
+          <span style={{ opacity: 0.6 }}>Loaded {totalLoaded} of {totalEligible}</span>
+          <button
+            className="dir-panel-close"
+            onClick={handleLoadMore}
+            disabled={loadingMore}
+            style={{ fontSize: '11px', padding: '1px 6px', cursor: loadingMore ? 'wait' : 'pointer' }}
+          >
+            {loadingMore ? '…' : '+100'}
+          </button>
+          <button
+            className="dir-panel-close"
+            onClick={handleLoadAll}
+            disabled={loadingMore}
+            title={totalEligible > 1000 ? `Load all ${totalEligible.toLocaleString()} sessions (may use significant memory)` : `Load all ${totalEligible.toLocaleString()} sessions`}
+            style={{ fontSize: '11px', padding: '1px 6px', cursor: loadingMore ? 'wait' : 'pointer' }}
+          >
+            {loadingMore ? '…' : 'All'}
+          </button>
+        </div>
+      )}
+
+      <div className="ai-session-sort-header" role="row">
+        {((groupByRepo ? ['title', 'activity'] : ['title', 'activity', 'prompts']) as SortColumn[]).map((col) => {
+          const active = sortColumn === col;
+          const glyph = active ? (sortDir === 'asc' ? '↑' : '↓') : '';
+          const label = col === 'title' ? 'Title' : col === 'activity' ? 'Activity' : 'Prompts';
+          return (
+            <button
+              key={col}
+              type="button"
+              role="columnheader"
+              aria-sort={active ? (sortDir === 'asc' ? 'ascending' : 'descending') : 'none'}
+              className={`ai-session-sort-header-col${active ? ' active' : ''} col-${col}`}
+              onClick={() => onHeaderClick(col)}
+              data-column={col}
+            >
+              <span className="ai-session-sort-header-label">{label}</span>
+              {glyph && <span className="ai-session-sort-header-glyph">{glyph}</span>}
+            </button>
+          );
+        })}
+      </div>
+
+      <div className="dir-panel-list" ref={listRef}>
+        {displayList.slice(0, renderLimit).map((session, index) => {
+          const title = getTitle(session);
+          const subtitle = getSubtitle(session);
+          const isOpen = openSessionIds.has(session.id);
+          // TASK-220: only treat a session as running (pulsing dot, status
+          // text, running highlight) when it's non-idle AND live in tmax.
+          // Synthetic/log-only sessions keep a stale 'thinking' status but
+          // must render as idle.
+          const active = isRunning(session, openSessionIds);
+          // Resolve the displayed status to 'idle' for non-running sessions so
+          // the dot color/label and status text don't surface a stale log
+          // status (e.g. 'Thinking') for a session with no live pane.
+          const displayStatus: CopilotSessionStatus = active ? session.status : 'idle';
+          const time = relativeTime(session.lastActivityTime);
+          const hasStats = session.messageCount > 0 || session.toolCallCount > 0;
+          const paneColor = sessionColors.get(session.id);
+          // Left accent border mirrors the pane's color so you can match
+          // sessions with their open pane at a glance.
+          const itemStyle = paneColor ? { borderLeft: `3px solid ${paneColor}` } : undefined;
+          const currentRepo = effectiveRepoKey(session);
+          const prevRepo = index > 0 ? effectiveRepoKey(displayList[index - 1]) : null;
+          const groupingActive = groupByRepo;
+          const showGroupHeader = groupingActive && currentRepo !== prevRepo;
+          const isCollapsed = groupingActive && collapsedGroups.has(currentRepo);
+          const headerLabel = groupDisplayNames.get(currentRepo) || currentRepo;
+          const isPaneActive = activePaneSessionId === session.id;
+
+          return (
+            <React.Fragment key={`${session.provider}-${session.id}`}>
+              {showGroupHeader && (
+                <div
+                  className={`ai-session-group-header${isCollapsed ? ' collapsed' : ''}`}
+                  title={headerLabel}
+                  onClick={() => toggleGroupCollapsed(currentRepo)}
+                >
+                  <span className="ai-session-group-chevron" style={{ transform: isCollapsed ? 'rotate(-90deg)' : 'rotate(0deg)', transition: 'transform 0.15s ease' }}>
+                    <svg width="10" height="10" viewBox="0 0 10 10" fill="none" stroke="currentColor" strokeWidth="1.6" strokeLinecap="round" strokeLinejoin="round" aria-hidden="true">
+                      <path d="M2 4 L5 7 L8 4" />
+                    </svg>
+                  </span>
+                  <span className="ai-session-group-name">{headerLabel}</span>
+                  <span className="ai-session-group-count">{groupSizes.get(currentRepo) || 0}</span>
+                  {/* TASK-159: per-group "+ new session" affordance. Always
+                      spawns a Copilot session (uses the configured
+                      copilotCommand from settings if set, defaults to
+                      `copilot`). cwd + wsl flags come from the most-recent
+                      session in the group. Stop propagation so the click
+                      doesn't also toggle the group's collapsed state. */}
+                  {session.cwd && (
+                    <button
+                      className="ai-session-group-new"
+                      title={`New Copilot session in ${session.cwd}`}
+                      onClick={(e) => {
+                        e.stopPropagation();
+                        useTerminalStore.getState().createAiSessionInCwd(
+                          'copilot',
+                          session.cwd,
+                          { wsl: session.wsl, wslDistro: session.wslDistro },
+                        );
+                      }}
+                    >
+                      +
+                    </button>
+                  )}
+                </div>
+              )}
+              {!isCollapsed && <>
+            <div
+              style={itemStyle}
+              className={`ai-session-item${index === selectedIndex ? ' selected' : ''}${selectedSessionIds.has(session.id) ? ' multi-selected' : ''}${active ? ' active' : ''}${isPaneActive ? ' pane-active' : ''}${flashedSessionId === session.id ? ' flashing' : ''}`}
+              onClick={(e) => {
+                setSelectedIndex(index);
+                if (e.ctrlKey || e.metaKey) {
+                  setSelectedSessionIds((prev) => {
+                    const next = new Set(prev);
+                    if (next.has(session.id)) next.delete(session.id); else next.add(session.id);
+                    return next;
+                  });
+                } else {
+                  setSelectedSessionIds(new Set([session.id]));
+                }
+              }}
+              onDoubleClick={() => openSession(session)}
+              onContextMenu={(e) => handleContextMenu(e, session)}
+              title={session.cwd || session.id}
+            >
+              <span
+                className={`ai-status-dot${active ? ' pulsing' : ''}`}
+                style={{ background: STATUS_COLORS[displayStatus] }}
+                title={STATUS_LABELS[displayStatus]}
+              />
+              <div className="ai-session-info">
+                <div className="ai-session-title-row">
+                  {renaming && renaming.id === session.id ? (
+                    <input
+                      ref={renameRef}
+                      className="ai-session-rename-input"
+                      value={renaming.value}
+                      onChange={(e) => setRenaming({ ...renaming, value: e.target.value })}
+                      onKeyDown={(e) => {
+                        e.stopPropagation();
+                        if (e.key === 'Enter') handleFinishRename();
+                        if (e.key === 'Escape') setRenaming(null);
+                      }}
+                      onBlur={handleFinishRename}
+                      onClick={(e) => e.stopPropagation()}
+                    />
+                  ) : (
+                    <span className="ai-session-name" title={title}>
+                      {renderWithMdLinks(title, session.cwd)}
+                      {dupTitles.has(title) && (
+                        <span className="ai-session-iddup" title={session.id}> · {session.id.slice(0, 6)}</span>
+                      )}
+                    </span>
+                  )}
+                  {isOpen && <span className="ai-open-badge">OPEN</span>}
+                  {session.wsl && (
+                    <span className="ai-wsl-badge" title={session.wslDistro || 'WSL'}>
+                      {session.wslDistro || 'WSL'}
+                    </span>
+                  )}
+                  {detectSessionHost(session) === 'clawpilot' && (
+                    <span className="ai-host-badge ai-host-clawpilot" title="Surfaced from ClawPilot (detected via prompt marker)">
+                      ClawPilot
+                    </span>
+                  )}
+                  {time && <span className="ai-session-time">{time}</span>}
+                </div>
+                {session.cwd && (
+                  <div className="ai-session-cwd" title={session.cwd}>{cwdLabel(session.cwd)}</div>
+                )}
+                {active && (
+                  <div className="ai-session-status" style={{ color: STATUS_COLORS[session.status] }}>
+                    {STATUS_LABELS[session.status]}
+                  </div>
+                )}
+                <div className="ai-session-meta">
+                  <span className="ai-provider-badge" data-provider={session.provider}>
+                    {PROVIDER_LABEL[session.provider] || session.provider}
+                  </span>
+                  {session.model && (
+                    <span className="ai-session-stat">{session.model.replace(/^claude-/, '').replace(/-\d{8}$/, '')}</span>
+                  )}
+                  {hasStats && (
+                    <>
+                      <span className="ai-session-stat">{session.messageCount} prompts</span>
+                      {session.toolCallCount > 0 && (
+                        <span className="ai-session-stat">{session.toolCallCount} tools</span>
+                      )}
+                    </>
+                  )}
+                </div>
+              </div>
+              {/* Pin / Unpin toggle - always available, hover-visible unless pinned */}
+              <button
+                className={`ai-session-lifecycle-btn ai-session-pin-btn${pinnedSessions[session.id] ? ' pinned' : ''}`}
+                title={pinnedSessions[session.id] ? 'Unpin from top' : 'Pin to top'}
+                onClick={(e) => {
+                  e.stopPropagation();
+                  useTerminalStore.getState().togglePinSession(session.id);
+                }}
+              >
+                📌
+              </button>
+              {/* Complete button (Active tab) or Reactivate button (Completed/Old tabs) */}
+              {lifecycleTab === 'active' && (
+                <button
+                  className="ai-session-lifecycle-btn ai-session-complete-btn"
+                  title="Mark as completed"
+                  onClick={(e) => {
+                    e.stopPropagation();
+                    useTerminalStore.getState().setSessionLifecycle(session.id, 'completed');
+                  }}
+                >
+                  ✓
+                </button>
+              )}
+              {(lifecycleTab === 'completed' || lifecycleTab === 'old') && (
+                <button
+                  className="ai-session-lifecycle-btn ai-session-reactivate-btn"
+                  title="Move back to Active"
+                  onClick={(e) => {
+                    e.stopPropagation();
+                    useTerminalStore.getState().setSessionLifecycle(session.id, 'active');
+                  }}
+                >
+                  ↩
+                </button>
+              )}
+            </div>
+            </>}
+            </React.Fragment>
+          );
+        })}
+        {displayList.length > renderLimit && (
+          <div
+            style={{ padding: '8px', textAlign: 'center', fontSize: '11px', opacity: 0.7, cursor: 'pointer' }}
+            onClick={() => setRenderLimit(r => r + 200)}
+          >
+            Showing {renderLimit} of {displayList.length} — click to show more
+          </div>
+        )}
+        {displayList.length === 0 && (
+          <div className="dir-panel-empty">
+            {copilotSearching
+              ? 'Searching...'
+              : query.trim()
+              ? 'No matching sessions'
+              : lifecycleTab === 'active' && allCount === 0
+              ? 'No AI sessions found'
+              : lifecycleTab === 'completed'
+              ? 'No completed sessions'
+              : lifecycleTab === 'old'
+              ? 'No old sessions'
+              : 'No matching sessions'}
+          </div>
+        )}
+      </div>
+
+      {promptsPortal}
+
+      {ctxMenu && (
+        <div ref={(el) => {
+          (ctxRef as any).current = el;
+          if (el) {
+            const rect = el.getBoundingClientRect();
+            if (rect.bottom > window.innerHeight - 4) {
+              el.style.top = `${Math.max(4, ctxMenu.y - rect.height)}px`;
+            }
+            if (rect.right > window.innerWidth - 4) {
+              el.style.left = `${Math.max(4, ctxMenu.x - rect.width)}px`;
+            }
+          }
+        }} className="context-menu" style={{ left: ctxMenu.x, top: ctxMenu.y, zIndex: 1000 }}>
+          <button className="context-menu-item" onClick={() => { openSession(ctxMenu.session); setCtxMenu(null); }}>
+            ▶ Resume session <span className="context-menu-shortcut">double-click</span>
+          </button>
+          <button className="context-menu-item" onClick={() => { useTerminalStore.getState().showSessionSummary(ctxMenu.session.id); setCtxMenu(null); }}>
+            📖 View summary
+          </button>
+          <button className="context-menu-item" onClick={() => handleShowPrompts(ctxMenu.session)}>
+            💬 Show prompts
+          </button>
+          <button className="context-menu-item" onClick={() => {
+            // Pin the transcript to THIS session, regardless of which pane is
+            // focused. Old/resumed sessions often have no linked pane, so the
+            // previous "focus the linked pane" approach fell through to showing
+            // whatever pane was focused (wrong transcript).
+            useTerminalStore.getState().openTranscriptForSession(ctxMenu.session.id);
+            setCtxMenu(null);
+          }}>
+            🕑 Transcript
+          </button>
+          <button className="context-menu-item" onClick={() => handleStartRename(ctxMenu.session)}>
+            ✏️ Rename
+          </button>
+          <button className="context-menu-item" onClick={() => { useTerminalStore.getState().togglePinSession(ctxMenu.session.id); setCtxMenu(null); }}>
+            {pinnedSessions[ctxMenu.session.id] ? '📌 Unpin' : '📌 Pin to top'}
+          </button>
+          {ctxMenu.session.cwd && (
+            <>
+              <button className="context-menu-item" onClick={() => {
+                useTerminalStore.getState().createAiSessionInCwd(
+                  'copilot',
+                  ctxMenu.session.cwd!,
+                  { wsl: ctxMenu.session.wsl, wslDistro: ctxMenu.session.wslDistro },
+                );
+                setCtxMenu(null);
+              }}>
+                ➕ New Copilot session here
+              </button>
+              <button className="context-menu-item" onClick={() => {
+                navigator.clipboard.writeText(ctxMenu.session.cwd!);
+                useTerminalStore.getState().addToast('Path copied to clipboard');
+                setCtxMenu(null);
+              }}>
+                📋 Copy path
+              </button>
+              <button className="context-menu-item" onClick={() => { (window.terminalAPI as any).openPath(ctxMenu.session.cwd); setCtxMenu(null); }}>
+                📂 Open in explorer
+              </button>
+            </>
+          )}
+          <div className="context-menu-separator" />
+          {(() => {
+            const targets = selectedSessionIds.size > 1 ? Array.from(selectedSessionIds) : [ctxMenu.session.id];
+            const currentLifecycle = getSessionLifecycle(ctxMenu.session);
+            return (
+              <>
+                {currentLifecycle !== 'active' && (
+                  <button className="context-menu-item" onClick={() => { targets.forEach((id) => useTerminalStore.getState().setSessionLifecycle(id, 'active')); setCtxMenu(null); setSelectedSessionIds(new Set()); }}>
+                    🔄 Move to Active{targets.length > 1 ? ` (${targets.length})` : ''}
+                  </button>
+                )}
+                {currentLifecycle !== 'completed' && (
+                  <button className="context-menu-item" onClick={() => { targets.forEach((id) => useTerminalStore.getState().setSessionLifecycle(id, 'completed')); setCtxMenu(null); setSelectedSessionIds(new Set()); }}>
+                    ✅ Mark Completed{targets.length > 1 ? ` (${targets.length})` : ''}
+                  </button>
+                )}
+                {currentLifecycle !== 'old' && (
+                  <button className="context-menu-item" onClick={() => { targets.forEach((id) => useTerminalStore.getState().setSessionLifecycle(id, 'old')); setCtxMenu(null); setSelectedSessionIds(new Set()); }}>
+                    🕐 Archive{targets.length > 1 ? ` (${targets.length})` : ''}
+                  </button>
+                )}
+              </>
+            );
+          })()}
+          <div className="context-menu-separator" />
+          <button className="context-menu-item" onClick={() => {
+            navigator.clipboard.writeText(ctxMenu.session.id);
+            useTerminalStore.getState().addToast('Session ID copied to clipboard');
+            setCtxMenu(null);
+          }}>
+            🔗 Copy session ID
+          </button>
+          <button className="context-menu-item danger" onClick={() => handleRemoveSession(ctxMenu.session)}>
+            🗑️ Remove from list
+          </button>
+        </div>
+      )}
+    </div>
+  );
+};
+
+// ── Prompts Dialog ───────────────────────────────────────────────────
+
+const PromptsDialog: React.FC<{
+  title: string;
+  prompts: string[];
+  terminalId: string | null;
+  scrollToIndex?: number;
+  onClose: () => void;
+}> = ({ title, prompts, terminalId, scrollToIndex, onClose }) => {
+  const [search, setSearch] = useState('');
+  const [selectedIndex, setSelectedIndex] = useState(0);
+  const [jumpWarning, setJumpWarning] = useState<string | null>(null);
+  const searchRef = useRef<HTMLInputElement>(null);
+  const listRef = useRef<HTMLDivElement>(null);
+
+  useEffect(() => {
+    requestAnimationFrame(() => searchRef.current?.focus());
+  }, []);
+
+  // Reverse to show newest first, then filter
+  const reversed = useMemo(() => [...prompts].reverse(), [prompts]);
+  const filtered = useMemo(() => {
+    const tokens = tokenizeAnd(search);
+    if (tokens.length === 0) return reversed;
+    return reversed.filter((p) => matchesAllTokens(p.toLowerCase(), tokens));
+  }, [reversed, search]);
+
+  // Reset selection when filter changes
+  useEffect(() => { setSelectedIndex(0); }, [filtered]);
+
+  // Scroll to the requested prompt index on open (use timeout to run after filter reset)
+  useEffect(() => {
+    if (scrollToIndex == null || search) return;
+    const reversedIdx = prompts.length - 1 - scrollToIndex;
+    if (reversedIdx >= 0 && reversedIdx < filtered.length) {
+      setTimeout(() => setSelectedIndex(reversedIdx), 0);
+    }
+  }, []); // eslint-disable-line react-hooks/exhaustive-deps
+
+  // Scroll selected item into view
+  useEffect(() => {
+    const list = listRef.current;
+    if (!list) return;
+    const item = list.children[selectedIndex] as HTMLElement | undefined;
+    item?.scrollIntoView({ block: 'nearest' });
+  }, [selectedIndex]);
+
+  const jumpToPrompt = useCallback((promptText: string) => {
+    if (!terminalId) {
+      setJumpWarning('No terminal is linked to this session.');
+      return;
+    }
+    const entry = getTerminalEntry(terminalId);
+    if (!entry) {
+      setJumpWarning('Terminal is no longer open.');
+      return;
+    }
+    const { searchAddon, terminal } = entry;
+    const found = runJumpToPromptSearch(searchAddon, terminal, promptText);
+    try {
+      (window as any).terminalAPI?.diagLog?.('renderer:jump-to-prompt', {
+        terminalId,
+        queryLen: promptText.trim().length,
+        found,
+      });
+    } catch { /* ignore */ }
+    onClose();
+  }, [terminalId, onClose]);
+
+  const handleKeyDown = useCallback((e: React.KeyboardEvent) => {
+    if (e.key === 'Escape') { onClose(); e.stopPropagation(); return; }
+    if (e.key === 'ArrowDown') {
+      e.preventDefault();
+      setSelectedIndex((i) => Math.min(i + 1, filtered.length - 1));
+      return;
+    }
+    if (e.key === 'ArrowUp') {
+      e.preventDefault();
+      setSelectedIndex((i) => Math.max(i - 1, 0));
+      return;
+    }
+    if (e.key === 'Enter' && filtered.length > 0) {
+      e.preventDefault();
+      jumpToPrompt(filtered[selectedIndex]);
+      return;
+    }
+    e.stopPropagation();
+  }, [filtered, selectedIndex, jumpToPrompt, onClose]);
+
+  const canJump = !!terminalId;
+
+  return (
+    <div className="palette-backdrop" onClick={onClose}>
+      <div className="ai-prompts-dialog" onClick={(e) => e.stopPropagation()}>
+        <div className="ai-prompts-header">
+          <span title={title}>{title}</span>
+          <button className="dir-panel-close" onClick={onClose}>&#10005;</button>
+        </div>
+        <div className="ai-prompts-search-row">
+          <input
+            ref={searchRef}
+            className="dir-panel-search"
+            type="text"
+            placeholder="Search prompts (use AND to combine terms)..."
+            value={search}
+            onChange={(e) => setSearch(e.target.value)}
+            onKeyDown={handleKeyDown}
+          />
+          {reversed.length > 0 && (
+            <span className="ai-prompts-count" aria-live="polite">
+              {filtered.length} of {reversed.length}
+            </span>
+          )}
+        </div>
+        {jumpWarning && (
+          <div className="ai-prompts-warning">{jumpWarning}</div>
+        )}
+        <div className="ai-prompts-list" ref={listRef}>
+          {filtered.map((p, i) => (
+            <div
+              key={i}
+              className={`ai-prompt-item${i === selectedIndex ? ' selected' : ''}${canJump ? ' clickable' : ''}`}
+              onClick={() => canJump && jumpToPrompt(p)}
+              onMouseEnter={() => setSelectedIndex(i)}
+            >
+              <span className="ai-prompt-index">{prompts.length - reversed.indexOf(p)}</span>
+              <span className="ai-prompt-text">{renderWithMdLinks(p, terminalId ? useTerminalStore.getState().terminals.get(terminalId)?.cwd : undefined)}</span>
+            </div>
+          ))}
+          {filtered.length === 0 && (
+            <div className="dir-panel-empty">No matching prompts</div>
+          )}
+        </div>
+        <div className="ai-prompts-footer">
+          {filtered.length} of {prompts.length} prompts
+          {canJump && <span className="ai-prompts-hint"> · click or Enter to jump</span>}
+        </div>
+      </div>
+    </div>
+  );
+};
+
+export default CopilotPanel;

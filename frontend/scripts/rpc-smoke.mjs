@@ -1,9 +1,11 @@
 // End-to-end smoke test of the backend over the real WebSocket protocol.
 // Starts `tmax --headless`, connects like the frontend would, spawns a shell,
 // runs a command and checks the output. Also checks that a wrong token and a
-// shell outside the profiles are refused. Usage: npm run test:rpc  (after dotnet build)
+// shell outside the profiles are refused, and that config/session persist.
+// Uses a throwaway data dir. Usage: npm run test:rpc  (after dotnet build)
 import { spawn } from 'node:child_process';
-import { existsSync } from 'node:fs';
+import { existsSync, mkdtempSync, readFileSync, rmSync } from 'node:fs';
+import { tmpdir } from 'node:os';
 import { dirname, join } from 'node:path';
 import { fileURLToPath } from 'node:url';
 
@@ -12,10 +14,12 @@ const binDir = join(root, 'src', 'Tmax.App', 'bin', 'Debug', 'net10.0');
 const exe = join(binDir, process.platform === 'win32' ? 'tmax.exe' : 'tmax');
 if (!existsSync(exe)) throw new Error(`Build first: ${exe} not found`);
 
-const host = spawn(exe, ['--headless'], { stdio: ['ignore', 'pipe', 'inherit'] });
+const dataDir = mkdtempSync(join(tmpdir(), 'tmax-smoke-'));
+const host = spawn(exe, ['--headless'], { stdio: ['ignore', 'pipe', 'inherit'], env: { ...process.env, TMAX_DATA_DIR: dataDir } });
+const cleanup = () => { host.kill(); rmSync(dataDir, { recursive: true, force: true }); };
 const fail = (msg) => {
   console.error(`FAIL: ${msg}`);
-  host.kill();
+  cleanup();
   process.exit(1);
 };
 setTimeout(() => fail('timeout'), 20000).unref();
@@ -68,6 +72,20 @@ ws.onmessage = (ev) => {
 const info = await invoke('platform:getInfo');
 console.log(`ok  platform:getInfo -> ${info.platform}`);
 
+const config = await invoke('config:get');
+if (!config.shells?.length || !config.defaultShellId || !config.theme) fail('config:get misses defaults');
+await invoke('config:set', 'tabMode', 'workspaces');
+if ((await invoke('config:get')).tabMode !== 'workspaces') fail('config:set not applied');
+if (JSON.parse(readFileSync(join(dataDir, 'tmax-config.json'), 'utf8')).tabMode !== 'workspaces') fail('config not persisted');
+console.log(`ok  config get/set persisted (${config.shells.length} shells, default ${config.defaultShellId})`);
+
+await invoke('session:save', { tabs: ['a'] });
+if ((await invoke('session:load'))?.tabs?.[0] !== 'a') fail('session round trip');
+console.log('ok  session save/load');
+
+if (!Array.isArray(await invoke('copilot:listSessions'))) fail('pending channel should answer []');
+console.log('ok  not-yet-ported channels answer with defaults');
+
 try {
   await invoke('pty:create', { id: 'x', shellPath: '/usr/bin/env', cols: 80, rows: 24 });
   fail('shell outside profiles was accepted');
@@ -87,6 +105,6 @@ console.log('ok  command output received');
 
 await invoke('pty:kill', 'smoke');
 ws.close();
-host.kill();
+cleanup();
 console.log('PASS');
 process.exit(0);

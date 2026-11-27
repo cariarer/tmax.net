@@ -21,11 +21,18 @@ public sealed partial class PtyManager : IAsyncDisposable
     ];
 
     private readonly ConcurrentDictionary<string, PtySession> _sessions = new();
-    private readonly IReadOnlyList<ShellProfile> _profiles;
+    private readonly Func<IReadOnlyList<ShellProfile>> _profiles;
+
+    /// <param name="profiles">Allowed shells. Read on every spawn, so config edits apply immediately.</param>
+    public PtyManager(Func<IReadOnlyList<ShellProfile>> profiles)
+    {
+        _profiles = profiles;
+    }
 
     public PtyManager(IReadOnlyList<ShellProfile>? profiles = null)
     {
-        _profiles = profiles ?? ShellProfiles.Detect();
+        var fixedProfiles = profiles ?? ShellProfiles.Detect();
+        _profiles = () => fixedProfiles;
     }
 
     /// <summary>Raised on a background thread for every output chunk.</summary>
@@ -34,7 +41,7 @@ public sealed partial class PtyManager : IAsyncDisposable
     /// <summary>Raised once per session when its process exits.</summary>
     public event Action<string, int?>? Exited;
 
-    public IReadOnlyList<ShellProfile> Profiles => _profiles;
+    public IReadOnlyList<ShellProfile> Profiles => _profiles();
 
     public IReadOnlyCollection<PtySession> Sessions => _sessions.Values.ToArray();
 
@@ -69,12 +76,21 @@ public sealed partial class PtyManager : IAsyncDisposable
                 env[key] = value;
             }
         }
+        if (profile.Env is not null)
+        {
+            foreach (var (key, value) in profile.Env)
+            {
+                if (EnvBlocklist.Contains(key, StringComparer.OrdinalIgnoreCase)) continue;
+                env.TryAdd(key, value);
+            }
+        }
 
         var connection = await PtyProvider.SpawnAsync(new PtyOptions
         {
             Name = opts.Id,
             App = profile.Path,
-            CommandLine = (opts.Args ?? profile.Args).ToArray(),
+            // Like the original: arguments come from the trusted profile, never from the frontend.
+            CommandLine = profile.Args.ToArray(),
             Cwd = cwd,
             Cols = cols,
             Rows = rows,
@@ -108,10 +124,11 @@ public sealed partial class PtyManager : IAsyncDisposable
 
     private ShellProfile ResolveProfile(string? shellPath)
     {
+        var profiles = _profiles();
         if (string.IsNullOrEmpty(shellPath))
-            return _profiles.FirstOrDefault() ?? throw new InvalidOperationException("No shell found on this system.");
+            return profiles.FirstOrDefault() ?? throw new InvalidOperationException("No shell found on this system.");
 
-        return _profiles.FirstOrDefault(p => PathsEqual(p.Path, shellPath))
+        return profiles.FirstOrDefault(p => PathsEqual(p.Path, shellPath))
                ?? throw new UnauthorizedAccessException($"Shell path not in configured profiles: {shellPath}");
     }
 

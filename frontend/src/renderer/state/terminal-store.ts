@@ -1,0 +1,5043 @@
+import { create } from 'zustand';
+import { v4 as uuidv4 } from 'uuid';
+import type {
+  TerminalId,
+  LayoutNode,
+  LayoutSplitNode,
+  LayoutLeafNode,
+  LayoutState,
+  FloatingPanelState,
+  PreFloatAnchor,
+  TerminalInstance,
+  AppConfig,
+  SplitDirection,
+  TabGroup,
+  Workspace,
+  WorkspaceId,
+  ClosedTerminalEntry,
+  ClosedPaneSnapshot,
+} from './types';
+import { DEFAULT_WORKSPACE_ID, DEFAULT_WORKSPACE_NAME } from './types';
+import type { CopilotSessionSummary } from '../../shared/copilot-types';
+import type { DiffMode } from '../../shared/diff-types';
+import type { RepoWorktrees } from '../../shared/worktree-types';
+import { getAllTerminals, getTerminalEntry, getCurrentInputLine } from '../terminal-registry';
+import { confirmDialog } from '../components/AppDialog';
+import { dropComposerDraft, updateComposerDrafts } from '../utils/prompt-composer';
+
+// Session IDs must be alphanumeric/dash/dot/underscore only (prevent shell injection)
+const SAFE_SESSION_ID = /^[a-zA-Z0-9._-]+$/;
+
+function validateSessionId(id: string): boolean {
+  return SAFE_SESSION_ID.test(id);
+}
+
+type SessionProvider = 'copilot' | 'claude-code';
+
+// ── Shared session/CWD helpers ─────────────────────────────────────
+// Centralizes the "find session by ID across both provider arrays" pattern
+// so callers don't hardcode provider-specific array names. When a third
+// provider is added, only these helpers need updating.
+
+/**
+ * Find a session by ID across all provider session lists.
+ * Returns the session summary or null if not found.
+ */
+export function findSessionById(
+  copilotSessions: CopilotSessionSummary[],
+  claudeCodeSessions: CopilotSessionSummary[],
+  sessionId: string,
+): CopilotSessionSummary | null {
+  return copilotSessions.find(x => x.id === sessionId)
+      ?? claudeCodeSessions.find(x => x.id === sessionId)
+      ?? null;
+}
+
+/**
+ * Resolve which provider owns a given session ID. Returns the provider
+ * tag or undefined when no provider has a matching session. Pairs with
+ * {@link findSessionById} for sites that need only the provider, not
+ * the full session object.
+ */
+export function getSessionProvider(
+  copilotSessions: CopilotSessionSummary[],
+  claudeCodeSessions: CopilotSessionSummary[],
+  sessionId: string | undefined,
+): 'copilot' | 'claude-code' | undefined {
+  if (!sessionId) return undefined;
+  if (copilotSessions.some((s) => s.id === sessionId)) return 'copilot';
+  if (claudeCodeSessions.some((s) => s.id === sessionId)) return 'claude-code';
+  return undefined;
+}
+
+/**
+ * Resolve the effective working directory for a terminal.
+ * Prefers the linked AI session's CWD when the session is active (not idle),
+ * falling back to the terminal's shell CWD otherwise. This avoids stale
+ * session CWDs overriding the shell's real directory after the CLI exits.
+ *
+ * See: https://github.com/yoziv/tmax/issues/3
+ */
+export function getEffectiveCwd(
+  terminal: TerminalInstance | undefined,
+  copilotSessions: CopilotSessionSummary[],
+  claudeCodeSessions: CopilotSessionSummary[],
+): string {
+  if (!terminal) return '';
+  if (terminal.aiSessionId) {
+    const sess = findSessionById(copilotSessions, claudeCodeSessions, terminal.aiSessionId);
+    if (sess?.cwd && sess.status !== 'idle') return sess.cwd;
+  }
+  return terminal.cwd ?? '';
+}
+
+/**
+ * Capture the bits of a TerminalInstance that the undo-close stack
+ * needs to recreate an equivalent pane (TASK-112). Provider for AI
+ * sessions is derived by looking the session id up in the live session
+ * lists, since TerminalInstance does not store it.
+ */
+function snapshotPaneForRestore(
+  instance: TerminalInstance,
+  copilotSessions: CopilotSessionSummary[],
+  claudeCodeSessions: CopilotSessionSummary[],
+): ClosedPaneSnapshot {
+  const aiProvider = getSessionProvider(copilotSessions, claudeCodeSessions, instance.aiSessionId);
+  return {
+    title: instance.title,
+    customTitle: instance.customTitle,
+    shellProfileId: instance.shellProfileId,
+    cwd: instance.cwd,
+    tabColor: instance.tabColor,
+    workspaceId: instance.workspaceId,
+    aiSessionId: instance.aiSessionId,
+    aiProvider,
+  };
+}
+
+/**
+ * Spawn a fresh pane from a closed-pane snapshot. Tries the AI-resume
+ * path first when the snapshot has an aiSessionId+aiProvider; falls
+ * back to a plain createTerminal if the AI session has rotated out of
+ * the live list. Patches the resulting pane with the snapshot's title,
+ * color, and workspaceId. Used by both pane and workspace restore.
+ */
+async function restorePaneFromSnapshot(
+  snap: ClosedPaneSnapshot,
+  get: () => TerminalStore,
+  set: (partial: Partial<TerminalStore> | ((s: TerminalStore) => Partial<TerminalStore>)) => void,
+): Promise<void> {
+  const beforeSize = get().terminals.size;
+  let restoredAsAi = false;
+
+  if (snap.aiSessionId && snap.aiProvider) {
+    if (snap.aiProvider === 'copilot') {
+      await get().openCopilotSession(snap.aiSessionId);
+    } else {
+      await get().openClaudeCodeSession(snap.aiSessionId);
+    }
+    restoredAsAi = get().terminals.size > beforeSize;
+  }
+
+  if (!restoredAsAi) {
+    await get().createTerminal(snap.shellProfileId, snap.cwd);
+  }
+
+  const { focusedTerminalId, terminals, workspaces, activeWorkspaceId } = get();
+  if (!focusedTerminalId) return;
+  const fresh = terminals.get(focusedTerminalId);
+  if (!fresh) return;
+
+  const targetWs = snap.workspaceId && workspaces.has(snap.workspaceId)
+    ? snap.workspaceId
+    : activeWorkspaceId;
+
+  const newTerminals = new Map(terminals);
+  newTerminals.set(focusedTerminalId, {
+    ...fresh,
+    title: snap.title,
+    customTitle: snap.customTitle,
+    tabColor: snap.tabColor,
+    workspaceId: targetWs,
+  });
+  set({ terminals: newTerminals });
+}
+
+function buildResumeCommand(config: AppConfig, provider: SessionProvider, sessionId: string): string {
+  const cmd = provider === 'copilot'
+    ? (config.copilotCommand || 'copilot')
+    : (config.claudeCodeCommand || 'claude');
+  return `${cmd} --resume ${sessionId}`;
+}
+
+async function openAiSession(
+  sessionId: string,
+  provider: SessionProvider,
+  get: () => TerminalStore,
+  set: (partial: Partial<TerminalStore> | ((s: TerminalStore) => Partial<TerminalStore>)) => void,
+): Promise<void> {
+  if (!validateSessionId(sessionId)) return;
+
+  // If a terminal with this session is already open, just focus it
+  const { terminals: existingTerminals } = get();
+  for (const [id, inst] of existingTerminals) {
+    if (inst.aiSessionId === sessionId) {
+      set({ focusedTerminalId: id });
+      return;
+    }
+  }
+
+  // Fetch session details via IPC
+  const session = provider === 'copilot'
+    ? await (window.terminalAPI as any).getCopilotSession(sessionId)
+    : await (window.terminalAPI as any).getClaudeCodeSession(sessionId);
+  if (!session) return;
+
+  const store = get();
+  const config = store.config;
+  if (!config) return;
+
+  // Determine WSL status from the session summary list
+  const sessionList = provider === 'copilot' ? store.copilotSessions : store.claudeCodeSessions;
+  const sessionSummary = sessionList.find((s) => s.id === sessionId);
+  const isWsl = sessionSummary?.wsl === true;
+  const wslDistro = sessionSummary?.wslDistro;
+
+  // Extract CWD from the session (different shape per provider)
+  const sessionCwd = provider === 'copilot' ? session.workspace?.cwd : session.cwd;
+
+  const id = uuidv4();
+  let shellProfileId: string;
+  let shellPath: string;
+  let shellArgs: string[];
+  let shellEnv: Record<string, string> | undefined;
+  let termCwd: string;
+
+  if (isWsl && wslDistro) {
+    const wslProfile = config.shells.find((s) => s.id === 'wsl');
+    if (!wslProfile) return;
+    shellProfileId = 'wsl';
+    shellPath = wslProfile.path;
+    shellArgs = wslProfile.args;
+    shellEnv = wslProfile.env;
+    termCwd = sessionCwd || '/';
+  } else {
+    const profileId = config.defaultShellId;
+    const profile = config.shells.find((s) => s.id === profileId);
+    if (!profile) return;
+    shellProfileId = profileId;
+    shellPath = profile.path;
+    shellArgs = profile.args;
+    shellEnv = profile.env;
+    termCwd = sessionCwd || profile.cwd || (navigator.platform.startsWith('Win') ? 'C:\\Users' : '/');
+  }
+
+  const startupCommand = buildResumeCommand(config, provider, sessionId);
+
+  const { pid } = await window.terminalAPI.createPty({
+    id, shellPath, args: shellArgs, cwd: termCwd, env: shellEnv,
+    cols: 80, rows: 24,
+    wslDistro: isWsl ? wslDistro : undefined,
+  });
+
+  // Build display title
+  let displayName: string;
+  if (provider === 'copilot') {
+    displayName = session.workspace?.summary
+      || (session.workspace?.repository ? session.workspace.repository.split('/').pop() : null)
+      || session.workspace?.name
+      || sessionId.slice(0, 8);
+  } else {
+    displayName = session.summary || sessionId.slice(0, 8);
+  }
+
+  // Auto-color the new pane when colorize-all-tabs is on, so opening a
+  // session from the AI list doesn't drop in with the default theme bg
+  // (had to manually run Colorize Again to give it a color otherwise).
+  let tabColor: string | undefined;
+  {
+    const { autoColorTabs, terminals: existingTerminals, activeWorkspaceId } = get();
+    if (autoColorTabs) {
+      const colorCounts = new Map<string, number>();
+      for (const c of TAB_COLORS) colorCounts.set(c.value, 0);
+      for (const t of existingTerminals.values()) {
+        if ((t.workspaceId ?? activeWorkspaceId) !== activeWorkspaceId) continue;
+        if (t.tabColor && colorCounts.has(t.tabColor)) {
+          colorCounts.set(t.tabColor, (colorCounts.get(t.tabColor) ?? 0) + 1);
+        }
+      }
+      let minCount = Infinity;
+      for (const [color, count] of colorCounts) {
+        if (count < minCount) { minCount = count; tabColor = color; }
+      }
+    }
+  }
+
+  const instance: TerminalInstance = {
+    id,
+    title: displayName,
+    shellProfileId,
+    cwd: isWsl ? (sessionCwd || termCwd) : termCwd,
+    customTitle: true,
+    aiAutoTitle: true,
+    mode: 'tiled',
+    pid,
+    lastProcess: '',
+    startupCommand,
+    aiSessionId: sessionId,
+    wsl: isWsl || undefined,
+    wslDistro: wslDistro || undefined,
+    workspaceId: get().activeWorkspaceId,
+    tabColor,
+  };
+
+  const { terminals, layout } = get();
+  const newTerminals = new Map(terminals);
+  newTerminals.set(id, instance);
+  const newLeaf: LayoutLeafNode = { kind: 'leaf', terminalId: id };
+  let newRoot: LayoutNode;
+  if (layout.tilingRoot === null) {
+    newRoot = newLeaf;
+  } else {
+    const order = getLeafOrder(layout.tilingRoot);
+    newRoot = insertLeaf(layout.tilingRoot, order[order.length - 1], id, 'right');
+  }
+
+  const { viewMode, preGridRoot, gridColumns } = get();
+  let newPreGridRoot = preGridRoot;
+  if (viewMode === 'grid') {
+    if (preGridRoot) {
+      const preOrder = getLeafOrder(preGridRoot);
+      newPreGridRoot = insertLeaf(preGridRoot, preOrder[preOrder.length - 1], id, 'right');
+    }
+    const allIds = getLeafOrder(newRoot);
+    newRoot = buildGridTree(allIds, gridColumns || undefined) || newRoot;
+  }
+
+  set({
+    terminals: newTerminals,
+    layout: { ...layout, tilingRoot: newRoot },
+    focusedTerminalId: id,
+    preGridRoot: newPreGridRoot,
+  });
+}
+
+export const TAB_COLORS = [
+  // First 4 = Microsoft logo colors
+  { name: 'Red', value: '#F25022' },
+  { name: 'Green', value: '#7FBA00' },
+  { name: 'Blue', value: '#00A4EF' },
+  { name: 'Yellow', value: '#FFB900' },
+  // Extended palette - Fluent UI tones so they sit next to the MS logo colors without clashing
+  { name: 'Purple', value: '#6264A7' },
+  { name: 'Teal', value: '#00B7C3' },
+  { name: 'Magenta', value: '#C239B3' },
+  { name: 'Orange', value: '#D83B01' },
+  { name: 'Pink', value: '#E3008C' },
+  { name: 'Indigo', value: '#4F32B5' },
+  { name: 'Brown', value: '#8E562E' },
+  { name: 'Lime', value: '#BAD80A' },
+  { name: 'Gray', value: '#737373' },
+  { name: 'Dark', value: '#323130' },
+  { name: 'Black', value: '#000000' },
+  { name: 'White', value: '#FFFFFF' },
+];
+
+// ── Theme → CSS variable sync ────────────────────────────────────────
+
+function hexToRgb(hex: string): { r: number; g: number; b: number } | null {
+  const m = /^#?([a-f\d]{2})([a-f\d]{2})([a-f\d]{2})$/i.exec(hex);
+  return m ? { r: parseInt(m[1], 16), g: parseInt(m[2], 16), b: parseInt(m[3], 16) } : null;
+}
+
+function luminance(hex: string): number {
+  const rgb = hexToRgb(hex);
+  if (!rgb) return 0;
+  return (0.299 * rgb.r + 0.587 * rgb.g + 0.114 * rgb.b) / 255;
+}
+
+function adjustBrightness(hex: string, amount: number): string {
+  const rgb = hexToRgb(hex);
+  if (!rgb) return hex;
+  const clamp = (n: number) => Math.max(0, Math.min(255, Math.round(n)));
+  return `#${[clamp(rgb.r + amount), clamp(rgb.g + amount), clamp(rgb.b + amount)].map(c => c.toString(16).padStart(2, '0')).join('')}`;
+}
+
+function hexToRgba(hex: string, alpha: number): string {
+  const rgb = hexToRgb(hex);
+  if (!rgb) return hex;
+  return `rgba(${rgb.r}, ${rgb.g}, ${rgb.b}, ${alpha})`;
+}
+
+export function applyThemeToChromeVars(theme: Record<string, string>, transparencyOpacity?: number): void {
+  const bg = theme.background || '#1e1e2e';
+  const fg = theme.foreground || '#cdd6f4';
+  const isLight = luminance(bg) > 0.5;
+  const step = isLight ? -15 : 15;
+  const useTransparency = transparencyOpacity !== undefined && transparencyOpacity < 1;
+
+  const root = document.documentElement;
+
+  if (useTransparency) {
+    root.style.setProperty('--bg-primary', hexToRgba(bg, transparencyOpacity));
+    root.style.setProperty('--bg-secondary', hexToRgba(adjustBrightness(bg, step), transparencyOpacity));
+    root.style.setProperty('--tab-bg', hexToRgba(adjustBrightness(bg, step), transparencyOpacity));
+    root.style.setProperty('--tab-active', hexToRgba(adjustBrightness(bg, step * 2), transparencyOpacity));
+    root.classList.add('transparency-active');
+  } else {
+    root.style.setProperty('--bg-primary', bg);
+    root.style.setProperty('--bg-secondary', adjustBrightness(bg, step));
+    root.style.setProperty('--tab-bg', adjustBrightness(bg, step));
+    root.style.setProperty('--tab-active', adjustBrightness(bg, step * 2));
+    root.classList.remove('transparency-active');
+  }
+
+  root.style.setProperty('--border-color', adjustBrightness(bg, step * 2));
+  root.style.setProperty('--text-primary', fg);
+  root.style.setProperty('--text-secondary', adjustBrightness(fg, isLight ? 60 : -60));
+  root.style.setProperty('--focus-border', theme.blue || '#89b4fa');
+
+  // Sync every live xterm.js instance so canvases match the new transparency
+  syncTerminalTransparency(theme, useTransparency && transparencyOpacity !== undefined ? transparencyOpacity : undefined);
+}
+
+// ── Tab-color tint blending (TASK-170) ───────────────────────────────
+//
+// The pane tint is one user-facing knob ("Tab color intensity", 0-100,
+// default 40) that fans out into several blends:
+//   - Title-bar background    -> tintAlpha (rgba over the chrome bg)
+//   - Pane body (xterm theme.background) -> bodyAlpha (color-mix with
+//                                            the theme background)
+//   - xterm foreground/cursor -> flipped to a dark tone when the
+//                                resulting body bg is light enough to
+//                                make pale text unreadable
+//
+// Two policies live in here:
+//   1) Neutrals (very-low-chroma colors like Black / White / Gray /
+//      Dark) honor the full intensity for the body fill too - users
+//      asked for "a black tab is a real black pane regardless of
+//      slider" and capping black would just make it dark gray.
+//   2) Vivid colors cap their body alpha by chroma so an intense
+//      orange/red/pink doesn't drown the terminal in saturated color
+//      that fights the text.
+const NEUTRAL_CHROMA_THRESHOLD = 32;
+
+function chroma(hex: string): number {
+  const rgb = hexToRgb(hex);
+  if (!rgb) return 0;
+  return Math.max(rgb.r, rgb.g, rgb.b) - Math.min(rgb.r, rgb.g, rgb.b);
+}
+
+function blendRgb(
+  fg: { r: number; g: number; b: number },
+  bg: { r: number; g: number; b: number },
+  alpha: number,
+): { r: number; g: number; b: number } {
+  return {
+    r: Math.round(fg.r * alpha + bg.r * (1 - alpha)),
+    g: Math.round(fg.g * alpha + bg.g * (1 - alpha)),
+    b: Math.round(fg.b * alpha + bg.b * (1 - alpha)),
+  };
+}
+
+function rgbToHex({ r, g, b }: { r: number; g: number; b: number }): string {
+  const c = (n: number) => Math.max(0, Math.min(255, n)).toString(16).padStart(2, '0');
+  return `#${c(r)}${c(g)}${c(b)}`;
+}
+
+function luminanceRgb({ r, g, b }: { r: number; g: number; b: number }): number {
+  return (0.299 * r + 0.587 * g + 0.114 * b) / 255;
+}
+
+export interface TabTintResult {
+  /** rgba string for the pane title-bar background. */
+  titleBg: string;
+  /** Solid rgb string for a slim accent stripe under the title bar, keeping the
+   *  pane's color identity strong while the fill itself stays subtle. */
+  titleAccent: string;
+  /** Solid hex (or rgba if baseBg is rgba) for xterm.theme.background. */
+  terminalBg: string;
+  /** xterm.theme.foreground override (dark tone when bg is too light). */
+  terminalFg?: string;
+  /** xterm.theme.cursor override (dark tone when bg is too light). */
+  terminalCursor?: string;
+}
+
+/**
+ * Compute the tint applied to a pane that has a tab color.
+ *
+ * - intensity: 0-100, defaults to 40 (preserves the original look for
+ *   users who never touch the slider).
+ * - focused: drives title-bar alpha. Focused panes get the full
+ *   intensity; unfocused panes get half so out-of-focus chrome stays
+ *   subtle.
+ * - tintHex: the per-pane / group / workspace / default color.
+ * - baseBgHex: theme.background (already opacity-adjusted by the caller
+ *   if window transparency is on).
+ */
+export function computeTabTint(
+  tintHex: string,
+  baseBgHex: string,
+  intensity: number,
+  focused: boolean,
+): TabTintResult {
+  const tint = hexToRgb(tintHex);
+  const base = hexToRgb(baseBgHex);
+  // Defensive: malformed colors → fall back to base bg untouched.
+  if (!tint || !base) {
+    return { titleBg: tintHex, titleAccent: tintHex, terminalBg: baseBgHex };
+  }
+  const i = Math.max(0, Math.min(100, intensity)) / 100;
+  const isNeutral = chroma(tintHex) <= NEUTRAL_CHROMA_THRESHOLD;
+
+  // Title bar: a SUBTLE tint, not a wall of color. Cap much lower than before
+  // so the colored bar reads as tinted chrome; the pane's real color identity
+  // comes from the slim solid accent stripe (titleAccent) rendered under the
+  // bar. focused = fuller tint, unfocused = half. Neutrals may fill more since
+  // a grey/black bar is chrome, not a loud accent.
+  const titleCap = isNeutral ? 0.85 : 0.22;
+  const titleAlpha = Math.min(titleCap, focused ? i * 0.55 : i * 0.28);
+
+  // Body fill: vivid colors are accents, never walls. Hard cap at 0.20
+  // alpha so a colored pane reads as "tinted" rather than "filled". At
+  // default intensity 40, a vivid tab paints body bg at ~0.08 alpha -
+  // matches the pre-TASK-170 per-pane overlay feel.
+  // Neutrals (black/white/gray) bypass the cap so the user can dial them
+  // in fully: Black at intensity 100 paints a truly solid black pane.
+  let bodyAlpha = i;
+  if (!isNeutral) {
+    bodyAlpha = Math.min(0.20, i * 0.20);
+  }
+
+  const blendedBody = blendRgb(tint, base, bodyAlpha);
+  const terminalBg = rgbToHex(blendedBody);
+  const titleBg = `rgba(${tint.r}, ${tint.g}, ${tint.b}, ${titleAlpha})`;
+  // Solid accent stripe colour: dimmed a touch when unfocused so the active
+  // pane's stripe stands out.
+  const accentAlpha = focused ? 0.9 : 0.45;
+  const titleAccent = `rgba(${tint.r}, ${tint.g}, ${tint.b}, ${accentAlpha})`;
+
+  // Light pane: flip xterm foreground / cursor to dark so text stays
+  // readable. Threshold tuned at 0.55 - matches the user-verified value
+  // from the original task notes.
+  const useDarkText = luminanceRgb(blendedBody) > 0.55;
+  return useDarkText
+    ? {
+        titleBg,
+        titleAccent,
+        terminalBg,
+        terminalFg: '#1a1a1a',
+        terminalCursor: '#1a1a1a',
+      }
+    : { titleBg, titleAccent, terminalBg };
+}
+
+/**
+ * Update all live xterm.js terminal instances to match the current
+ * transparency / theme settings so terminals don't keep stale backgrounds.
+ */
+function syncTerminalTransparency(theme: Record<string, string>, opacity?: number): void {
+  const terminals = getAllTerminals();
+  const bg = theme.background || '#1e1e2e';
+  const useTransparency = opacity !== undefined && opacity < 1;
+  const bgColor = useTransparency ? hexToRgba(bg, opacity) : bg;
+
+  for (const term of terminals) {
+    term.options.allowTransparency = useTransparency;
+    term.options.theme = {
+      ...term.options.theme,
+      background: bgColor,
+    };
+    term.refresh(0, term.rows - 1);
+  }
+}
+
+// ── Pure tree helper functions ───────────────────────────────────────
+
+/**
+ * Remove a leaf from the tree. If the leaf is inside a split, promote its
+ * sibling to replace the split node. Returns null if the tree becomes empty.
+ */
+/**
+ * Swap the terminalId on a leaf node in-place (immutable rewrite). Used by
+ * TASK-173's "new terminal in place" - the layout slot stays exactly where
+ * it was; only the underlying terminal id is replaced.
+ */
+export function replaceLeafTerminalId(
+  root: LayoutNode,
+  oldId: TerminalId,
+  newId: TerminalId,
+): LayoutNode {
+  if (root.kind === 'leaf') {
+    return root.terminalId === oldId ? { ...root, terminalId: newId } : root;
+  }
+  const first = replaceLeafTerminalId(root.first, oldId, newId);
+  const second = replaceLeafTerminalId(root.second, oldId, newId);
+  if (first === root.first && second === root.second) return root;
+  return { ...root, first, second };
+}
+
+export function removeLeaf(
+  root: LayoutNode,
+  terminalId: TerminalId,
+): LayoutNode | null {
+  if (root.kind === 'leaf') {
+    return root.terminalId === terminalId ? null : root;
+  }
+
+  const firstResult = removeLeaf(root.first, terminalId);
+  const secondResult = removeLeaf(root.second, terminalId);
+
+  // The leaf was not found in either subtree — return unchanged
+  if (firstResult === root.first && secondResult === root.second) {
+    return root;
+  }
+
+  // Leaf was in the first subtree
+  if (firstResult === null) return secondResult;
+  // Leaf was in the second subtree
+  if (secondResult === null) return firstResult;
+
+  // Leaf was removed deeper, but both children still exist
+  return { ...root, first: firstResult, second: secondResult };
+}
+
+/**
+ * Insert a new leaf beside the target leaf. Creates a split node wrapping the
+ * existing target and the new terminal.
+ */
+export function insertLeaf(
+  root: LayoutNode,
+  targetId: TerminalId,
+  newId: TerminalId,
+  side: 'left' | 'right' | 'top' | 'bottom',
+): LayoutNode {
+  if (root.kind === 'leaf') {
+    if (root.terminalId !== targetId) return root;
+
+    const direction: SplitDirection =
+      side === 'left' || side === 'right' ? 'horizontal' : 'vertical';
+    const newLeaf: LayoutLeafNode = { kind: 'leaf', terminalId: newId };
+    const isNewFirst = side === 'left' || side === 'top';
+
+    const splitNode: LayoutSplitNode = {
+      kind: 'split',
+      id: uuidv4(),
+      direction,
+      splitRatio: 0.5,
+      first: isNewFirst ? newLeaf : root,
+      second: isNewFirst ? root : newLeaf,
+    };
+    return splitNode;
+  }
+
+  const newFirst = insertLeaf(root.first, targetId, newId, side);
+  const newSecond = insertLeaf(root.second, targetId, newId, side);
+
+  if (newFirst === root.first && newSecond === root.second) return root;
+  return { ...root, first: newFirst, second: newSecond };
+}
+
+/**
+ * In-order traversal of the layout tree returning terminal IDs from left to
+ * right (first to second).
+ */
+export function getLeafOrder(root: LayoutNode): TerminalId[] {
+  if (root.kind === 'leaf') return [root.terminalId];
+  return [...getLeafOrder(root.first), ...getLeafOrder(root.second)];
+}
+
+/**
+ * Replace whatever subtree currently sits at `path` with `replacement`. Used
+ * when restoring a floated leaf back to its parent's former position - the
+ * "sibling subtree" may have been edited during the float, so we wrap
+ * whatever's there now rather than the snapshot.
+ */
+function setSubtreeAtPath(
+  root: LayoutNode,
+  path: ('first' | 'second')[],
+  replacement: LayoutNode,
+): LayoutNode | null {
+  if (path.length === 0) return replacement;
+  if (root.kind !== 'split') return null; // path runs off the end
+  const [step, ...rest] = path;
+  const child = root[step];
+  const newChild = setSubtreeAtPath(child, rest, replacement);
+  if (newChild === null) return null;
+  return { ...root, [step]: newChild };
+}
+
+/**
+ * Re-insert a leaf at the position captured by its preFloatAnchor. Returns
+ * null when the saved path is no longer reachable in the current tree (e.g.
+ * the user closed/restructured tiles during the float), letting callers fall
+ * back to the heuristic insert.
+ */
+export function restoreFromPreFloatAnchor(
+  root: LayoutNode | null,
+  leafId: TerminalId,
+  anchor: PreFloatAnchor,
+): LayoutNode | null {
+  const newLeaf: LayoutLeafNode = { kind: 'leaf', terminalId: leafId };
+  if (root === null) return newLeaf;
+  // Walk parentPath in the current tree.
+  let target: LayoutNode = root;
+  for (const step of anchor.parentPath) {
+    if (target.kind !== 'split') return null;
+    target = target[step];
+  }
+  // `target` is whatever sits at the parent's former position now (a single
+  // leaf that was the lone surviving sibling, or a subtree the user added to
+  // during the float). Wrap it with the floated leaf in the saved direction
+  // and ratio.
+  const wrappedSplit: LayoutSplitNode = {
+    kind: 'split',
+    id: uuidv4(),
+    direction: anchor.parentDirection,
+    splitRatio: anchor.parentRatio,
+    first: anchor.position === 'first' ? newLeaf : target,
+    second: anchor.position === 'first' ? target : newLeaf,
+  };
+  return setSubtreeAtPath(root, anchor.parentPath, wrappedSplit);
+}
+
+/**
+ * Find the path from the root to a specific leaf node. Returns an array of
+ * 'first'|'second' steps, or null if not found.
+ */
+export function findLeafPath(
+  root: LayoutNode,
+  terminalId: TerminalId,
+): ('first' | 'second')[] | null {
+  if (root.kind === 'leaf') {
+    return root.terminalId === terminalId ? [] : null;
+  }
+
+  const firstPath = findLeafPath(root.first, terminalId);
+  if (firstPath !== null) return ['first', ...firstPath];
+
+  const secondPath = findLeafPath(root.second, terminalId);
+  if (secondPath !== null) return ['second', ...secondPath];
+
+  return null;
+}
+
+/**
+ * Immutably update the splitRatio of a split node identified by its id.
+ * Returns the tree unchanged if the node is not found.
+ */
+export function updateSplitRatio(
+  root: LayoutNode,
+  splitNodeId: string,
+  ratio: number,
+): LayoutNode {
+  if (root.kind === 'leaf') return root;
+
+  if (root.id === splitNodeId) {
+    return { ...root, splitRatio: Math.max(0.1, Math.min(0.9, ratio)) };
+  }
+
+  const newFirst = updateSplitRatio(root.first, splitNodeId, ratio);
+  const newSecond = updateSplitRatio(root.second, splitNodeId, ratio);
+
+  if (newFirst === root.first && newSecond === root.second) return root;
+  return { ...root, first: newFirst, second: newSecond };
+}
+
+/**
+ * Swap the terminal IDs of two leaf nodes in the tree.
+ */
+function swapLeaves(
+  root: LayoutNode,
+  idA: TerminalId,
+  idB: TerminalId,
+): LayoutNode {
+  if (root.kind === 'leaf') {
+    if (root.terminalId === idA) return { ...root, terminalId: idB };
+    if (root.terminalId === idB) return { ...root, terminalId: idA };
+    return root;
+  }
+
+  const newFirst = swapLeaves(root.first, idA, idB);
+  const newSecond = swapLeaves(root.second, idA, idB);
+
+  if (newFirst === root.first && newSecond === root.second) return root;
+  return { ...root, first: newFirst, second: newSecond };
+}
+
+/**
+ * Walk the tree to find a directional neighbor of the given terminal.
+ * Uses the path-based approach: walk up until we can step in the desired
+ * direction, then walk down to the nearest leaf on the opposite edge.
+ */
+function findDirectionalNeighbor(
+  root: LayoutNode,
+  terminalId: TerminalId,
+  direction: 'left' | 'right' | 'up' | 'down',
+): TerminalId | null {
+  const path = findLeafPath(root, terminalId);
+  if (path === null) return null;
+
+  // Determine which split axis and which step direction we need
+  const axis: SplitDirection =
+    direction === 'left' || direction === 'right' ? 'horizontal' : 'vertical';
+  const fromSide: 'first' | 'second' =
+    direction === 'right' || direction === 'down' ? 'first' : 'second';
+  const toSide: 'first' | 'second' =
+    fromSide === 'first' ? 'second' : 'first';
+
+  // Walk back up the path to find a split node where we can cross
+  let node: LayoutNode = root;
+  const nodes: LayoutSplitNode[] = [];
+
+  // Collect all split nodes along the path
+  for (const step of path) {
+    if (node.kind === 'split') {
+      nodes.push(node);
+      node = node[step];
+    }
+  }
+
+  // Walk backwards through the path to find a crossable split
+  for (let i = path.length - 1; i >= 0; i--) {
+    const splitNode = nodes[i];
+    if (splitNode.direction === axis && path[i] === fromSide) {
+      // We can cross into the toSide subtree
+      let target: LayoutNode = splitNode[toSide];
+      // Walk down to the nearest leaf on the edge closest to us
+      while (target.kind === 'split') {
+        if (target.direction === axis) {
+          target = target[fromSide];
+        } else {
+          // Perpendicular split — pick first by convention
+          target = target.first;
+        }
+      }
+      return target.terminalId;
+    }
+  }
+
+  return null;
+}
+
+// ── Grid layout builder ──────────────────────────────────────────────
+
+function buildGridRow(ids: TerminalId[]): LayoutNode {
+  if (ids.length === 1) return { kind: 'leaf', terminalId: ids[0] };
+  const mid = Math.ceil(ids.length / 2);
+  return {
+    kind: 'split',
+    id: uuidv4(),
+    direction: 'horizontal',
+    splitRatio: mid / ids.length,
+    first: buildGridRow(ids.slice(0, mid)),
+    second: buildGridRow(ids.slice(mid)),
+  };
+}
+
+function stackGridRows(nodes: LayoutNode[]): LayoutNode {
+  if (nodes.length === 1) return nodes[0];
+  const mid = Math.ceil(nodes.length / 2);
+  return {
+    kind: 'split',
+    id: uuidv4(),
+    direction: 'vertical',
+    splitRatio: mid / nodes.length,
+    first: stackGridRows(nodes.slice(0, mid)),
+    second: stackGridRows(nodes.slice(mid)),
+  };
+}
+
+function buildGridTree(terminalIds: TerminalId[], forceCols?: number): LayoutNode | null {
+  if (terminalIds.length === 0) return null;
+  if (terminalIds.length === 1) return { kind: 'leaf', terminalId: terminalIds[0] };
+  const n = terminalIds.length;
+  const cols = forceCols && forceCols > 0 ? Math.min(forceCols, n) : Math.ceil(Math.sqrt(n));
+  const rows = Math.ceil(n / cols);
+  const rowNodes: LayoutNode[] = [];
+  let idx = 0;
+  for (let r = 0; r < rows; r++) {
+    const rowTerminals: TerminalId[] = [];
+    for (let c = 0; c < cols && idx < n; c++) {
+      rowTerminals.push(terminalIds[idx++]);
+    }
+    rowNodes.push(buildGridRow(rowTerminals));
+  }
+  return stackGridRows(rowNodes);
+}
+
+// ── Store interface ──────────────────────────────────────────────────
+
+interface TerminalStore {
+  // State
+  terminals: Map<TerminalId, TerminalInstance>;
+  /**
+   * Active workspace's layout. In flat tab-mode (today's default) there
+   * is exactly one workspace and this is the canonical grid. In
+   * workspaces tab-mode, this mirrors `workspaces.get(activeWorkspaceId)
+   * .layout` and gets swapped on workspace switch. (TASK-40)
+   */
+  layout: LayoutState;
+  /** All workspaces by id. (TASK-40) */
+  workspaces: Map<WorkspaceId, Workspace>;
+  /** Which workspace is currently rendered in the grid. (TASK-40) */
+  activeWorkspaceId: WorkspaceId;
+  focusedTerminalId: TerminalId | null;
+  config: AppConfig | null;
+  isDragging: boolean;
+  draggedTerminalId: TerminalId | null;
+  nextZIndex: number;
+  showSwitcher: boolean;
+  showPromptSearch: boolean;
+  showPaneHints: boolean;
+  showShortcuts: boolean;
+  showCommandPalette: boolean;
+  showSettings: boolean;
+  showBacklog: boolean;
+  tabBarPosition: 'top' | 'bottom' | 'left' | 'right';
+  hideTabTitles: boolean;
+  hideTabCloseButtons: boolean;
+  // When true, closing a tab/pane asks for confirmation first so an
+  // accidental X-click or middle-click doesn't kill a live session. Bulk
+  // closes collapse to a single aggregate confirm. Opt-in; default off.
+  confirmOnCloseSession: boolean;
+  renamingTerminalId: TerminalId | null;
+  viewMode: 'split' | 'focus' | 'grid';
+  broadcastMode: boolean; // when true, typing in any pane is sent to all tiled panes
+  windowFocused: boolean; // mirrored from window focus/blur; gates the per-pane shimmer (TASK-140)
+  // Set of AI session IDs the user has acknowledged in their current waiting
+  // state - the user focused the pane while it was waitingForUser /
+  // awaitingApproval, so further shimmers are suppressed until the AI moves
+  // off the waiting state and re-enters it (a fresh "needs attention" event).
+  acknowledgedWaitingSessions: Record<string, true>;
+  gridColumns: number; // 0 = auto (sqrt-based), 1..N = fixed column count
+  preGridRoot: LayoutNode | null; // saved layout before entering grid mode
+  selectedTerminalIds: Record<TerminalId, true>;
+  gridTabIds: Record<TerminalId, true>;
+  fontSize: number;
+  terminalOpacity: number;
+  favoriteDirs: string[];
+  recentDirs: string[];
+  showDirPicker: boolean;
+  showFileExplorer: boolean;
+  // When set, FileExplorer consumes this path on next open then clears it.
+  fileExplorerTargetPath: string | null;
+  showWorktreePanel: boolean;
+  worktreeRepos: RepoWorktrees[];
+  worktreeLoading: boolean;
+  tabMenuTerminalId: TerminalId | null;
+  autoColorTabs: boolean;
+  showCopilotPanel: boolean;
+  // Counter that bumps when something explicitly asks the AI Sessions
+  // panel to re-evaluate its highlighted session - lets the panel re-run
+  // its auto-highlight effect even when focusedTerminalId hasn't changed
+  // (which would otherwise short-circuit the edge-trigger).
+  aiSessionHighlightRequest: number;
+  copilotSessions: CopilotSessionSummary[];
+  claudeCodeSessions: CopilotSessionSummary[];
+  /** Total eligible Copilot sessions on disk (may be larger than copilotSessions.length) */
+  copilotSessionsTotal: number;
+  /** Total eligible Claude Code sessions on disk */
+  claudeCodeSessionsTotal: number;
+  /** Current load limit for Copilot sessions */
+  copilotSessionsLimit: number;
+  /** Current load limit for Claude Code sessions */
+  claudeCodeSessionsLimit: number;
+  sessionNameOverrides: Record<string, string>;
+  sessionLifecycleOverrides: Record<string, import('../../shared/copilot-types').SessionLifecycle>;
+  /**
+   * Stack of recently closed panes for browser-style undo close
+   * (Ctrl+Shift+T, TASK-112). Most recent at the END. Capped at 10
+   * entries; older entries are evicted from the front.
+   */
+  closedTerminals: ClosedTerminalEntry[];
+  /** Session IDs the user has pinned to the top of the AI sessions list */
+  sessionPinned: Record<string, true>;
+  toastNotifications: Array<{ id: string; message: string; timestamp: number }>;
+  copilotSearchQuery: string;
+  copilotSearching: boolean;
+  copilotSqliteActive: boolean;
+  // Per-pane generation counter bumped by refreshTerminal(). React uses
+  // this as the xterm wrapper's `key` to force unmount+remount; the PTY
+  // lives in main, so the underlying shell process is untouched. Soft
+  // escape hatch for input-freezes (GH #101 / TASK-156).
+  refreshGenerations: Record<string, number>;
+  selectedCopilotSessionId: string | null;
+  // Prompts dialog state. Either terminalId (for the per-pane Ctrl+Shift+K
+  // shortcut) or sessionId (for opening from the session summary popover).
+  promptsDialogRequest: { terminalId?: TerminalId; sessionId?: string; scrollToPromptIndex?: number } | null;
+  // AI session summary popover - holds the session ID that should be shown.
+  sessionSummaryRequest: string | null;
+  // Prompt composer dialog - notepad-style scratchpad opened from the per-pane
+  // context menu. promptComposerRequest holds the target terminal id (or null
+  // when closed); composerDrafts stores the in-flight text per terminal so a
+  // user can close and reopen the dialog without losing their draft for the
+  // current session.
+  promptComposerRequest: TerminalId | null;
+  composerDrafts: Record<string, string>;
+  // Side-panel preview state. Despite the legacy name, also carries image
+  // previews now (kind: 'image') - the same overlay component branches on
+  // kind to render <img> vs sanitized markdown.
+  markdownPreview: { filePath: string; content: string; fileName: string; kind?: 'md' | 'image' } | null;
+  // AI-session chat transcript side panel (TASK-146). When open it follows the
+  // focused pane's AI session.
+  transcriptOpen: boolean;
+  // Diff review state
+  diffReviewOpen: boolean;
+  diffReviewTerminalId: TerminalId | null;
+  diffReviewMode: DiffMode;
+  // Tab groups
+  tabGroups: Map<string, TabGroup>;
+
+  // Actions
+  loadConfig: () => Promise<void>;
+  createTerminal: (shellProfileId?: string, cwdOverride?: string) => Promise<void>;
+  closeTerminal: (id: TerminalId, opts?: { skipConfirm?: boolean }) => Promise<void>;
+  // Close many tabs at once with a single aggregate confirm (instead of
+  // one dialog per tab). Used by Close All / Close Others / close group.
+  closeTerminals: (ids: TerminalId[]) => Promise<void>;
+  replaceTerminal: (id: TerminalId, shellProfileId?: string) => Promise<void>;
+  /**
+   * Browser-style undo close (TASK-112). Pops the most recent entry off
+   * closedTerminals and creates a fresh pane reusing its shellProfileId,
+   * cwd, title, color, and workspace. No-op when the stack is empty.
+   */
+  restoreClosedTerminal: () => Promise<void>;
+  setFocus: (id: TerminalId) => void;
+  splitTerminal: (
+    targetId: TerminalId,
+    direction: SplitDirection,
+    newTerminalId?: TerminalId,
+    insertSide?: 'left' | 'right' | 'top' | 'bottom',
+  ) => Promise<void>;
+  setSplitRatio: (splitNodeId: string, ratio: number) => void;
+  swapTerminals: (idA: TerminalId, idB: TerminalId) => void;
+  reorderTerminals: (draggedId: TerminalId, overId: TerminalId) => void;
+  moveToFloat: (id: TerminalId) => void;
+  moveToTiling: (id: TerminalId, targetId?: TerminalId, side?: 'left' | 'right' | 'top' | 'bottom') => void;
+  insertAtRoot: (id: TerminalId, side: 'left' | 'right' | 'top' | 'bottom') => void;
+  moveToDormant: (id: TerminalId) => void;
+  wakeFromDormant: (id: TerminalId) => void;
+  detachTerminal: (id: TerminalId) => Promise<void>;
+  reattachTerminal: (id: TerminalId) => void;
+  updateFloatingPanel: (id: TerminalId, partial: Partial<FloatingPanelState>) => void;
+  focusNext: () => void;
+  focusPrev: () => void;
+  focusDirection: (dir: 'left' | 'right' | 'up' | 'down') => void;
+  renameTerminal: (id: TerminalId, title: string, custom?: boolean, opts?: { firstCommand?: boolean }) => void;
+  setExternalTitle: (id: TerminalId, title: string) => void;
+  setTabColor: (id: TerminalId, color: string | undefined) => void;
+  colorizeAllTabs: () => void;
+  setDragging: (isDragging: boolean, terminalId?: TerminalId) => void;
+  toggleSwitcher: () => void;
+  togglePromptSearch: () => void;
+  togglePaneHints: () => void;
+  toggleShortcuts: () => void;
+  toggleCommandPalette: () => void;
+  toggleSettings: () => void;
+  toggleBacklog: () => void;
+  closeBacklog: () => void;
+  closeSettings: () => void;
+  updateConfig: (update: Partial<AppConfig>) => Promise<void>;
+  toggleTabBarPosition: () => void;
+  toggleHideTabTitles: () => void;
+  toggleHideTabCloseButtons: () => void;
+  toggleConfirmOnCloseSession: () => void;
+  setTerminalOpacity: (opacity: number) => void;
+  startRenaming: (id: TerminalId | null) => void;
+  toggleViewMode: () => void;
+  toggleBroadcastMode: () => void;
+  toggleSelectTerminal: (id: TerminalId) => void;
+  clearSelection: () => void;
+  gridSelectedTabs: (ids: TerminalId[]) => void;
+  /**
+   * TASK-72: hide every pane in the active workspace that is NOT in
+   * `selectedTerminalIds`, by re-laying out only the selected ones into
+   * an equal grid. The original layout is saved to preGridRoot so
+   * showAllPanes() can restore it. Selection is preserved (unlike
+   * gridSelectedTabs) so the user can still see which panes they picked.
+   * No-op if fewer than 2 panes are selected.
+   */
+  showSelectedPanes: () => void;
+  /**
+   * TASK-72: counterpart to showSelectedPanes - exits the filtered view
+   * and restores the pre-filter layout via preGridRoot. No-op if no
+   * filter is active. Selection is left intact.
+   */
+  showAllPanes: () => void;
+  equalizeLayout: () => void;
+  cycleGridColumns: () => void;
+  moveTerminalDirection: (id: TerminalId, dir: 'up' | 'down' | 'left' | 'right') => void;
+  zoomIn: () => void;
+  zoomOut: () => void;
+  zoomReset: () => void;
+  saveNamedLayout: (name: string) => Promise<void>;
+  loadNamedLayout: (name: string) => Promise<boolean>;
+  getLayoutNames: () => Promise<{ name: string; count: number }[]>;
+  saveSession: () => Promise<void>;
+  restoreSession: () => Promise<boolean>;
+  /**
+   * TASK-163: re-load just the cross-window-syncable maps
+   * (sessionNameOverrides, sessionLifecycleOverrides, sessionPinned) from
+   * the on-disk session file and merge them into the live store. Called
+   * from the SESSION_FILE_CHANGED handler in App.tsx when another tmax
+   * window writes to tmax-session.json. Returns true if any map changed.
+   */
+  reloadSessionSyncMaps: () => Promise<boolean>;
+  /**
+   * True from app boot until session restore + auto-spawn fallback have
+   * finished. Used by TilingLayout to render a neutral loading indicator
+   * instead of the empty-state hero while panes are still being attached
+   * (TASK-117). App.tsx is responsible for flipping it to false in the
+   * init effect's finally clause; restoreSession also flips it false on
+   * its own exit so direct callers (tests, hot-reload) don't leave it stuck.
+   */
+  isRestoring: boolean;
+  addFavoriteDir: (dir: string) => void;
+  removeFavoriteDir: (dir: string) => void;
+  addRecentDir: (dir: string) => void;
+  removeRecentDir: (dir: string) => void;
+  cdToDir: (dir: string) => void;
+  toggleDirPicker: () => void;
+  toggleFileExplorer: () => void;
+  openFileExplorerAt: (path: string) => void;
+  toggleWorktreePanel: () => void;
+  loadWorktrees: () => Promise<void>;
+  createWorktree: (repoPath: string, branchName: string, baseBranch: string) => Promise<{ success: boolean; error?: string }>;
+  deleteWorktree: (repoPath: string, worktreePath: string) => Promise<{ success: boolean; error?: string }>;
+  openTabMenu: (id?: TerminalId) => void;
+  loadDirs: () => Promise<void>;
+  saveDirs: () => Promise<void>;
+  // ── Workspaces (TASK-40) ─────────────────────────────────────────
+  /**
+   * Create a new workspace and switch to it. Optional initialName uses the
+   * given string; otherwise auto-numbered ("Workspace 2", "Workspace 3"...).
+   * Caller is responsible for spawning a terminal into the new workspace
+   * if they want one (UI's "+ New tab" handler does this in workspaces mode).
+   */
+  createWorkspace: (initialName?: string) => WorkspaceId;
+  /** Switch which workspace is rendered in the grid. */
+  setActiveWorkspace: (id: WorkspaceId) => void;
+  /** Rename a workspace. */
+  renameWorkspace: (id: WorkspaceId, name: string) => void;
+  /** Set or clear the color hint for a workspace chip. Pass undefined to clear. */
+  setWorkspaceColor: (id: WorkspaceId, color: string | undefined) => void;
+  /** Strip color from every workspace. */
+  clearAllWorkspaceColors: () => void;
+  /**
+   * Reorder workspaces by moving the dragged workspace to the position of
+   * the drop target. The new Map iteration order is what saveSession
+   * persists, so the order survives across restarts. (TASK-136)
+   */
+  reorderWorkspaces: (draggedId: WorkspaceId, overId: WorkspaceId) => void;
+  /**
+   * Close a workspace and all of its terminals. If the closed workspace
+   * was active, switches to the next remaining workspace (or creates a
+   * fresh default if it was the last one).
+   */
+  closeWorkspace: (id: WorkspaceId) => Promise<void>;
+  /**
+   * TASK-78: Move an existing pane from its current workspace to `destWorkspaceId`
+   * without restarting its PTY. The pane is removed from the source workspace's
+   * tilingRoot and inserted to the right of the last leaf in the destination
+   * workspace's tilingRoot (or as the only leaf if the destination is empty).
+   * If the moved pane is currently focused, the active workspace switches to
+   * the destination so the user follows their pane. No-op if dest === source,
+   * dest workspace doesn't exist, or terminal is not tiled.
+   */
+  movePaneToWorkspace: (terminalId: TerminalId, destWorkspaceId: WorkspaceId) => void;
+  toggleCopilotPanel: () => void;
+  // Open/close the read-only transcript panel. By default it follows the
+  // focused AI pane; toggling always returns to that follow-focus mode.
+  toggleTranscript: () => void;
+  // Pin the transcript to a specific session id, regardless of which pane is
+  // focused (used by the AI Sessions list right-click → Transcript, where the
+  // session may have no live/linked pane). Cleared back to follow-focus when
+  // the user focuses another pane or toggles the panel.
+  transcriptSessionId: string | null;
+  openTranscriptForSession: (sessionId: string) => void;
+  // Docked transcript panel width in px (drag-resizable, persisted to
+  // localStorage). Clamped to [TRANSCRIPT_WIDTH_MIN, TRANSCRIPT_WIDTH_MAX].
+  transcriptWidth: number;
+  setTranscriptWidth: (width: number) => void;
+  // Open the AI Sessions panel and ask it to highlight the session
+  // linked to this pane. Sets focus to the pane (so the panel reads the
+  // right aiSessionId) and bumps aiSessionHighlightRequest. If the
+  // session isn't in the loaded slice (we cap loads at ~314), fetches it
+  // by id and prepends it to the local list before bumping the request.
+  showAiSessionsForPane: (terminalId: TerminalId) => Promise<void>;
+  // Bump the per-pane refresh generation, forcing a React remount of the
+  // xterm wrapper. PTY untouched. TASK-156 / GH #101.
+  refreshTerminal: (terminalId: TerminalId) => void;
+  // Spawn a fresh AI session in the given cwd, running the configured
+  // copilotCommand or claudeCodeCommand. Used by the "+ New session"
+  // affordance on group headers in the AI Sessions panel. TASK-159 / GH #105.
+  createAiSessionInCwd: (provider: SessionProvider, cwd: string, options?: { wsl?: boolean; wslDistro?: string }) => Promise<void>;
+  loadCopilotSessions: () => Promise<void>;
+  loadMoreSessions: (extra: number) => Promise<void>;
+  loadAllSessions: () => Promise<void>;
+  searchCopilotSessions: (query: string) => Promise<void>;
+  openCopilotSession: (sessionId: string) => Promise<void>;
+  setCopilotSessions: (sessions: CopilotSessionSummary[]) => void;
+  acknowledgeWaitingSession: (sessionId: string) => void;
+  updateTerminalTitleFromSession: (session: CopilotSessionSummary, sessionType?: 'copilot' | 'claude') => void;
+  addCopilotSession: (session: CopilotSessionSummary) => void;
+  updateCopilotSession: (session: CopilotSessionSummary) => void;
+  removeCopilotSession: (sessionId: string) => void;
+  loadClaudeCodeSessions: () => Promise<void>;
+  searchClaudeCodeSessions: (query: string) => Promise<void>;
+  openClaudeCodeSession: (sessionId: string) => Promise<void>;
+  addClaudeCodeSession: (session: CopilotSessionSummary) => void;
+  updateClaudeCodeSession: (session: CopilotSessionSummary) => void;
+  removeClaudeCodeSession: (sessionId: string) => void;
+  setSessionNameOverride: (sessionId: string, name: string) => void;
+  setSessionLifecycle: (sessionId: string, lifecycle: import('../../shared/copilot-types').SessionLifecycle) => void;
+  // Move stale AI sessions to the 'old' (Archived) lifecycle on app start
+  // so the Active tab stays scrollable. Skips pinned sessions and any
+  // session that already has a lifecycle override (the user's manual
+  // choice wins). Idempotent - safe to call multiple times. (TASK-32)
+  autoArchiveStaleSessions: () => void;
+  // Bulk-archive every AI session whose messageCount is below the given
+  // threshold. Skips pinned sessions and any session that already has a
+  // lifecycle override (the user's manual choice wins). Returns the count
+  // of sessions archived. (TASK-37)
+  cleanupLowPromptSessions: (threshold: number) => number;
+  // Count of sessions that cleanupLowPromptSessions(threshold) would
+  // archive without applying any change. Used to populate the
+  // confirmation dialog. (TASK-37)
+  countLowPromptSessions: (threshold: number) => number;
+  // Distribution of session counts by messageCount for the cleanup dialog
+  // (TASK-162). Returns an array of length maxBucket + 2:
+  //   - index 0 = sessions with messageCount === 0
+  //   - index i (1..maxBucket) = sessions with messageCount === i
+  //   - index maxBucket + 1 = overflow (messageCount > maxBucket)
+  // Excludes pinned and already-archived sessions to match the cleanup
+  // behavior, so the user picks a threshold against the same pool.
+  lowPromptHistogram: (maxBucket: number) => number[];
+  togglePinSession: (sessionId: string) => void;
+  checkStaleActiveSessions: () => void;
+  addToast: (message: string) => void;
+  dismissToast: (id: string) => void;
+  resumeAllSessions: () => void;
+  // Prompts dialog action
+  showPromptsForTerminal: (terminalId: TerminalId) => void;
+  showPromptsForSession: (sessionId: string, scrollToPromptIndex?: number) => void;
+  clearPromptsDialogRequest: () => void;
+  showSessionSummary: (sessionId: string) => void;
+  clearSessionSummary: () => void;
+  // Prompt composer actions
+  openPromptComposer: (terminalId: TerminalId) => void;
+  closePromptComposer: () => void;
+  setPromptComposerDraft: (terminalId: TerminalId, draft: string) => void;
+  // Self-healing: in grid mode, ensures every tiled terminal is present in
+  // the tilingRoot. Called from a subscribe() side-effect so any code path
+  // that accidentally leaves an orphan pane gets reconciled on the next tick.
+  reconcileGridLayout: () => void;
+  // Tab group actions
+  createTabGroup: (name: string, color: string) => string;
+  deleteTabGroup: (groupId: string) => void;
+  renameTabGroup: (groupId: string, name: string) => void;
+  toggleTabGroupCollapse: (groupId: string) => void;
+  addToGroup: (terminalId: TerminalId, groupId: string) => void;
+  removeFromGroup: (terminalId: TerminalId) => void;
+  // Diff review actions
+  openDiffReview: (terminalId: TerminalId) => void;
+  closeDiffReview: () => void;
+  setDiffReviewMode: (mode: DiffMode) => void;
+}
+
+// Cached session extras (layouts, etc.) so saveSession doesn't need async load
+let _sessionExtras: Record<string, unknown> = {};
+
+// Guard against early saveSession calls wiping persisted overrides before
+// restoreSession has populated the store. Flipped to true once restoreSession
+// has completed (or confirmed no saved session exists).
+let _sessionHydrated = false;
+// TASK-162: saveSession used to fire on every state change (12 callsites),
+// blasting electron-store sync writes whenever AI updates / typing /
+// resizing triggered the store. Debounce to ~300 ms - any saveSession
+// call within the window resets the timer and the latest snapshot wins.
+let _saveSessionTimer: ReturnType<typeof setTimeout> | null = null;
+const SAVE_SESSION_DEBOUNCE_MS = 300;
+// Monotonically increasing counter to detect stale loadWorktrees() calls
+let _loadWorktreesSeq = 0;
+// TASK-163: timestamp of the most recent saveSession() the renderer issued.
+// The SESSION_FILE_CHANGED watcher in main fires on every disk write
+// (including the renderer's own). When the broadcast arrives within
+// _OWN_WRITE_IGNORE_MS of a self-write AND the on-disk sync maps already
+// match the in-memory state, the reload is a no-op - this is the
+// feedback-loop guard.
+let _lastOwnSaveAt = 0;
+const _OWN_WRITE_IGNORE_MS = 500;
+
+function shallowEqualStringMap(
+  a: Record<string, string> | undefined,
+  b: Record<string, string> | undefined,
+): boolean {
+  const aKeys = a ? Object.keys(a) : [];
+  const bKeys = b ? Object.keys(b) : [];
+  if (aKeys.length !== bKeys.length) return false;
+  for (const k of aKeys) {
+    if (!b || a![k] !== b[k]) return false;
+  }
+  return true;
+}
+
+function shallowEqualBoolMap(
+  a: Record<string, true> | undefined,
+  b: Record<string, true> | undefined,
+): boolean {
+  const aKeys = a ? Object.keys(a) : [];
+  const bKeys = b ? Object.keys(b) : [];
+  if (aKeys.length !== bKeys.length) return false;
+  for (const k of aKeys) {
+    if (!b || !b[k]) return false;
+  }
+  return true;
+}
+
+// ── Store implementation ─────────────────────────────────────────────
+
+function makeDefaultWorkspace(): Workspace {
+  return {
+    id: DEFAULT_WORKSPACE_ID,
+    name: DEFAULT_WORKSPACE_NAME,
+    layout: { tilingRoot: null, floatingPanels: [] },
+  };
+}
+
+// Transcript panel width is a renderer-only view preference, so it lives in
+// localStorage rather than the multi-window session/config snapshot. Clamp on
+// read so a hand-edited or stale value can't dock the panel off-screen.
+export const TRANSCRIPT_WIDTH_MIN = 320;
+export const TRANSCRIPT_WIDTH_MAX = 900;
+const TRANSCRIPT_WIDTH_KEY = 'tmax.transcriptWidth';
+export function readTranscriptWidth(): number {
+  try {
+    const raw = window.localStorage?.getItem(TRANSCRIPT_WIDTH_KEY);
+    const n = raw ? parseInt(raw, 10) : NaN;
+    if (Number.isFinite(n)) return Math.max(TRANSCRIPT_WIDTH_MIN, Math.min(TRANSCRIPT_WIDTH_MAX, n));
+  } catch { /* localStorage unavailable - fall through to default */ }
+  return 400;
+}
+
+export const useTerminalStore = create<TerminalStore>((set, get) => ({
+  // ── Initial state ────────────────────────────────────────────────
+  terminals: new Map(),
+  layout: { tilingRoot: null, floatingPanels: [] },
+  workspaces: new Map<WorkspaceId, Workspace>([[DEFAULT_WORKSPACE_ID, makeDefaultWorkspace()]]),
+  activeWorkspaceId: DEFAULT_WORKSPACE_ID,
+  focusedTerminalId: null,
+  config: null,
+  // Default true so the loading indicator covers the very first paint -
+  // App.tsx flips this to false in its init effect's finally block.
+  isRestoring: true,
+  isDragging: false,
+  draggedTerminalId: null,
+  nextZIndex: 100,
+  showSwitcher: false,
+  showPromptSearch: false,
+  showPaneHints: false,
+  showShortcuts: false,
+  showCommandPalette: false,
+  showSettings: false,
+  showBacklog: false,
+  showDirPicker: false,
+  showFileExplorer: false,
+  fileExplorerTargetPath: null,
+  showWorktreePanel: false,
+  worktreeRepos: [] as RepoWorktrees[],
+  worktreeLoading: false,
+  autoColorTabs: true,
+  showCopilotPanel: false,
+  aiSessionHighlightRequest: 0,
+  promptsDialogRequest: null,
+  sessionSummaryRequest: null,
+  promptComposerRequest: null,
+  composerDrafts: {},
+  copilotSessions: [],
+  claudeCodeSessions: [],
+  copilotSessionsTotal: 0,
+  claudeCodeSessionsTotal: 0,
+  copilotSessionsLimit: 314,
+  claudeCodeSessionsLimit: 314,
+  sessionNameOverrides: {},
+  sessionLifecycleOverrides: {},
+  sessionPinned: {},
+  closedTerminals: [],
+  toastNotifications: [],
+  copilotSearchQuery: '',
+  copilotSearching: false,
+  copilotSqliteActive: false,
+  refreshGenerations: {},
+  selectedCopilotSessionId: null,
+  tabGroups: new Map(),
+  markdownPreview: null,
+  transcriptOpen: false,
+  transcriptSessionId: null,
+  transcriptWidth: readTranscriptWidth(),
+  diffReviewOpen: false,
+  diffReviewTerminalId: null,
+  diffReviewMode: 'unstaged' as DiffMode,
+  tabMenuTerminalId: null,
+  favoriteDirs: [],
+  recentDirs: [],
+  tabBarPosition: 'top' as 'top' | 'bottom' | 'left' | 'right',
+  hideTabTitles: false,
+  hideTabCloseButtons: false,
+  confirmOnCloseSession: false,
+  renamingTerminalId: null,
+  viewMode: 'grid' as 'split' | 'focus' | 'grid',
+  broadcastMode: false,
+  windowFocused: typeof document !== 'undefined' ? document.hasFocus() : true,
+  acknowledgedWaitingSessions: {},
+  gridColumns: 0,
+  preGridRoot: null as LayoutNode | null,
+  selectedTerminalIds: {} as Record<TerminalId, true>,
+  gridTabIds: {} as Record<TerminalId, true>,
+  fontSize: 14,
+  terminalOpacity: 1,
+
+  // ── Actions ──────────────────────────────────────────────────────
+
+  loadConfig: async () => {
+    const config = (await window.terminalAPI.getConfig()) as unknown as AppConfig;
+    const materialActive = config?.backgroundMaterial && config.backgroundMaterial !== 'none';
+    const opacity = materialActive ? (config?.backgroundOpacity ?? 0.8) : undefined;
+    if (config?.theme) applyThemeToChromeVars(config.theme, opacity);
+    const updates: Record<string, unknown> = { config };
+    if (config?.tabBarPosition) updates.tabBarPosition = config.tabBarPosition;
+    if (typeof (config as any)?.hideTabTitles === 'boolean') updates.hideTabTitles = (config as any).hideTabTitles;
+    if (typeof (config as any)?.hideTabCloseButtons === 'boolean') updates.hideTabCloseButtons = (config as any).hideTabCloseButtons;
+    if (typeof (config as any)?.confirmOnCloseSession === 'boolean') updates.confirmOnCloseSession = (config as any).confirmOnCloseSession;
+    if ((config as any)?.terminalOpacity != null) {
+      updates.terminalOpacity = (config as any).terminalOpacity;
+      document.documentElement.style.setProperty('--terminal-opacity', String((config as any).terminalOpacity));
+    }
+    // Seed the live zoom size from the configured baseline. Without this the
+    // store keeps its hardcoded initial 14 and TerminalPanel's fontSize effect
+    // writes that back over the xterm instance on mount, so a configured size
+    // only ever took effect via updateConfig (Settings) or zoomReset (Ctrl+0)
+    // - never on startup. It also left the status-bar zoom badge showing
+    // 14 / configured instead of 100%.
+    const baseFontSize = config?.terminal?.fontSize;
+    if (typeof baseFontSize === 'number' && baseFontSize > 0) {
+      updates.fontSize = baseFontSize;
+    }
+    // Seed AI session load limits from config so subsequent
+    // loadCopilotSessions / loadClaudeCodeSessions calls in App.init
+    // honor the user's preference (0 = no scan).
+    const aiLimit = (config as any)?.aiSessionLoadLimit;
+    if (typeof aiLimit === 'number' && aiLimit >= 0) {
+      updates.copilotSessionsLimit = aiLimit;
+      updates.claudeCodeSessionsLimit = aiLimit;
+    }
+    set(updates);
+  },
+
+  createTerminal: async (shellProfileId?: string, cwdOverride?: string) => {
+    const { config } = get();
+    if (!config) return;
+
+    const profileId = shellProfileId ?? config.defaultShellId;
+    const profile = config.shells.find((s) => s.id === profileId);
+    if (!profile) return;
+
+    const id = uuidv4();
+    // cwdOverride lets callers (e.g. prompt-search "open in this session's
+    // folder" fallback) pin the new pane's working directory without changing
+    // the user's default shell profile.
+    const cwd = cwdOverride || profile.cwd || (config as any).defaultCwd || ((window as any).platformInfo?.platform === 'win32' ? 'C:\\Users' : (window as any).platformInfo?.homeDir || '/');
+    const { pid } = await window.terminalAPI.createPty({
+      id,
+      shellPath: profile.path,
+      args: profile.args,
+      cwd,
+      env: profile.env,
+      cols: 80,
+      rows: 24,
+    });
+    // Read the store only after the await: title updates or renames that
+    // landed meanwhile must not be overwritten by an older snapshot.
+    const { terminals, layout, nextZIndex } = get();
+
+    // Auto-assign a color if colors mode is active — pick the least-used palette color.
+    // Scope the count to the active workspace so each workspace colorizes from
+    // scratch (a new ws's first pane gets the first MS color, not "color #5").
+    const hasColors = get().autoColorTabs;
+    const activeWsId = get().activeWorkspaceId;
+    let tabColor: string | undefined;
+    if (hasColors) {
+      const colorCounts = new Map<string, number>();
+      for (const c of TAB_COLORS) colorCounts.set(c.value, 0);
+      for (const t of terminals.values()) {
+        if ((t.workspaceId ?? activeWsId) !== activeWsId) continue;
+        if (t.tabColor && colorCounts.has(t.tabColor)) {
+          colorCounts.set(t.tabColor, (colorCounts.get(t.tabColor) ?? 0) + 1);
+        }
+      }
+      let minCount = Infinity;
+      for (const [color, count] of colorCounts) {
+        if (count < minCount) {
+          minCount = count;
+          tabColor = color;
+        }
+      }
+    }
+
+    const instance: TerminalInstance = {
+      id,
+      title: profile.name,
+      shellProfileId: profileId,
+      cwd,
+      customTitle: false,
+      mode: 'tiled',
+      tabColor,
+      pid,
+      lastProcess: '',
+      startupCommand: '',
+      workspaceId: get().activeWorkspaceId,
+    };
+
+    const newTerminals = new Map(terminals);
+    newTerminals.set(id, instance);
+
+    const newLeaf: LayoutLeafNode = { kind: 'leaf', terminalId: id };
+    let newRoot: LayoutNode;
+
+    if (layout.tilingRoot === null) {
+      newRoot = newLeaf;
+    } else {
+      // Insert next to the last terminal as a right split
+      const leafOrder = getLeafOrder(layout.tilingRoot);
+      const lastId = leafOrder[leafOrder.length - 1];
+      newRoot = insertLeaf(layout.tilingRoot, lastId, id, 'right');
+    }
+
+    // In grid mode, also update preGridRoot and rebuild the grid
+    const { viewMode, preGridRoot, gridColumns } = get();
+    let newPreGridRoot = preGridRoot;
+    if (viewMode === 'grid') {
+      // Add to preGridRoot too
+      if (preGridRoot) {
+        const preOrder = getLeafOrder(preGridRoot);
+        newPreGridRoot = insertLeaf(preGridRoot, preOrder[preOrder.length - 1], id, 'right');
+      }
+      // Rebuild grid with all terminals including the new one
+      const allIds = getLeafOrder(newRoot);
+      newRoot = buildGridTree(allIds, gridColumns || undefined) || newRoot;
+    }
+
+    set({
+      terminals: newTerminals,
+      layout: { ...layout, tilingRoot: newRoot },
+      focusedTerminalId: id,
+      nextZIndex,
+      preGridRoot: newPreGridRoot,
+    });
+  },
+
+  replaceTerminal: async (id: TerminalId, shellProfileId?: string) => {
+    // TASK-173: close the current pane's PTY and spawn a fresh one in the
+    // SAME layout slot. Different from refreshTerminal (which keeps the
+    // PTY) and closeTerminal (which removes the slot). Useful when a
+    // shell is in a weird state or the user wants a clean shell without
+    // disturbing the surrounding split layout.
+    const { config, terminals, layout, workspaces, viewMode, preGridRoot } = get();
+    if (!config) return;
+    const old = terminals.get(id);
+    if (!old) return;
+    const profileId = shellProfileId ?? old.shellProfileId ?? config.defaultShellId;
+    const profile = config.shells.find((s) => s.id === profileId) ?? config.shells.find((s) => s.id === config.defaultShellId);
+    if (!profile) return;
+
+    const newId = uuidv4();
+    const cwd = profile.cwd
+      || (config as any).defaultCwd
+      || ((window as any).platformInfo?.platform === 'win32' ? 'C:\\Users' : (window as any).platformInfo?.homeDir || '/');
+    const { pid } = await window.terminalAPI.createPty({
+      id: newId,
+      shellPath: profile.path,
+      args: profile.args,
+      cwd,
+      env: profile.env,
+      cols: 80,
+      rows: 24,
+    });
+
+    // Build the replacement instance, preserving the slot-relevant fields
+    // (mode, tabColor, workspaceId) so the user sees the same shape pane.
+    const replacement: TerminalInstance = {
+      id: newId,
+      title: profile.name,
+      shellProfileId: profile.id,
+      cwd,
+      customTitle: false,
+      tabColor: old.tabColor,
+      mode: old.mode,
+      pid,
+      lastProcess: '',
+      startupCommand: '',
+      workspaceId: old.workspaceId,
+    };
+
+    const newTerminals = new Map(terminals);
+    newTerminals.delete(id);
+    newTerminals.set(newId, replacement);
+
+    // Swap the leaf id in the active layout tree.
+    let newRoot = layout.tilingRoot;
+    let newFloating = layout.floatingPanels;
+    if (old.mode === 'tiled' && newRoot) {
+      newRoot = replaceLeafTerminalId(newRoot, id, newId);
+    } else if (old.mode === 'floating') {
+      newFloating = newFloating.map((p) => (p.terminalId === id ? { ...p, terminalId: newId } : p));
+    }
+
+    // If we're in grid view, also patch preGridRoot so toggling back keeps
+    // the layout consistent.
+    let newPreGridRoot = preGridRoot;
+    if (viewMode === 'grid' && old.mode === 'tiled' && preGridRoot) {
+      newPreGridRoot = replaceLeafTerminalId(preGridRoot, id, newId);
+    }
+
+    // Mirror the swap into the workspaces map so a workspace switch later
+    // doesn't reveal stale terminal ids.
+    const newWorkspaces = new Map(workspaces);
+    for (const [wsId, ws] of newWorkspaces) {
+      let wsTree = ws.layout.tilingRoot;
+      let wsFloating = ws.layout.floatingPanels;
+      let dirty = false;
+      if (wsTree) {
+        const next = replaceLeafTerminalId(wsTree, id, newId);
+        if (next !== wsTree) { wsTree = next; dirty = true; }
+      }
+      if (wsFloating.some((p) => p.terminalId === id)) {
+        wsFloating = wsFloating.map((p) => (p.terminalId === id ? { ...p, terminalId: newId } : p));
+        dirty = true;
+      }
+      if (dirty) {
+        newWorkspaces.set(wsId, { ...ws, layout: { tilingRoot: wsTree, floatingPanels: wsFloating } });
+      }
+    }
+
+    set({
+      terminals: newTerminals,
+      layout: { tilingRoot: newRoot, floatingPanels: newFloating },
+      workspaces: newWorkspaces,
+      preGridRoot: newPreGridRoot,
+      focusedTerminalId: newId,
+    });
+
+    // Kill the old PTY after the layout has been swapped so the user
+    // never sees a "Process exited" flash on the previous content. The
+    // kill happens in the background; we don't await it.
+    void window.terminalAPI.killPty(id);
+
+    get().saveSession();
+  },
+
+  closeTerminal: async (id: TerminalId, opts?: { skipConfirm?: boolean }) => {
+    const t0 = performance.now();
+    const { terminals, layout, focusedTerminalId, closedTerminals, copilotSessions, claudeCodeSessions } = get();
+    const instance = terminals.get(id);
+    if (!instance) return;
+
+    // Guard against an accidental X-click / middle-click killing a live
+    // session. skipConfirm lets bulk closers show one aggregate confirm
+    // instead of one dialog per pane (see closeTerminals).
+    if (get().confirmOnCloseSession && !opts?.skipConfirm) {
+      const label = instance.title?.trim() || 'this session';
+      const ok = await confirmDialog({
+        title: 'Close session?',
+        message: `Close "${label}"? This ends the terminal session.`,
+        confirmText: 'Close',
+        danger: true,
+      });
+      if (!ok) return;
+    }
+
+    // Snapshot pane identity for browser-style undo close (TASK-112).
+    // Capture BEFORE the PTY is killed so the metadata is intact even if
+    // killPty surfaces an error. Cap at 10 - older entries fall off the
+    // front so memory stays bounded across long sessions.
+    //
+    // For AI sessions, also capture the provider by looking the session
+    // id up in the live session lists. The provider isn't stored on
+    // TerminalInstance, so we have to derive it now while the lists
+    // still contain the session.
+    const paneSnapshot = snapshotPaneForRestore(instance, copilotSessions, claudeCodeSessions);
+    const closedEntry: ClosedTerminalEntry = {
+      kind: 'pane',
+      closedAt: Date.now(),
+      ...paneSnapshot,
+    };
+    const newClosedTerminals = [...closedTerminals, closedEntry].slice(-10);
+
+    if (instance.mode === 'detached') {
+      await window.terminalAPI.closeDetached(id);
+    }
+    await window.terminalAPI.killPty(id);
+    const t1 = performance.now();
+
+    const newTerminals = new Map(terminals);
+    newTerminals.delete(id);
+
+    // Drop any prompt-composer draft for this pane so its memory doesn't
+    // outlive the terminal, and close the composer if it was targeting us.
+    const newDrafts = dropComposerDraft(get().composerDrafts, id);
+    const newComposerRequest =
+      get().promptComposerRequest === id ? null : get().promptComposerRequest;
+
+    let newRoot = layout.tilingRoot;
+    let newFloating = layout.floatingPanels;
+
+    if (instance.mode === 'tiled' && newRoot) {
+      newRoot = removeLeaf(newRoot, id);
+    } else if (instance.mode === 'floating') {
+      newFloating = newFloating.filter((p) => p.terminalId !== id);
+    }
+
+    // In grid mode, also update preGridRoot and rebuild the grid
+    const { viewMode, preGridRoot, gridColumns } = get();
+    let newPreGridRoot = preGridRoot;
+    if (viewMode === 'grid' && instance.mode === 'tiled') {
+      if (preGridRoot) {
+        newPreGridRoot = removeLeaf(preGridRoot, id);
+      }
+      // Rebuild grid from remaining terminals
+      const remainingIds = newRoot ? getLeafOrder(newRoot) : [];
+      if (remainingIds.length > 0) {
+        newRoot = buildGridTree(remainingIds, gridColumns || undefined);
+      }
+    }
+
+    // Determine new focus
+    let newFocus: TerminalId | null = focusedTerminalId;
+    if (focusedTerminalId === id) {
+      if (newRoot) {
+        const order = getLeafOrder(newRoot);
+        newFocus = order.length > 0 ? order[0] : null;
+      } else if (newFloating.length > 0) {
+        newFocus = newFloating[newFloating.length - 1].terminalId;
+      } else {
+        newFocus = null;
+      }
+    }
+
+    set({
+      terminals: newTerminals,
+      layout: { tilingRoot: newRoot, floatingPanels: newFloating },
+      focusedTerminalId: newFocus,
+      preGridRoot: newPreGridRoot,
+      closedTerminals: newClosedTerminals,
+      composerDrafts: newDrafts,
+      promptComposerRequest: newComposerRequest,
+    });
+
+    // After React processes the layout change, force-focus the new terminal.
+    // Tree collapse causes the surviving TerminalPanel to unmount/remount,
+    // and browsers can lose focus during DOM reparenting.
+    if (newFocus) {
+      const forceFocus = () => {
+        const entry = getTerminalEntry(newFocus!);
+        if (entry?.terminal && get().focusedTerminalId === newFocus) {
+          entry.terminal.focus();
+          const textarea = entry.terminal.element?.querySelector('textarea');
+          if (textarea && document.activeElement !== textarea) {
+            (textarea as HTMLElement).focus();
+          }
+        }
+      };
+      requestAnimationFrame(() => requestAnimationFrame(forceFocus));
+      setTimeout(forceFocus, 50);
+      setTimeout(forceFocus, 150);
+    }
+
+    window.terminalAPI.diagLog('renderer:close-terminal', {
+      id,
+      remaining: newTerminals.size,
+    });
+  },
+
+  closeTerminals: async (ids: TerminalId[]) => {
+    if (ids.length === 0) return;
+    // A single tab still names itself; let closeTerminal own that confirm.
+    if (ids.length === 1) {
+      await get().closeTerminal(ids[0]);
+      return;
+    }
+    // Many tabs: one aggregate confirm, then close each without re-asking.
+    if (get().confirmOnCloseSession) {
+      const ok = await confirmDialog({
+        title: 'Close sessions?',
+        message: `Close ${ids.length} sessions? This ends all of them.`,
+        confirmText: `Close ${ids.length}`,
+        danger: true,
+      });
+      if (!ok) return;
+    }
+    for (const id of ids) await get().closeTerminal(id, { skipConfirm: true });
+  },
+
+  restoreClosedTerminal: async () => {
+    const { closedTerminals } = get();
+    if (closedTerminals.length === 0) return;
+
+    // Peek before popping - confirm both pane and workspace restores so an
+    // accidental Ctrl+Shift+T does not silently re-spawn a PTY (or N PTYs
+    // for a workspace). Decline = entry stays on the stack to retry.
+    const top = closedTerminals[closedTerminals.length - 1];
+    if (top.kind === 'workspace') {
+      const paneCount = top.panes.length;
+      const paneWord = paneCount === 1 ? 'pane' : 'panes';
+      const ok = await confirmDialog({
+        title: 'Restore workspace?',
+        message: `Restore workspace "${top.name}" with ${paneCount} ${paneWord}?`,
+        confirmText: 'Restore',
+      });
+      if (!ok) return;
+    } else {
+      const label = top.title || top.cwd;
+      const ok = await confirmDialog({
+        title: 'Restore pane?',
+        message: `Restore pane "${label}"?`,
+        confirmText: 'Restore',
+      });
+      if (!ok) return;
+    }
+
+    const stack = [...closedTerminals];
+    const entry = stack.pop()!;
+    set({ closedTerminals: stack });
+
+    if (entry.kind === 'pane') {
+      await restorePaneFromSnapshot(entry, get, set);
+      window.terminalAPI.diagLog('renderer:restore-terminal', {
+        kind: 'pane',
+        shellProfileId: entry.shellProfileId,
+        cwd: entry.cwd,
+        aiProvider: entry.aiProvider,
+        remaining: stack.length,
+      });
+      return;
+    }
+
+    // Workspace restore: recreate the workspace shell, then restore each
+    // pane into it. Use the original workspaceId so the panes' captured
+    // workspaceId still points at a real workspace; if a workspace with
+    // that id has reappeared somehow, leave it alone and reuse it.
+    const { workspaces } = get();
+    if (!workspaces.has(entry.workspaceId)) {
+      const restoredWs: Workspace = {
+        id: entry.workspaceId,
+        name: entry.name,
+        color: entry.color,
+        layout: { tilingRoot: null, floatingPanels: [] },
+      };
+      const newWorkspaces = new Map(workspaces);
+      newWorkspaces.set(entry.workspaceId, restoredWs);
+      set({ workspaces: newWorkspaces });
+    }
+    // Switch to the restored workspace BEFORE spawning panes so
+    // createTerminal places them in the right place. setActiveWorkspace
+    // handles the layout swap.
+    get().setActiveWorkspace(entry.workspaceId);
+
+    for (const pane of entry.panes) {
+      await restorePaneFromSnapshot(pane, get, set);
+    }
+
+    window.terminalAPI.diagLog('renderer:restore-terminal', {
+      kind: 'workspace',
+      workspaceId: entry.workspaceId,
+      paneCount: entry.panes.length,
+      remaining: stack.length,
+    });
+  },
+
+  setFocus: (id: TerminalId) => {
+    const { terminals, layout, nextZIndex } = get();
+    if (!terminals.has(id)) return;
+
+    const instance = terminals.get(id)!;
+    if (instance.mode === 'dormant') {
+      // Just select the tab, don't wake — use context menu "Wake" to restore
+      set({ focusedTerminalId: id });
+      return;
+    }
+    if (instance.mode === 'detached') {
+      // Select the tab and focus the detached window
+      set({ focusedTerminalId: id });
+      window.terminalAPI.focusDetached(id);
+      return;
+    }
+    if (instance.mode === 'floating') {
+      const newFloating = layout.floatingPanels.map((p) =>
+        p.terminalId === id ? { ...p, zIndex: nextZIndex } : p,
+      );
+      set({
+        focusedTerminalId: id,
+        layout: { ...layout, floatingPanels: newFloating },
+        nextZIndex: nextZIndex + 1,
+      });
+    } else {
+      set({ focusedTerminalId: id });
+    }
+  },
+
+  splitTerminal: async (
+    targetId: TerminalId,
+    direction: SplitDirection,
+    newTerminalId?: TerminalId,
+    insertSide?: 'left' | 'right' | 'top' | 'bottom',
+  ) => {
+    const { config, terminals, layout } = get();
+    if (!config || !layout.tilingRoot) return;
+
+    const targetInstance = terminals.get(targetId);
+    if (!targetInstance) return;
+
+    const id = newTerminalId ?? uuidv4();
+    const profile = config.shells.find(
+      (s) => s.id === targetInstance.shellProfileId,
+    );
+    if (!profile) return;
+
+    const { pid } = await window.terminalAPI.createPty({
+      id,
+      shellPath: profile.path,
+      args: profile.args,
+      cwd: targetInstance.cwd,
+      env: profile.env,
+      cols: 80,
+      rows: 24,
+    });
+
+    const instance: TerminalInstance = {
+      id,
+      title: profile.name,
+      shellProfileId: targetInstance.shellProfileId,
+      cwd: targetInstance.cwd,
+      customTitle: false,
+      mode: 'tiled',
+      pid,
+      lastProcess: '',
+      startupCommand: '',
+      // Splits land in the same workspace as their target pane.
+      workspaceId: targetInstance.workspaceId ?? get().activeWorkspaceId,
+    };
+
+    const side = insertSide ?? (direction === 'horizontal' ? 'right' : 'bottom');
+    const newRoot = insertLeaf(layout.tilingRoot, targetId, id, side);
+
+    const newTerminals = new Map(terminals);
+    newTerminals.set(id, instance);
+
+    set({
+      terminals: newTerminals,
+      layout: { ...layout, tilingRoot: newRoot },
+      focusedTerminalId: id,
+    });
+  },
+
+  setSplitRatio: (splitNodeId: string, ratio: number) => {
+    const { layout } = get();
+    if (!layout.tilingRoot) return;
+    const newRoot = updateSplitRatio(layout.tilingRoot, splitNodeId, ratio);
+    set({ layout: { ...layout, tilingRoot: newRoot } });
+  },
+
+  swapTerminals: (idA: TerminalId, idB: TerminalId) => {
+    const { layout, terminals } = get();
+    if (!layout.tilingRoot) return;
+    const newRoot = swapLeaves(layout.tilingRoot, idA, idB);
+    // Also swap tab order to keep tab bar in sync with grid positions
+    const entries = Array.from(terminals.entries());
+    const idxA = entries.findIndex(([id]) => id === idA);
+    const idxB = entries.findIndex(([id]) => id === idB);
+    if (idxA !== -1 && idxB !== -1) {
+      [entries[idxA], entries[idxB]] = [entries[idxB], entries[idxA]];
+      set({ layout: { ...layout, tilingRoot: newRoot }, terminals: new Map(entries) });
+    } else {
+      set({ layout: { ...layout, tilingRoot: newRoot } });
+    }
+  },
+
+  reorderTerminals: (draggedId: TerminalId, overId: TerminalId) => {
+    if (draggedId === overId) return;
+    const { terminals, layout } = get();
+    const entries = Array.from(terminals.entries());
+    const fromIndex = entries.findIndex(([id]) => id === draggedId);
+    const toIndex = entries.findIndex(([id]) => id === overId);
+    if (fromIndex === -1 || toIndex === -1) return;
+
+    // Adopt the drop target's group (or ungroup if target has no group)
+    const overTerminal = terminals.get(overId);
+    const draggedTerminal = terminals.get(draggedId);
+    if (draggedTerminal && overTerminal && draggedTerminal.groupId !== overTerminal.groupId) {
+      entries[fromIndex] = [draggedId, { ...draggedTerminal, groupId: overTerminal.groupId }];
+    }
+
+    const [moved] = entries.splice(fromIndex, 1);
+    entries.splice(toIndex, 0, moved);
+
+    // Reassign leaf positions so pane order matches new tab order
+    let newRoot = layout.tilingRoot;
+    if (newRoot) {
+      const currentLeafSet = new Set(getLeafOrder(newRoot));
+      const newTiledOrder = entries
+        .filter(([id]) => currentLeafSet.has(id))
+        .map(([id]) => id);
+
+      let leafIdx = 0;
+      function reassignLeaves(node: LayoutNode): LayoutNode {
+        if (node.kind === 'leaf') {
+          const newId = newTiledOrder[leafIdx++];
+          return newId === node.terminalId ? node : { ...node, terminalId: newId };
+        }
+        const newFirst = reassignLeaves(node.first);
+        const newSecond = reassignLeaves(node.second);
+        if (newFirst === node.first && newSecond === node.second) return node;
+        return { ...node, first: newFirst, second: newSecond };
+      }
+      newRoot = reassignLeaves(newRoot);
+    }
+
+    set({
+      terminals: new Map(entries),
+      layout: { ...layout, tilingRoot: newRoot },
+    });
+  },
+
+  moveToFloat: (id: TerminalId) => {
+    const { terminals, layout, nextZIndex } = get();
+    const instance = terminals.get(id);
+    if (!instance || instance.mode === 'floating') return;
+
+    // Snapshot the floated leaf's position in the tree so moveToTiling can
+    // restore the exact split direction / ratio / side on round-trip,
+    // instead of always re-inserting via the tab-neighbour heuristic
+    // (which uses horizontal splits and flattens grids into rows).
+    let preFloatAnchor: PreFloatAnchor | undefined;
+    if (layout.tilingRoot) {
+      const path = findLeafPath(layout.tilingRoot, id);
+      if (path && path.length > 0) {
+        const position = path[path.length - 1];
+        const parentPath = path.slice(0, -1);
+        let parent: LayoutNode | null = layout.tilingRoot;
+        for (const step of parentPath) {
+          if (parent === null || parent.kind !== 'split') { parent = null; break; }
+          parent = parent[step];
+        }
+        if (parent && parent.kind === 'split') {
+          preFloatAnchor = {
+            parentPath,
+            parentDirection: parent.direction,
+            parentRatio: parent.splitRatio,
+            position,
+          };
+        }
+      }
+    }
+
+    // Remove from tiling tree
+    let newRoot = layout.tilingRoot;
+    if (newRoot) {
+      newRoot = removeLeaf(newRoot, id);
+    }
+
+    // Add floating panel maximized to fill the layout area
+    const panel: FloatingPanelState = {
+      terminalId: id,
+      x: 0,
+      y: 0,
+      width: window.innerWidth,
+      height: window.innerHeight - 60,
+      zIndex: nextZIndex,
+      maximized: true,
+      preFloatAnchor,
+    };
+
+    const updatedInstance: TerminalInstance = { ...instance, mode: 'floating' };
+    const newTerminals = new Map(terminals);
+    newTerminals.set(id, updatedInstance);
+
+    set({
+      terminals: newTerminals,
+      layout: {
+        tilingRoot: newRoot,
+        floatingPanels: [...layout.floatingPanels, panel],
+      },
+      nextZIndex: nextZIndex + 1,
+      focusedTerminalId: id,
+    });
+  },
+
+  moveToTiling: (
+    id: TerminalId,
+    targetId?: TerminalId,
+    side?: 'left' | 'right' | 'top' | 'bottom',
+  ) => {
+    const { terminals, layout } = get();
+    const instance = terminals.get(id);
+    if (!instance || instance.mode === 'tiled') return;
+
+    const floatedPanel = layout.floatingPanels.find((p) => p.terminalId === id);
+
+    // Remove from floating panels
+    const newFloating = layout.floatingPanels.filter(
+      (p) => p.terminalId !== id,
+    );
+
+    // Insert into tiling tree
+    let newRoot: LayoutNode;
+    if (layout.tilingRoot === null) {
+      newRoot = { kind: 'leaf', terminalId: id };
+    } else if (targetId && side) {
+      newRoot = insertLeaf(layout.tilingRoot, targetId, id, side);
+    } else {
+      // No explicit target. If we captured a preFloatAnchor on float and it
+      // still applies to the current tree, restore the leaf to its exact
+      // former position so a Ctrl+Shift+U round-trip preserves the tile
+      // layout. Otherwise fall back to the tab-neighbour heuristic.
+      const restored = floatedPanel?.preFloatAnchor
+        ? restoreFromPreFloatAnchor(layout.tilingRoot, id, floatedPanel.preFloatAnchor)
+        : null;
+      if (restored) {
+        newRoot = restored;
+      } else {
+        // Match wakeFromDormant's logic so "Restore" lands the pane next to
+        // its tab-bar neighbours instead of always at the end.
+        const tabOrder = Array.from(terminals.keys());
+        const myIdx = tabOrder.indexOf(id);
+        const tiledLeaves = new Set(getLeafOrder(layout.tilingRoot));
+
+        let insertAfterId: TerminalId | null = null;
+        for (let i = myIdx - 1; i >= 0; i--) {
+          if (tiledLeaves.has(tabOrder[i])) { insertAfterId = tabOrder[i]; break; }
+        }
+        if (insertAfterId) {
+          newRoot = insertLeaf(layout.tilingRoot, insertAfterId, id, 'right');
+        } else {
+          let insertBeforeId: TerminalId | null = null;
+          for (let i = myIdx + 1; i < tabOrder.length; i++) {
+            if (tiledLeaves.has(tabOrder[i])) { insertBeforeId = tabOrder[i]; break; }
+          }
+          if (insertBeforeId) {
+            newRoot = insertLeaf(layout.tilingRoot, insertBeforeId, id, 'left');
+          } else {
+            const order = getLeafOrder(layout.tilingRoot);
+            newRoot = insertLeaf(layout.tilingRoot, order[order.length - 1], id, 'right');
+          }
+        }
+      }
+    }
+
+    const updatedInstance: TerminalInstance = { ...instance, mode: 'tiled' };
+    const newTerminals = new Map(terminals);
+    newTerminals.set(id, updatedInstance);
+
+    set({
+      terminals: newTerminals,
+      layout: { tilingRoot: newRoot, floatingPanels: newFloating },
+      focusedTerminalId: id,
+    });
+  },
+
+  insertAtRoot: (id: TerminalId, side: 'left' | 'right' | 'top' | 'bottom') => {
+    const { terminals, layout } = get();
+    if (!layout.tilingRoot) return;
+    const instance = terminals.get(id);
+    if (!instance) return;
+
+    // Remove from floating panels (moveToFloat was called before this)
+    const newFloating = layout.floatingPanels.filter((p) => p.terminalId !== id);
+
+    const direction: SplitDirection = (side === 'left' || side === 'right') ? 'horizontal' : 'vertical';
+    const newLeaf: LayoutLeafNode = { kind: 'leaf', terminalId: id };
+    const isFirst = side === 'left' || side === 'top';
+
+    const newRoot: LayoutSplitNode = {
+      kind: 'split',
+      id: uuidv4(),
+      direction,
+      splitRatio: 0.5,
+      first: isFirst ? newLeaf : layout.tilingRoot,
+      second: isFirst ? layout.tilingRoot : newLeaf,
+    };
+
+    const updatedInstance: TerminalInstance = { ...instance, mode: 'tiled' };
+    const newTerminals = new Map(terminals);
+    newTerminals.set(id, updatedInstance);
+
+    set({
+      terminals: newTerminals,
+      layout: { tilingRoot: newRoot, floatingPanels: newFloating },
+      focusedTerminalId: id,
+    });
+  },
+
+  moveToDormant: (id: TerminalId) => {
+    const t0 = performance.now();
+    const { terminals, layout, focusedTerminalId } = get();
+    const instance = terminals.get(id);
+    if (!instance || instance.mode === 'dormant') return;
+
+    let newRoot = layout.tilingRoot;
+    let newFloating = layout.floatingPanels;
+
+    if (instance.mode === 'tiled' && newRoot) {
+      newRoot = removeLeaf(newRoot, id);
+    } else if (instance.mode === 'floating') {
+      newFloating = newFloating.filter((p) => p.terminalId !== id);
+    }
+
+    const updatedInstance: TerminalInstance = { ...instance, mode: 'dormant' };
+    const newTerminals = new Map(terminals);
+    newTerminals.set(id, updatedInstance);
+
+    // Also remove from preGridRoot so restoring from grid mode won't
+    // bring back a dormant terminal.
+    const { preGridRoot, viewMode, gridColumns } = get();
+    const newPreGridRoot = preGridRoot ? removeLeaf(preGridRoot, id) : null;
+
+    // In grid mode, rebuild the grid so remaining terminals fill equally.
+    if (viewMode === 'grid' && newRoot) {
+      const remainingIds = getLeafOrder(newRoot);
+      if (remainingIds.length > 0) {
+        newRoot = buildGridTree(remainingIds, gridColumns || undefined) || newRoot;
+      }
+    }
+
+    // Move focus to another terminal if this one was focused
+    let newFocus = focusedTerminalId;
+    if (focusedTerminalId === id) {
+      const tiledOrder = newRoot ? getLeafOrder(newRoot) : [];
+      const floatingIds = newFloating.map((p) => p.terminalId);
+      const allVisible = [...tiledOrder, ...floatingIds];
+      newFocus = allVisible.length > 0 ? allVisible[0] : null;
+    }
+
+    set({
+      terminals: newTerminals,
+      layout: { tilingRoot: newRoot, floatingPanels: newFloating },
+      focusedTerminalId: newFocus,
+      preGridRoot: newPreGridRoot,
+    });
+    window.terminalAPI.diagLog('renderer:move-to-dormant', {
+      id,
+      ms: Math.round(performance.now() - t0),
+      remaining: newRoot ? getLeafOrder(newRoot).length : 0,
+      newFocus,
+    });
+  },
+
+  wakeFromDormant: (id: TerminalId) => {
+    const t0 = performance.now();
+    const { terminals, layout } = get();
+    const instance = terminals.get(id);
+    if (!instance || instance.mode !== 'dormant') return;
+
+    let newRoot: LayoutNode;
+    if (layout.tilingRoot === null) {
+      newRoot = { kind: 'leaf', terminalId: id };
+    } else {
+      // Insert based on tab order: find the nearest tiled neighbor
+      const tabOrder = Array.from(terminals.keys());
+      const myIdx = tabOrder.indexOf(id);
+      const tiledLeaves = new Set(getLeafOrder(layout.tilingRoot));
+
+      // Look left in tab order for a tiled neighbor to insert after
+      let insertAfterId: TerminalId | null = null;
+      for (let i = myIdx - 1; i >= 0; i--) {
+        if (tiledLeaves.has(tabOrder[i])) {
+          insertAfterId = tabOrder[i];
+          break;
+        }
+      }
+
+      if (insertAfterId) {
+        newRoot = insertLeaf(layout.tilingRoot, insertAfterId, id, 'right');
+      } else {
+        // No tiled tab before us — look right for one to insert before
+        let insertBeforeId: TerminalId | null = null;
+        for (let i = myIdx + 1; i < tabOrder.length; i++) {
+          if (tiledLeaves.has(tabOrder[i])) {
+            insertBeforeId = tabOrder[i];
+            break;
+          }
+        }
+        if (insertBeforeId) {
+          newRoot = insertLeaf(layout.tilingRoot, insertBeforeId, id, 'left');
+        } else {
+          // Fallback: insert at the end
+          const order = getLeafOrder(layout.tilingRoot);
+          newRoot = insertLeaf(layout.tilingRoot, order[order.length - 1], id, 'right');
+        }
+      }
+    }
+
+    const updatedInstance: TerminalInstance = { ...instance, mode: 'tiled' };
+    const newTerminals = new Map(terminals);
+    newTerminals.set(id, updatedInstance);
+
+    // Keep preGridRoot in sync so a later grid→focus toggle restores a tree
+    // that includes the woken terminal (fixes #70 blank focus mode when a
+    // terminal was woken in grid mode between the two toggles).
+    const { viewMode, preGridRoot, gridColumns } = get();
+    let newPreGridRoot = preGridRoot;
+    if (preGridRoot) {
+      const preOrder = getLeafOrder(preGridRoot);
+      if (preOrder.length > 0) {
+        newPreGridRoot = insertLeaf(preGridRoot, preOrder[preOrder.length - 1], id, 'right');
+      } else {
+        newPreGridRoot = { kind: 'leaf', terminalId: id };
+      }
+    }
+
+    // In grid mode, rebuild the grid so the woken terminal slots in cleanly.
+    let finalRoot = newRoot;
+    if (viewMode === 'grid' && finalRoot) {
+      const allIds = getLeafOrder(finalRoot);
+      finalRoot = buildGridTree(allIds, gridColumns || undefined) || finalRoot;
+    }
+
+    set({
+      terminals: newTerminals,
+      layout: { ...layout, tilingRoot: finalRoot },
+      focusedTerminalId: id,
+      preGridRoot: newPreGridRoot,
+    });
+    window.terminalAPI.diagLog('renderer:wake-from-dormant', {
+      id,
+      ms: Math.round(performance.now() - t0),
+      tiled: finalRoot ? getLeafOrder(finalRoot).length : 0,
+    });
+  },
+
+  detachTerminal: async (id: TerminalId) => {
+    const before = get().terminals.get(id);
+    if (!before || before.mode === 'detached') return;
+
+    await window.terminalAPI.detachTerminal(id);
+
+    // Build the new state from the store as it is after the await so
+    // concurrent title updates or renames are kept.
+    const { terminals, layout } = get();
+    const instance = terminals.get(id);
+    if (!instance || instance.mode === 'detached') return;
+
+    let newRoot = layout.tilingRoot;
+    let newFloating = layout.floatingPanels;
+
+    if (instance.mode === 'tiled' && newRoot) {
+      newRoot = removeLeaf(newRoot, id);
+    } else if (instance.mode === 'floating') {
+      newFloating = newFloating.filter((p) => p.terminalId !== id);
+    }
+
+    const updatedInstance: TerminalInstance = { ...instance, mode: 'detached' };
+    const newTerminals = new Map(terminals);
+    newTerminals.set(id, updatedInstance);
+
+    // Move focus to another visible terminal
+    const tiledOrder = newRoot ? getLeafOrder(newRoot) : [];
+    const floatingIds = newFloating.map((p) => p.terminalId);
+    const allVisible = [...tiledOrder, ...floatingIds];
+    const newFocus = allVisible.length > 0 ? allVisible[0] : null;
+
+    set({
+      terminals: newTerminals,
+      layout: { tilingRoot: newRoot, floatingPanels: newFloating },
+      focusedTerminalId: newFocus,
+    });
+  },
+
+  reattachTerminal: (id: TerminalId) => {
+    const { terminals, layout } = get();
+    const instance = terminals.get(id);
+    if (!instance || instance.mode !== 'detached') return;
+
+    const updatedInstance: TerminalInstance = { ...instance, mode: 'tiled' };
+    const newTerminals = new Map(terminals);
+    newTerminals.set(id, updatedInstance);
+
+    let newRoot: LayoutNode;
+    if (layout.tilingRoot === null) {
+      newRoot = { kind: 'leaf', terminalId: id };
+    } else {
+      const order = getLeafOrder(layout.tilingRoot);
+      const lastId = order[order.length - 1];
+      newRoot = insertLeaf(layout.tilingRoot, lastId, id, 'right');
+    }
+
+    set({
+      terminals: newTerminals,
+      layout: { ...layout, tilingRoot: newRoot },
+      focusedTerminalId: id,
+    });
+  },
+
+  reconcileGridLayout: () => {
+    const { viewMode, terminals, layout, gridColumns, gridTabIds, activeWorkspaceId } = get();
+    if (viewMode !== 'grid') return;
+
+    // If the user explicitly gridded a subset via gridSelectedTabs, respect
+    // that scope - only reconcile within the selected set. Also restrict
+    // to terminals belonging to the active workspace (TASK-40) so a grid
+    // rebuild after a workspace switch doesn't drag terminals from other
+    // workspaces back into the visible grid.
+    const hasSubsetScope = Object.keys(gridTabIds).length > 0;
+    const eligibleIds = Array.from(terminals.entries())
+      .filter(([id, t]) =>
+        t.mode === 'tiled'
+        && (t.workspaceId ?? activeWorkspaceId) === activeWorkspaceId
+        && (!hasSubsetScope || gridTabIds[id]),
+      )
+      .map(([id]) => id);
+
+    const treeIds = layout.tilingRoot ? getLeafOrder(layout.tilingRoot) : [];
+    if (eligibleIds.length === treeIds.length) return;
+
+    // Orphans exist - some path added a tiled terminal without inserting it
+    // into tilingRoot. Rebuild the grid so the missing panes show up.
+    // Tab-order (Map insertion order) is authoritative for position, which
+    // matches the "grid follows tab order" invariant.
+    const rebuilt = eligibleIds.length > 0
+      ? buildGridTree(eligibleIds, gridColumns || undefined)
+      : null;
+    if (!rebuilt) return;
+    window.terminalAPI?.diagLog?.('renderer:reconcile-grid', {
+      fromTree: treeIds.length,
+      fromMap: eligibleIds.length,
+      subsetScope: hasSubsetScope,
+    });
+    set({ layout: { ...layout, tilingRoot: rebuilt } });
+  },
+
+  updateFloatingPanel: (
+    id: TerminalId,
+    partial: Partial<FloatingPanelState>,
+  ) => {
+    const { layout } = get();
+    const newFloating = layout.floatingPanels.map((p) =>
+      p.terminalId === id ? { ...p, ...partial } : p,
+    );
+    set({ layout: { ...layout, floatingPanels: newFloating } });
+  },
+
+  focusNext: () => {
+    const { terminals, focusedTerminalId } = get();
+
+    // Use Map insertion order (same as tab bar), skip dormant
+    const order = Array.from(terminals.entries())
+      .filter(([, t]) => t.mode !== 'dormant' && t.mode !== 'detached')
+      .map(([id]) => id);
+    if (order.length === 0) return;
+
+    if (!focusedTerminalId) {
+      get().setFocus(order[0]);
+      return;
+    }
+
+    const idx = order.indexOf(focusedTerminalId);
+    const nextIdx = (idx + 1) % order.length;
+    get().setFocus(order[nextIdx]);
+  },
+
+  focusPrev: () => {
+    const { terminals, focusedTerminalId } = get();
+
+    // Use Map insertion order (same as tab bar), skip dormant
+    const order = Array.from(terminals.entries())
+      .filter(([, t]) => t.mode !== 'dormant' && t.mode !== 'detached')
+      .map(([id]) => id);
+    if (order.length === 0) return;
+
+    if (!focusedTerminalId) {
+      get().setFocus(order[order.length - 1]);
+      return;
+    }
+
+    const idx = order.indexOf(focusedTerminalId);
+    const prevIdx = (idx - 1 + order.length) % order.length;
+    get().setFocus(order[prevIdx]);
+  },
+
+  focusDirection: (dir: 'left' | 'right' | 'up' | 'down') => {
+    const { layout, focusedTerminalId } = get();
+    if (!layout.tilingRoot || !focusedTerminalId) return;
+
+    const neighbor = findDirectionalNeighbor(
+      layout.tilingRoot,
+      focusedTerminalId,
+      dir,
+    );
+    if (neighbor) {
+      set({ focusedTerminalId: neighbor });
+      // Immediately move DOM focus and send DEC focus sequences
+      // (the useEffect in TerminalPanel is async and causes a race)
+      const entry = getTerminalEntry(neighbor);
+      if (entry) {
+        entry.terminal.focus();
+        window.terminalAPI.writePty(focusedTerminalId, '\x1b[O');
+        requestAnimationFrame(() => {
+          window.terminalAPI.writePty(neighbor, '\x1b[I');
+        });
+      }
+    }
+  },
+
+  renameTerminal: (id: TerminalId, title: string, custom?: boolean, opts?: { firstCommand?: boolean }) => {
+    const { terminals } = get();
+    const instance = terminals.get(id);
+    if (!instance) return;
+    const newTerminals = new Map(terminals);
+    // First-command renames (TASK-23) need customTitle:true so OSC titles
+    // don't override, but they're NOT a deliberate user rename. We tag
+    // them with firstCommandTitle so the AI-link path can let the AI
+    // session topic take over once a session is detected (TASK-88).
+    // An explicit user rename clears the flag so the rename truly sticks.
+    const isFirstCmd = !!opts?.firstCommand;
+    const updatedInstance: TerminalInstance = {
+      ...instance,
+      title,
+      customTitle: custom ?? instance.customTitle,
+      firstCommandTitle: custom ? isFirstCmd : instance.firstCommandTitle,
+    };
+    if (custom) updatedInstance.aiAutoTitle = false;
+    // A deliberate user rename replaces an external title for good.
+    if (custom && !isFirstCmd) {
+      updatedInstance.externalTitle = undefined;
+      updatedInstance.externalTitleDisabled = true;
+    }
+    // Explicit rename clears the prompt-title latch: the user is making a
+    // new choice, so a future relink with an empty summary should be free
+    // to set its own auto-title again.
+    if (custom && !isFirstCmd) updatedInstance.aiPromptTitleLatched = false;
+    newTerminals.set(id, updatedInstance);
+    set({ terminals: newTerminals });
+    if (custom && !isFirstCmd) window.terminalAPI.disablePtyExternalTitle(id);
+    // Propagate custom rename to linked AI session - but only for
+    // explicit user renames, not first-command auto-titles. Otherwise
+    // typing `cd somewhere` before launching claude would override the
+    // AI session's name with `cd somewhere`.
+    if (custom && !isFirstCmd && instance.aiSessionId) {
+      get().setSessionNameOverride(instance.aiSessionId, title);
+    }
+  },
+
+  setExternalTitle: (id: TerminalId, title: string) => {
+    const { terminals } = get();
+    const instance = terminals.get(id);
+    if (!instance || instance.externalTitleDisabled) return;
+    const next = title.trim();
+    if ((instance.externalTitle ?? '') === next) return;
+    const newTerminals = new Map(terminals);
+    newTerminals.set(id, { ...instance, externalTitle: next || undefined });
+    set({ terminals: newTerminals });
+  },
+
+  setTabColor: (id: TerminalId, color: string | undefined) => {
+    const { terminals } = get();
+    const instance = terminals.get(id);
+    if (!instance) return;
+    const newTerminals = new Map(terminals);
+    newTerminals.set(id, { ...instance, tabColor: color });
+    set({ terminals: newTerminals });
+  },
+
+  colorizeAllTabs: () => {
+    const { terminals, autoColorTabs, activeWorkspaceId } = get();
+    const newTerminals = new Map(terminals);
+    if (autoColorTabs) {
+      for (const [id, instance] of newTerminals) {
+        newTerminals.set(id, { ...instance, tabColor: undefined });
+      }
+      set({ terminals: newTerminals, autoColorTabs: false });
+    } else {
+      // Group by workspace so each workspace colorizes from scratch:
+      // the first 4 panes per workspace get the MS logo colors in order,
+      // the rest cycle through a shuffled palette (re-shuffled per workspace
+      // so two workspaces don't always end up looking identical).
+      const msColors = TAB_COLORS.slice(0, 4);
+      const byWorkspace = new Map<string, TerminalId[]>();
+      for (const [id, instance] of newTerminals) {
+        const wsId = instance.workspaceId ?? activeWorkspaceId;
+        if (!byWorkspace.has(wsId)) byWorkspace.set(wsId, []);
+        byWorkspace.get(wsId)!.push(id);
+      }
+      for (const ids of byWorkspace.values()) {
+        const rest = [...TAB_COLORS.slice(4)].sort(() => Math.random() - 0.5);
+        ids.forEach((id, i) => {
+          const inst = newTerminals.get(id);
+          if (!inst) return;
+          const color = i < 4 ? msColors[i].value : rest[(i - 4) % rest.length].value;
+          newTerminals.set(id, { ...inst, tabColor: color });
+        });
+      }
+      set({ terminals: newTerminals, autoColorTabs: true });
+    }
+  },
+
+  toggleSwitcher: () => {
+    set((state) => ({ showSwitcher: !state.showSwitcher }));
+  },
+
+  togglePromptSearch: () => {
+    set((state) => ({ showPromptSearch: !state.showPromptSearch }));
+  },
+
+  togglePaneHints: () => {
+    set((state) => ({ showPaneHints: !state.showPaneHints }));
+  },
+
+  toggleShortcuts: () => {
+    set((state) => ({ showShortcuts: !state.showShortcuts }));
+  },
+
+  toggleCommandPalette: () => {
+    set((state) => ({ showCommandPalette: !state.showCommandPalette }));
+  },
+
+  toggleSettings: () => {
+    set((state) => ({ showSettings: !state.showSettings }));
+  },
+
+  closeSettings: () => {
+    set({ showSettings: false });
+  },
+
+  toggleBacklog: () => {
+    set((state) => ({ showBacklog: !state.showBacklog }));
+  },
+
+  closeBacklog: () => {
+    set({ showBacklog: false });
+  },
+
+  updateConfig: async (update: Partial<AppConfig>) => {
+    const { config } = get();
+    if (!config) return;
+    const newConfig = { ...config, ...update };
+    for (const [key, value] of Object.entries(update)) {
+      await window.terminalAPI.setConfig(key, value);
+    }
+    if (update.theme || update.backgroundMaterial !== undefined || update.backgroundOpacity !== undefined) {
+      const materialActive = newConfig.backgroundMaterial && newConfig.backgroundMaterial !== 'none';
+      const opacity = materialActive ? (newConfig.backgroundOpacity ?? 0.8) : undefined;
+      applyThemeToChromeVars(newConfig.theme, opacity);
+    }
+    const extra: Record<string, unknown> = { config: newConfig };
+    // Sync store fontSize with config when terminal font size changes
+    if (update.terminal?.fontSize) {
+      extra.fontSize = update.terminal.fontSize;
+    }
+    // tabMode flip: rebuild the layout for the new mode so the user
+    // doesn't have to manually toggle focus<->grid to see the right
+    // pane set (TASK-101). Three cases:
+    //   1. viewMode === 'grid': rebuild the grid with the new mode's
+    //      pane scope (flat = all panes, workspaces = active ws only).
+    //   2. flat -> workspaces while NOT in grid: restore the active
+    //      workspace's saved layout (the flat layout had panes from
+    //      every workspace, which doesn't fit the workspaces model).
+    //   3. workspaces -> flat while NOT in grid: snapshot the leaving
+    //      workspace's layout first, then keep the current tilingRoot
+    //      so the focused pane stays visible.
+    const oldTabMode = (config as { tabMode?: 'flat' | 'workspaces' }).tabMode ?? 'flat';
+    const newTabMode = (update as { tabMode?: 'flat' | 'workspaces' }).tabMode;
+    if (newTabMode && newTabMode !== oldTabMode) {
+      const { viewMode, terminals, activeWorkspaceId, gridColumns, workspaces, layout } = get();
+      if (viewMode === 'grid') {
+        const ids = Array.from(terminals.entries())
+          .filter(([, t]) => {
+            if (t.mode !== 'tiled') return false;
+            if (newTabMode === 'workspaces') {
+              return (t.workspaceId ?? activeWorkspaceId) === activeWorkspaceId;
+            }
+            return true;
+          })
+          .map(([id]) => id);
+        const newGrid = ids.length > 0 ? buildGridTree(ids, gridColumns || undefined) : null;
+        extra.layout = { ...layout, tilingRoot: newGrid };
+        // Stale preGridRoot from the old tab mode would point at panes
+        // that may no longer be in scope; drop it so grid->focus just
+        // returns to the rebuilt grid's first pane.
+        extra.preGridRoot = null;
+      } else if (newTabMode === 'workspaces') {
+        // Restore active workspace's saved layout if we have one.
+        const ws = workspaces.get(activeWorkspaceId);
+        if (ws?.layout?.tilingRoot) {
+          extra.layout = { ...layout, tilingRoot: ws.layout.tilingRoot };
+        }
+      } else {
+        // workspaces -> flat, non-grid view. Save the leaving workspace's
+        // current layout so we can restore it on the way back.
+        const ws = workspaces.get(activeWorkspaceId);
+        if (ws) {
+          const newWorkspaces = new Map(workspaces);
+          newWorkspaces.set(activeWorkspaceId, {
+            ...ws,
+            layout: { ...ws.layout, tilingRoot: layout.tilingRoot },
+          });
+          extra.workspaces = newWorkspaces;
+        }
+      }
+    }
+    // Mirror aiSessionLoadLimit into the runtime session-limit fields and
+    // re-scan so the new threshold takes effect immediately (incl. 0 = clear).
+    const newAiLimit = (update as any).aiSessionLoadLimit;
+    const aiLimitChanged =
+      typeof newAiLimit === 'number' && newAiLimit !== (config as any).aiSessionLoadLimit;
+    if (aiLimitChanged) {
+      extra.copilotSessionsLimit = newAiLimit;
+      extra.claudeCodeSessionsLimit = newAiLimit;
+    }
+    set(extra);
+    if (aiLimitChanged) {
+      await Promise.all([
+        get().loadCopilotSessions(),
+        get().loadClaudeCodeSessions(),
+      ]);
+    }
+  },
+
+  toggleTabBarPosition: () => {
+    const newPos = get().tabBarPosition === 'top' ? 'left' : 'top';
+    set({ tabBarPosition: newPos });
+    get().updateConfig({ tabBarPosition: newPos } as any);
+  },
+
+  setTabBarPosition: (pos: 'top' | 'bottom' | 'left' | 'right') => {
+    set({ tabBarPosition: pos });
+    get().updateConfig({ tabBarPosition: pos } as any);
+  },
+
+  toggleHideTabTitles: () => {
+    const val = !get().hideTabTitles;
+    set({ hideTabTitles: val });
+    get().updateConfig({ hideTabTitles: val } as any);
+  },
+
+  toggleHideTabCloseButtons: () => {
+    const val = !get().hideTabCloseButtons;
+    set({ hideTabCloseButtons: val });
+    get().updateConfig({ hideTabCloseButtons: val } as any);
+  },
+
+  toggleConfirmOnCloseSession: () => {
+    const val = !get().confirmOnCloseSession;
+    set({ confirmOnCloseSession: val });
+    get().updateConfig({ confirmOnCloseSession: val } as any);
+  },
+
+  setTerminalOpacity: (opacity: number) => {
+    const clamped = Math.max(0.3, Math.min(1, opacity));
+    set({ terminalOpacity: clamped });
+    document.documentElement.style.setProperty('--terminal-opacity', String(clamped));
+    get().updateConfig({ terminalOpacity: clamped } as any);
+  },
+
+  startRenaming: (id: TerminalId | null) => {
+    set({ renamingTerminalId: id });
+  },
+
+  toggleViewMode: () => {
+    const { viewMode, layout, preGridRoot, gridColumns, focusedTerminalId } = get();
+    if (viewMode === 'grid') {
+      // Grid → Focus: restore the pre-grid layout when available. Defensive
+      // guard (#70): if preGridRoot is stale and doesn't contain the currently
+      // focused terminal, fall back to the current tilingRoot so focus mode
+      // never ends up blank.
+      let restored = preGridRoot || layout.tilingRoot;
+      if (preGridRoot && focusedTerminalId) {
+        const preIds = getLeafOrder(preGridRoot);
+        if (!preIds.includes(focusedTerminalId)) {
+          restored = layout.tilingRoot;
+        }
+      }
+      set({
+        viewMode: 'focus',
+        layout: { ...layout, tilingRoot: restored },
+        preGridRoot: null,
+        gridTabIds: {},
+      });
+    } else {
+      // Focus → Grid: build grid from all non-dormant terminals
+      const root = layout.tilingRoot;
+      if (!root) {
+        set({ viewMode: 'grid' });
+        return;
+      }
+      // Build grid from all tiled terminals in TAB order so the grid panes
+      // line up left-to-right, top-to-bottom with the tab bar. Tab order =
+      // insertion order of the terminals Map, which TabBar.tsx uses too.
+      // Scope to active workspace ONLY when in workspaces tab mode
+      // (TASK-87). In flat tab mode the user sees all panes across all
+      // workspaces in the tab bar, so the grid must show all panes too -
+      // earlier 'always filter' behavior would hide panes from other
+      // workspaces when the user toggled focus -> grid in flat mode.
+      const tabMode = (get().config as { tabMode?: 'flat' | 'workspaces' } | undefined)?.tabMode ?? 'flat';
+      const activeWsId = get().activeWorkspaceId;
+      const ids = Array.from(get().terminals.entries())
+        .filter(([, t]) => {
+          if (t.mode !== 'tiled') return false;
+          if (tabMode === 'workspaces') {
+            return (t.workspaceId ?? activeWsId) === activeWsId;
+          }
+          return true;
+        })
+        .map(([id]) => id);
+      if (ids.length === 0) {
+        set({ viewMode: 'grid' });
+        return;
+      }
+      const gridRoot = buildGridTree(ids, gridColumns || undefined);
+      set({
+        viewMode: 'grid',
+        preGridRoot: root,
+        layout: { ...layout, tilingRoot: gridRoot },
+      });
+    }
+  },
+
+  toggleBroadcastMode: () => {
+    set((s) => ({ broadcastMode: !s.broadcastMode }));
+  },
+
+  toggleSelectTerminal: (id: TerminalId) => {
+    const { selectedTerminalIds } = get();
+    const next = { ...selectedTerminalIds };
+    if (next[id]) {
+      delete next[id];
+    } else {
+      next[id] = true;
+    }
+    set({ selectedTerminalIds: next });
+  },
+
+  clearSelection: () => {
+    set({ selectedTerminalIds: {} });
+  },
+
+  gridSelectedTabs: (ids: TerminalId[]) => {
+    if (ids.length < 2) return;
+    const { layout, preGridRoot } = get();
+    const gridRoot = buildGridTree(ids);
+    if (!gridRoot) return;
+    // Save the original layout so we can restore when exiting grid
+    const originalRoot = preGridRoot || layout.tilingRoot;
+    const gridIds: Record<string, true> = {};
+    for (const id of ids) gridIds[id] = true;
+    set({
+      viewMode: 'grid',
+      preGridRoot: originalRoot,
+      layout: { ...layout, tilingRoot: gridRoot },
+      gridTabIds: gridIds,
+      selectedTerminalIds: {},
+      focusedTerminalId: ids[0],
+    });
+  },
+
+  showSelectedPanes: () => {
+    // TASK-72: filter to currently-selected panes only. Restrict the set
+    // to terminals in the active workspace's tiling tree so a stale
+    // selection (e.g. one that was set in a different workspace) cannot
+    // pull foreign terminals into the visible grid.
+    const { selectedTerminalIds, layout, preGridRoot } = get();
+    const root = layout.tilingRoot;
+    if (!root) return;
+    const inWorkspace = new Set(getLeafOrder(root));
+    const ids = Object.keys(selectedTerminalIds).filter((id) => inWorkspace.has(id));
+    if (ids.length < 2) return;
+    const gridRoot = buildGridTree(ids);
+    if (!gridRoot) return;
+    // Save the original layout so showAllPanes() can restore it. If we're
+    // already in a grid (preGridRoot set), keep that as the canonical
+    // restore target.
+    const originalRoot = preGridRoot || root;
+    const gridIds: Record<string, true> = {};
+    for (const id of ids) gridIds[id] = true;
+    set({
+      viewMode: 'grid',
+      preGridRoot: originalRoot,
+      layout: { ...layout, tilingRoot: gridRoot },
+      gridTabIds: gridIds,
+      // Intentionally DO NOT clear selectedTerminalIds: keeping it lets the
+      // multi-selected visual indicator persist on the visible panes, and
+      // lets the user toggle the filter off and on without re-picking.
+      focusedTerminalId: ids[0],
+    });
+  },
+
+  showAllPanes: () => {
+    // TASK-173: "Show All" must actually SHOW ALL panes - earlier behavior
+    // dropped back to focus mode (one pane visible), which contradicted
+    // the button label and surprised users who'd selected 3 panes, hit
+    // "Show All" expecting to see all 4. We now widen the existing grid
+    // to include every tiled pane in the active workspace (mirroring the
+    // Focus->Grid branch of toggleViewMode). The user can still leave
+    // grid mode entirely via the separate "Switch to tabs" button.
+    const { viewMode, layout, preGridRoot, gridColumns } = get();
+    if (viewMode !== 'grid' || !preGridRoot) return;
+    const tabMode = (get().config as { tabMode?: 'flat' | 'workspaces' } | undefined)?.tabMode ?? 'flat';
+    const activeWsId = get().activeWorkspaceId;
+    const allIds = Array.from(get().terminals.entries())
+      .filter(([, t]) => {
+        if (t.mode !== 'tiled') return false;
+        if (tabMode === 'workspaces') {
+          return (t.workspaceId ?? activeWsId) === activeWsId;
+        }
+        return true;
+      })
+      .map(([id]) => id);
+    if (allIds.length < 2) {
+      // Only one (or zero) panes left in the workspace - a grid view doesn't
+      // make sense, so fall back to restoring focus mode the old way.
+      set({
+        viewMode: 'focus',
+        layout: { ...layout, tilingRoot: preGridRoot },
+        preGridRoot: null,
+        gridTabIds: {},
+      });
+      return;
+    }
+    const gridRoot = buildGridTree(allIds, gridColumns || undefined);
+    if (!gridRoot) return;
+    const gridIds: Record<string, true> = {};
+    for (const id of allIds) gridIds[id] = true;
+    set({
+      // Stay in grid mode but with every pane now visible. preGridRoot is
+      // preserved so "Switch to tabs" can still exit the grid back to the
+      // pre-grid focus layout. Selection is PRESERVED (TASK-173 follow-up)
+      // so the workspace toolbar can immediately offer "Show Selected (N)"
+      // as the reverse toggle - clearing here would make the user re-pick
+      // panes just to narrow again, and break the show-all <-> show-selected
+      // toggle UX.
+      viewMode: 'grid',
+      layout: { ...layout, tilingRoot: gridRoot },
+      gridTabIds: gridIds,
+    });
+  },
+
+  equalizeLayout: () => {
+    const { layout } = get();
+    if (!layout.tilingRoot || layout.tilingRoot.kind === 'leaf') return;
+
+    function countLeaves(node: LayoutNode): number {
+      if (node.kind === 'leaf') return 1;
+      return countLeaves(node.first) + countLeaves(node.second);
+    }
+
+    function equalize(node: LayoutNode): LayoutNode {
+      if (node.kind === 'leaf') return node;
+      const firstCount = countLeaves(node.first);
+      const secondCount = countLeaves(node.second);
+      const ratio = firstCount / (firstCount + secondCount);
+      return {
+        ...node,
+        splitRatio: ratio,
+        first: equalize(node.first),
+        second: equalize(node.second),
+      };
+    }
+
+    set({ layout: { ...layout, tilingRoot: equalize(layout.tilingRoot) } });
+  },
+
+  cycleGridColumns: () => {
+    const { layout, gridColumns, viewMode, preGridRoot } = get();
+    // When already in grid, preserve the grid's current order (which is tab
+    // order after the order-matches-tabs fix). When entering grid from focus,
+    // fall back to the source tree's leaf order.
+    let ids: TerminalId[];
+    if (viewMode === 'grid' && layout.tilingRoot) {
+      ids = getLeafOrder(layout.tilingRoot);
+    } else {
+      const sourceRoot = preGridRoot || layout.tilingRoot;
+      if (!sourceRoot) return;
+      ids = getLeafOrder(sourceRoot);
+    }
+    const n = ids.length;
+    if (n <= 1) return;
+
+    const next = gridColumns + 1;
+    const newCols = next > n ? 0 : next;
+
+    // Rebuild grid tree with new column count
+    const newGridRoot = buildGridTree(ids, newCols || undefined);
+
+    if (viewMode === 'grid') {
+      // Already in grid mode — just replace the tree
+      set({
+        gridColumns: newCols,
+        layout: { ...layout, tilingRoot: newGridRoot },
+      });
+    } else {
+      // Enter grid mode
+      set({
+        gridColumns: newCols,
+        viewMode: 'grid',
+        preGridRoot: layout.tilingRoot,
+        layout: { ...layout, tilingRoot: newGridRoot },
+      });
+    }
+  },
+
+  moveTerminalDirection: (id: TerminalId, dir: 'up' | 'down' | 'left' | 'right') => {
+    const { layout, terminals } = get();
+    if (!layout.tilingRoot) return;
+    const neighbor = findDirectionalNeighbor(layout.tilingRoot, id, dir);
+    if (neighbor) {
+      const newRoot = swapLeaves(layout.tilingRoot, id, neighbor);
+      // Also swap tab order to keep tab bar in sync with grid positions
+      const entries = Array.from(terminals.entries());
+      const idxA = entries.findIndex(([tid]) => tid === id);
+      const idxB = entries.findIndex(([tid]) => tid === neighbor);
+      if (idxA !== -1 && idxB !== -1) {
+        [entries[idxA], entries[idxB]] = [entries[idxB], entries[idxA]];
+        set({ layout: { ...layout, tilingRoot: newRoot }, terminals: new Map(entries) });
+      } else {
+        set({ layout: { ...layout, tilingRoot: newRoot } });
+      }
+    }
+  },
+
+  zoomIn: () => {
+    const { fontSize } = get();
+    const next = Math.min(fontSize + 1, 32);
+    set({ fontSize: next });
+    // Intentionally not persisting to config.terminal.fontSize: that field is
+    // the user-set baseline (Settings dialog) and the denominator of the
+    // zoom % shown in the status bar. Writing zoom back there would make the
+    // ratio always 1.0 → the status bar would be stuck at 100%.
+  },
+
+  zoomOut: () => {
+    const { fontSize } = get();
+    const next = Math.max(fontSize - 1, 8);
+    set({ fontSize: next });
+  },
+
+  zoomReset: () => {
+    const { config } = get();
+    const next = config?.terminal?.fontSize ?? 14;
+    set({ fontSize: next });
+    // zoomReset restores the config default; no need to write it back
+  },
+
+  saveNamedLayout: async (name: string) => {
+    const { terminals, layout } = get();
+
+    // Serialize layout tree with terminal info at each leaf
+    function serializeNode(node: LayoutNode): unknown {
+      if (node.kind === 'leaf') {
+        const t = terminals.get(node.terminalId);
+        return {
+          kind: 'leaf',
+          terminal: {
+            title: t?.title ?? 'Terminal',
+            shellProfileId: t?.shellProfileId ?? '',
+            cwd: t?.cwd ?? 'C:\\Users',
+            lastProcess: t?.lastProcess ?? '',
+            startupCommand: t?.startupCommand ?? '',
+          },
+        };
+      }
+      return {
+        kind: 'split',
+        direction: node.direction,
+        splitRatio: node.splitRatio,
+        first: serializeNode(node.first),
+        second: serializeNode(node.second),
+      };
+    }
+
+    const serialized = {
+      tree: layout.tilingRoot ? serializeNode(layout.tilingRoot) : null,
+      floating: layout.floatingPanels.map((p) => {
+        const t = terminals.get(p.terminalId);
+        return {
+          terminal: { title: t?.title ?? 'Terminal', shellProfileId: t?.shellProfileId ?? '', cwd: t?.cwd ?? 'C:\\Users', lastProcess: t?.lastProcess ?? '', startupCommand: t?.startupCommand ?? '' },
+          x: p.x, y: p.y, width: p.width, height: p.height,
+        };
+      }),
+    };
+
+    const layouts = (_sessionExtras.layouts as Record<string, unknown>) ?? {};
+    layouts[name] = serialized;
+    _sessionExtras = { ..._sessionExtras, layouts };
+    await window.terminalAPI.saveSession(_sessionExtras);
+  },
+
+  loadNamedLayout: async (name: string) => {
+    const saved = (_sessionExtras.layouts as Record<string, unknown>)?.[name] as { tree?: unknown; floating?: unknown[] } | undefined;
+    if (!saved) return false;
+
+    const { config } = get();
+    if (!config) return false;
+
+    // Close all existing terminals
+    const { terminals } = get();
+    for (const [id] of terminals) {
+      await window.terminalAPI.killPty(id);
+    }
+    set({ terminals: new Map(), layout: { tilingRoot: null, floatingPanels: [] }, focusedTerminalId: null });
+
+    // Helper to create a pty and terminal instance
+    async function createTerm(info: { title: string; shellProfileId: string; cwd: string }): Promise<{ id: TerminalId; instance: TerminalInstance } | null> {
+      const profile = config!.shells.find((s) => s.id === info.shellProfileId) ?? config!.shells[0];
+      if (!profile) return null;
+      const id = uuidv4();
+      try {
+        const { pid } = await window.terminalAPI.createPty({
+          id, shellPath: profile.path, args: profile.args, cwd: info.cwd || 'C:\\Users', env: profile.env, cols: 80, rows: 24,
+        });
+        return { id, instance: { id, title: info.title || profile.name, customTitle: !!info.title, shellProfileId: profile.id, cwd: info.cwd, mode: 'tiled' as const, pid, lastProcess: '', startupCommand: info.startupCommand || '' } };
+      } catch { return null; }
+    }
+
+    // Rebuild layout tree recursively
+    const newTerminals = new Map<TerminalId, TerminalInstance>();
+    let firstTerminalId: TerminalId | null = null;
+
+    async function rebuildNode(node: any): Promise<LayoutNode | null> {
+      if (node.kind === 'leaf') {
+        const result = await createTerm(node.terminal);
+        if (!result) return null;
+        newTerminals.set(result.id, result.instance);
+        if (!firstTerminalId) firstTerminalId = result.id;
+        return { kind: 'leaf', terminalId: result.id };
+      }
+      if (node.kind === 'split') {
+        const first = await rebuildNode(node.first);
+        const second = await rebuildNode(node.second);
+        if (!first && !second) return null;
+        if (!first) return second;
+        if (!second) return first;
+        return {
+          kind: 'split',
+          id: uuidv4(),
+          direction: node.direction,
+          splitRatio: node.splitRatio ?? 0.5,
+          first,
+          second,
+        };
+      }
+      return null;
+    }
+
+    let newRoot: LayoutNode | null = null;
+    if (saved.tree) {
+      newRoot = await rebuildNode(saved.tree);
+    }
+
+    // Restore floating panels
+    const newFloating: FloatingPanelState[] = [];
+    if (Array.isArray(saved.floating)) {
+      for (const f of saved.floating as any[]) {
+        const result = await createTerm(f.terminal);
+        if (result) {
+          result.instance.mode = 'floating';
+          newTerminals.set(result.id, result.instance);
+          newFloating.push({ terminalId: result.id, x: f.x ?? 200, y: f.y ?? 150, width: f.width ?? 600, height: f.height ?? 400, zIndex: 100 });
+          if (!firstTerminalId) firstTerminalId = result.id;
+        }
+      }
+    }
+
+    set({
+      terminals: newTerminals,
+      layout: { tilingRoot: newRoot, floatingPanels: newFloating },
+      focusedTerminalId: firstTerminalId,
+    });
+    return true;
+  },
+
+  getLayoutNames: async () => {
+    const layouts = (_sessionExtras.layouts as Record<string, unknown>) ?? {};
+
+    function countNodes(node: any): number {
+      if (!node) return 0;
+      if (node.kind === 'leaf') return 1;
+      if (node.kind === 'split') return countNodes(node.first) + countNodes(node.second);
+      return 0;
+    }
+
+    return Object.entries(layouts).map(([name, data]) => {
+      const d = data as { tree?: unknown; floating?: unknown[] };
+      const tiled = countNodes(d?.tree);
+      const floating = Array.isArray(d?.floating) ? d.floating.length : 0;
+      return { name, count: tiled + floating };
+    });
+  },
+
+  addFavoriteDir: (dir: string) => {
+    const { favoriteDirs } = get();
+    if (favoriteDirs.includes(dir)) return;
+    const updated = [...favoriteDirs, dir];
+    set({ favoriteDirs: updated });
+    get().saveDirs();
+  },
+
+  removeFavoriteDir: (dir: string) => {
+    const updated = get().favoriteDirs.filter((d) => d !== dir);
+    set({ favoriteDirs: updated });
+    get().saveDirs();
+  },
+
+  addRecentDir: (dir: string) => {
+    // Only add actual directories, not executable paths or garbled terminal output
+    if (/\.(exe|cmd|bat|com|ps1|sh|msi|dll)$/i.test(dir)) return;
+    // Reject paths containing ANSI escapes, control chars, shell operators, or command substitution
+    if (/[\x1b\x00-\x1f`$]|&&|\|\||[><|'"]|\$\(/.test(dir)) return;
+    // Must look like a real path (drive letter, unix root, or WSL UNC path)
+    if (!/^[A-Z]:\\/i.test(dir) && !dir.startsWith('/') && !/^\\\\wsl/i.test(dir)) return;
+    const { recentDirs } = get();
+    const filtered = recentDirs.filter((d) => d !== dir);
+    const updated = [dir, ...filtered].slice(0, 10);
+    set({ recentDirs: updated });
+    get().saveDirs();
+  },
+
+  removeRecentDir: (dir: string) => {
+    const updated = get().recentDirs.filter((d) => d !== dir);
+    set({ recentDirs: updated });
+    get().saveDirs();
+  },
+
+  cdToDir: (dir: string) => {
+    const { focusedTerminalId, terminals } = get();
+    if (!focusedTerminalId) return;
+    // Use single quotes for POSIX shells to prevent command substitution;
+    // double quotes for Windows shells (no $() expansion risk)
+    const terminal = terminals.get(focusedTerminalId);
+    const isWslOrUnix = terminal?.wsl || dir.startsWith('/');
+    const quoted = isWslOrUnix ? `'${dir.replace(/'/g, "'\\''")}'` : `"${dir}"`;
+    window.terminalAPI.writePty(focusedTerminalId, `cd ${quoted}\r`);
+    get().addRecentDir(dir);
+  },
+
+  toggleDirPicker: () => {
+    set((state) => ({ showDirPicker: !state.showDirPicker }));
+  },
+
+  toggleFileExplorer: () => {
+    set((state) => ({ showFileExplorer: !state.showFileExplorer }));
+  },
+
+  openFileExplorerAt: (path: string) => {
+    // Toggle: if panel is already open, close it. Otherwise open at the path.
+    const { showFileExplorer } = get();
+    if (showFileExplorer) {
+      set({ showFileExplorer: false, fileExplorerTargetPath: null });
+    } else {
+      set({ showFileExplorer: true, fileExplorerTargetPath: path });
+    }
+  },
+
+  // ── Worktree panel actions ────────────────────────────────────────
+  toggleWorktreePanel: () => {
+    const wasShowing = get().showWorktreePanel;
+    set({ showWorktreePanel: !wasShowing });
+    if (!wasShowing) {
+      get().loadWorktrees();
+    }
+  },
+
+  loadWorktrees: async () => {
+    const seq = ++_loadWorktreesSeq;
+    const { favoriteDirs, recentDirs } = get();
+    const allDirs = [...new Set([...favoriteDirs, ...recentDirs])];
+    if (allDirs.length === 0) {
+      set({ worktreeRepos: [], worktreeLoading: false });
+      return;
+    }
+    set({ worktreeLoading: true });
+    const results = await Promise.allSettled(
+      allDirs.map((dir) => window.terminalAPI.listWorktrees(dir)),
+    );
+    if (seq !== _loadWorktreesSeq) return;
+    const oldRepos = get().worktreeRepos;
+    const oldExpandState = new Map(oldRepos.map((r) => [r.gitRoot, r.isExpanded]));
+    const seenRoots = new Set<string>();
+    const repos: RepoWorktrees[] = [];
+    for (const result of results) {
+      if (result.status !== 'fulfilled') continue;
+      const repo = result.value as RepoWorktrees;
+      if (!repo.gitRoot || seenRoots.has(repo.gitRoot)) continue;
+      seenRoots.add(repo.gitRoot);
+      // Only show repos that actually have worktrees. Non-git dirs, missing
+      // dirs, or repos with spawn errors are silently skipped — the panel
+      // shouldn't surface errors for dirs the user didn't explicitly target.
+      if (repo.worktrees.length > 0) {
+        const prevExpanded = oldExpandState.get(repo.gitRoot);
+        repo.isExpanded = prevExpanded !== undefined ? prevExpanded : true;
+        repos.push(repo);
+      }
+    }
+    set({ worktreeRepos: repos, worktreeLoading: false });
+  },
+
+  createWorktree: async (repoPath: string, branchName: string, baseBranch: string) => {
+    const result = await window.terminalAPI.createWorktree(repoPath, branchName, baseBranch);
+    if (result.success) {
+      await get().loadWorktrees();
+    }
+    return result;
+  },
+
+  deleteWorktree: async (repoPath: string, worktreePath: string) => {
+    const result = await window.terminalAPI.deleteWorktree(repoPath, worktreePath);
+    if (result.success) {
+      await get().loadWorktrees();
+    }
+    return result;
+  },
+
+  openTabMenu: (id?: TerminalId) => {
+    const targetId = id ?? get().focusedTerminalId;
+    if (targetId) set({ tabMenuTerminalId: targetId });
+  },
+
+  loadDirs: async () => {
+    const session = (await window.terminalAPI.loadSession()) as Record<string, unknown> | null;
+    if (session) {
+      _sessionExtras = { ..._sessionExtras, ...session };
+      const isNotExe = (d: string) => !/\.(exe|cmd|bat|com|ps1|sh|msi|dll)$/i.test(d);
+      set({
+        favoriteDirs: ((session.favoriteDirs as string[]) ?? []).filter(isNotExe),
+        recentDirs: ((session.recentDirs as string[]) ?? []).filter(isNotExe),
+      });
+    }
+  },
+
+  saveDirs: async () => {
+    // Just trigger a full save — avoids race conditions with separate saves
+    get().saveSession();
+  },
+
+  saveSession: async () => {
+    // Skip until the store has been hydrated from disk — otherwise an early
+    // save would overwrite persisted overrides with empty defaults.
+    if (!_sessionHydrated) return;
+    // TASK-162: coalesce rapid-fire calls. Each save does an IPC +
+    // sync electron-store.set in main; without this, typing / AI session
+    // updates / workspace nudges could trigger 10+ writes/second and stall
+    // the UI on IPC round-trips. 300 ms debounce keeps the latest snapshot
+    // and lands well before any user-perceptible "should be saved" deadline.
+    if (_saveSessionTimer) clearTimeout(_saveSessionTimer);
+    _saveSessionTimer = setTimeout(() => {
+      _saveSessionTimer = null;
+      void runSaveSession();
+    }, SAVE_SESSION_DEBOUNCE_MS);
+
+    async function runSaveSession(): Promise<void> {
+    const { terminals, layout, favoriteDirs, recentDirs, config, copilotSessions, claudeCodeSessions, workspaces, activeWorkspaceId } = get();
+    // Snapshot the active workspace's layout from the canonical top-level
+    // before serialization (TASK-40) - the workspaces map only mirrors on
+    // workspace switch, so the live edits since the last switch live in
+    // top-level `layout`.
+    const liveWorkspaces = new Map(workspaces);
+    const active = liveWorkspaces.get(activeWorkspaceId);
+    if (active) liveWorkspaces.set(activeWorkspaceId, { ...active, layout });
+
+    // For AI sessions, always derive the command from session type to avoid stale
+    // startupCommand (e.g. user opened copilot, exited, then started claude manually).
+    function getStartupCommand(t: TerminalInstance | undefined): string {
+      if (!t) return '';
+      if (t.aiSessionId && config) {
+        if (!validateSessionId(t.aiSessionId)) return '';
+        const provider = getSessionProvider(copilotSessions, claudeCodeSessions, t.aiSessionId);
+        if (provider) return buildResumeCommand(config, provider, t.aiSessionId);
+      }
+      return t.startupCommand || '';
+    }
+
+    function serializeNode(node: LayoutNode): unknown {
+      if (node.kind === 'leaf') {
+        const t = terminals.get(node.terminalId);
+        return { kind: 'leaf', terminal: { title: t?.title ?? 'Terminal', shellProfileId: t?.shellProfileId ?? '', cwd: t?.cwd ?? 'C:\\Users', startupCommand: getStartupCommand(t), aiSessionId: t?.aiSessionId, aiAutoTitle: t?.aiAutoTitle, tabColor: t?.tabColor, customTitle: t?.customTitle, wsl: t?.wsl, wslDistro: t?.wslDistro } };
+      }
+      return { kind: 'split', direction: node.direction, splitRatio: node.splitRatio, first: serializeNode(node.first), second: serializeNode(node.second) };
+    }
+
+    // Serialize floating panels for any workspace.
+    function serializeFloating(panels: FloatingPanelState[]) {
+      return panels.map((p) => {
+        const t = terminals.get(p.terminalId);
+        return { terminal: { title: t?.title ?? 'Terminal', shellProfileId: t?.shellProfileId ?? '', cwd: t?.cwd ?? 'C:\\Users', startupCommand: getStartupCommand(t), aiSessionId: t?.aiSessionId, aiAutoTitle: t?.aiAutoTitle, tabColor: t?.tabColor, customTitle: t?.customTitle, wsl: t?.wsl, wslDistro: t?.wslDistro }, x: p.x, y: p.y, width: p.width, height: p.height };
+      });
+    }
+
+    // Workspaces array (TASK-40). Each workspace serializes its own
+    // tree + floating. The legacy top-level `tree` / `floating` fields
+    // stay populated with the ACTIVE workspace's content so older code
+    // paths (and any external readers) keep working.
+    const workspacesPayload = [...liveWorkspaces.values()].map((w) => ({
+      id: w.id,
+      name: w.name,
+      color: w.color,
+      tree: w.layout.tilingRoot ? serializeNode(w.layout.tilingRoot) : null,
+      floating: serializeFloating(w.layout.floatingPanels),
+    }));
+
+    // Merge with cached extras (saved layouts, etc.) — no async load needed
+    const data = {
+      ..._sessionExtras,
+      favoriteDirs,
+      recentDirs,
+      autoColorTabs: get().autoColorTabs,
+      sessionNameOverrides: get().sessionNameOverrides,
+      sessionLifecycleOverrides: get().sessionLifecycleOverrides,
+      sessionPinned: get().sessionPinned,
+      tree: layout.tilingRoot ? serializeNode(layout.tilingRoot) : null,
+      floating: serializeFloating(layout.floatingPanels),
+      workspaces: workspacesPayload,
+      activeWorkspaceId,
+    };
+    _sessionExtras = data;
+    // TASK-163: tag the timestamp before the IPC round-trip. The main
+    // process file watcher fires shortly after; the SESSION_FILE_CHANGED
+    // handler compares against this to skip self-triggered reloads.
+    _lastOwnSaveAt = Date.now();
+    await window.terminalAPI.saveSession(data);
+    }
+  },
+
+  reloadSessionSyncMaps: async () => {
+    if (!_sessionHydrated) return false;
+    try {
+      const session = (await window.terminalAPI.loadSession()) as Record<string, unknown> | null;
+      if (!session) return false;
+      const diskNames = (session.sessionNameOverrides && typeof session.sessionNameOverrides === 'object')
+        ? (session.sessionNameOverrides as Record<string, string>)
+        : {};
+      const diskLifecycle = (session.sessionLifecycleOverrides && typeof session.sessionLifecycleOverrides === 'object')
+        ? (session.sessionLifecycleOverrides as Record<string, import('../../shared/copilot-types').SessionLifecycle>)
+        : {};
+      const diskPinned = (session.sessionPinned && typeof session.sessionPinned === 'object')
+        ? (session.sessionPinned as Record<string, true>)
+        : {};
+
+      const st = get();
+      const namesEqual = shallowEqualStringMap(st.sessionNameOverrides, diskNames);
+      const lifecycleEqual = shallowEqualStringMap(st.sessionLifecycleOverrides as Record<string, string>, diskLifecycle as Record<string, string>);
+      const pinnedEqual = shallowEqualBoolMap(st.sessionPinned, diskPinned);
+
+      if (namesEqual && lifecycleEqual && pinnedEqual) {
+        // No disk-vs-memory delta - either nothing changed, or this is the
+        // echo from our own saveSession. Either way: no-op.
+        void _lastOwnSaveAt;
+        return false;
+      }
+
+      const patch: Partial<TerminalStore> = {};
+      if (!namesEqual) {
+        patch.sessionNameOverrides = diskNames;
+        // Mirror any renames into open AI pane titles, same as
+        // setSessionNameOverride does locally.
+        const updated = new Map(st.terminals);
+        let changed = false;
+        for (const [id, inst] of updated) {
+          if (!inst.aiSessionId) continue;
+          const next = diskNames[inst.aiSessionId];
+          if (next && next !== inst.title) {
+            updated.set(id, { ...inst, title: next, customTitle: true, aiAutoTitle: false });
+            changed = true;
+          }
+        }
+        if (changed) patch.terminals = updated;
+      }
+      if (!lifecycleEqual) patch.sessionLifecycleOverrides = diskLifecycle;
+      if (!pinnedEqual) patch.sessionPinned = diskPinned;
+
+      // Refresh the cached extras blob so the next saveSession doesn't
+      // clobber unrelated fields with stale data.
+      _sessionExtras = { ..._sessionExtras, ...session };
+      set(patch as any);
+
+      // If names changed, push the fresh map to main so notifyCopilotSession
+      // shows the correct display name immediately.
+      if (!namesEqual) {
+        try {
+          (window.terminalAPI as any).syncSessionNameOverrides?.(diskNames);
+        } catch { /* non-fatal */ }
+      }
+      return true;
+    } catch {
+      return false;
+    }
+  },
+
+  restoreSession: async () => {
+    try {
+    // User opted out of restoring the previous session (Settings > Terminal >
+    // Startup). Skip loading it, but still mark hydration complete so saving
+    // continues normally - turning the setting back on restores the most
+    // recent session. (The dev --no-restore flag short-circuits on the main
+    // side; this is the user-facing equivalent.)
+    if ((get().config as AppConfig | undefined)?.restoreSessionOnLaunch === false) {
+      _sessionHydrated = true;
+      return false;
+    }
+    const session = (await window.terminalAPI.loadSession()) as Record<string, unknown> | null;
+    // Flip the hydration flag whether or not a saved session exists —
+    // subsequent saveSession calls are safe either way.
+    _sessionHydrated = true;
+    if (!session) return false;
+    // Cache session extras (layouts, etc.) so saveSession doesn't need async load
+    _sessionExtras = { ...session };
+
+    // Hydrate favoriteDirs / recentDirs here so we don't need a separate
+    // loadDirs() call from App.tsx (TASK-117 - drops a redundant
+    // loadSession disk read at startup). The .exe filter mirrors what
+    // loadDirs used to do.
+    const isNotExe = (d: string) => !/\.(exe|cmd|bat|com|ps1|sh|msi|dll)$/i.test(d);
+    set({
+      favoriteDirs: ((session.favoriteDirs as string[]) ?? []).filter(isNotExe),
+      recentDirs: ((session.recentDirs as string[]) ?? []).filter(isNotExe),
+    });
+
+    if (typeof session.autoColorTabs === 'boolean') {
+      set({ autoColorTabs: session.autoColorTabs });
+    }
+
+    if (session.sessionNameOverrides && typeof session.sessionNameOverrides === 'object') {
+      set({ sessionNameOverrides: session.sessionNameOverrides as Record<string, string> });
+      // TASK-71: push the restored map to main so the first notification
+      // of this run picks up user-set names even if main hadn't already
+      // seeded the cache from disk (belt-and-suspenders).
+      try {
+        (window.terminalAPI as any).syncSessionNameOverrides?.(session.sessionNameOverrides as Record<string, string>);
+      } catch { /* non-fatal */ }
+    }
+
+    if (session.sessionLifecycleOverrides && typeof session.sessionLifecycleOverrides === 'object') {
+      set({ sessionLifecycleOverrides: session.sessionLifecycleOverrides as Record<string, import('../../shared/copilot-types').SessionLifecycle> });
+    }
+
+    if (session.sessionPinned && typeof session.sessionPinned === 'object') {
+      set({ sessionPinned: session.sessionPinned as Record<string, true> });
+    }
+
+    const { config } = get();
+    if (!config) return false;
+
+    // New tree format
+    if (session.tree || session.floating || Array.isArray((session as any).workspaces)) {
+      async function createTerm(info: { title: string; shellProfileId: string; cwd: string; startupCommand?: string; aiSessionId?: string; aiAutoTitle?: boolean; tabColor?: string; customTitle?: boolean; wsl?: boolean; wslDistro?: string; workspaceId?: string }): Promise<{ id: TerminalId; instance: TerminalInstance } | null> {
+        const profile = config!.shells.find((s) => s.id === info.shellProfileId) ?? config!.shells[0];
+        if (!profile) return null;
+        const id = uuidv4();
+        // Sanitize cwd: skip executable paths that were incorrectly saved as cwd
+        let cwd = info.cwd || '';
+        if (/\.(exe|cmd|bat|com|ps1|sh|msi|dll)$/i.test(cwd) || !cwd) {
+          cwd = profile.cwd || ((window as any).platformInfo?.platform === 'win32' ? 'C:\\Users' : (window as any).platformInfo?.homeDir || '/');
+        }
+        try {
+          const { pid } = await window.terminalAPI.createPty({
+            id, shellPath: profile.path, args: profile.args, cwd, env: profile.env, cols: 80, rows: 24,
+            wslDistro: info.wsl ? info.wslDistro : undefined,
+          });
+          // TASK-167 follow-up: send the startup command (e.g. AI resume)
+          // at PTY-creation time so panes in flat-tab mode (only the focused
+          // tab's TerminalPanel mounts) still resume their AI sessions in
+          // the background. WSL needs prompt detection that lives in the
+          // component for now, so skip it here and let mount handle it.
+          let startupCommandSent = false;
+          if (info.startupCommand && !info.wsl) {
+            const cmd = info.startupCommand;
+            setTimeout(() => {
+              try { window.terminalAPI.writePty(id, cmd + '\r'); } catch { /* terminal gone */ }
+            }, 1500);
+            startupCommandSent = true;
+          }
+          return { id, instance: { id, title: info.title || profile.name, customTitle: info.customTitle ?? !!info.title, shellProfileId: profile.id, cwd, mode: 'tiled' as const, pid, lastProcess: '', startupCommand: info.startupCommand || '', startupCommandSent, aiSessionId: info.aiSessionId, aiAutoTitle: info.aiAutoTitle, tabColor: info.tabColor, wsl: info.wsl, wslDistro: info.wslDistro, workspaceId: info.workspaceId } };
+        } catch { return null; }
+      }
+
+      const newTerminals = new Map<TerminalId, TerminalInstance>();
+      let firstId: TerminalId | null = null;
+      // Workspaces array survives across rebuilds; populated either
+      // directly from session.workspaces or fabricated for the legacy
+      // single-tree case (TASK-40).
+      const restoredWorkspaces = new Map<WorkspaceId, Workspace>();
+      let workspaceContext: WorkspaceId = DEFAULT_WORKSPACE_ID;
+
+      // TASK-117: parallelize pty spawn for the whole tree. Walk the tree
+      // pre-order to collect every leaf's createTerm() promise, await them
+      // concurrently with Promise.all, then assemble the LayoutNode tree
+      // synchronously from the resolved IDs in pre-order. Cuts wall-clock
+      // restore time on N panes from N*spawn to ~1*spawn.
+      async function rebuildNode(node: any): Promise<LayoutNode | null> {
+        const leafPromises: Promise<{ id: TerminalId; instance: TerminalInstance } | null>[] = [];
+        function collect(n: any): void {
+          if (!n || typeof n !== 'object') return;
+          if (n.kind === 'leaf') {
+            leafPromises.push(createTerm({ ...n.terminal, workspaceId: workspaceContext }));
+          } else if (n.kind === 'split') {
+            collect(n.first);
+            collect(n.second);
+          }
+        }
+        collect(node);
+        const leafResults = await Promise.all(leafPromises);
+
+        let cursor = 0;
+        function build(n: any): LayoutNode | null {
+          if (!n || typeof n !== 'object') return null;
+          if (n.kind === 'leaf') {
+            const result = leafResults[cursor++];
+            if (!result) return null;
+            newTerminals.set(result.id, result.instance);
+            if (!firstId) firstId = result.id;
+            return { kind: 'leaf', terminalId: result.id };
+          }
+          if (n.kind === 'split') {
+            const first = build(n.first);
+            const second = build(n.second);
+            if (!first && !second) return null;
+            if (!first) return second;
+            if (!second) return first;
+            return { kind: 'split', id: uuidv4(), direction: n.direction, splitRatio: n.splitRatio ?? 0.5, first, second };
+          }
+          return null;
+        }
+        return build(node);
+      }
+
+      // Workspaces-aware restore: if session has a workspaces array, walk
+      // each workspace's tree+floating with workspaceContext set to that
+      // workspace's id. Otherwise fall back to wrapping the legacy
+      // session.tree/.floating into a single default workspace.
+      let newRoot: LayoutNode | null = null;
+      const newFloating: FloatingPanelState[] = [];
+      let activeIdAfter: WorkspaceId = DEFAULT_WORKSPACE_ID;
+
+      if (Array.isArray((session as any).workspaces) && (session as any).workspaces.length > 0) {
+        for (const ws of (session as any).workspaces as any[]) {
+          if (!ws || typeof ws !== 'object') continue;
+          const wsId = (typeof ws.id === 'string' && ws.id) ? ws.id : uuidv4();
+          workspaceContext = wsId;
+          const wsRoot: LayoutNode | null = ws.tree ? await rebuildNode(ws.tree) : null;
+          const wsFloating: FloatingPanelState[] = [];
+          if (Array.isArray(ws.floating)) {
+            // TASK-117: parallelize floating-pane spawns within the workspace.
+            const floatingPairs = await Promise.all(
+              (ws.floating as any[]).map(async (f) => ({ result: await createTerm({ ...f.terminal, workspaceId: wsId }), f })),
+            );
+            for (const { result, f } of floatingPairs) {
+              if (result) {
+                result.instance.mode = 'floating';
+                newTerminals.set(result.id, result.instance);
+                wsFloating.push({ terminalId: result.id, x: f.x ?? 200, y: f.y ?? 150, width: f.width ?? 600, height: f.height ?? 400, zIndex: 100 });
+                if (!firstId) firstId = result.id;
+              }
+            }
+          }
+          restoredWorkspaces.set(wsId, {
+            id: wsId,
+            name: typeof ws.name === 'string' ? ws.name : DEFAULT_WORKSPACE_NAME,
+            color: typeof ws.color === 'string' ? ws.color : undefined,
+            layout: { tilingRoot: wsRoot, floatingPanels: wsFloating },
+          });
+        }
+        const savedActive = (session as any).activeWorkspaceId;
+        if (typeof savedActive === 'string' && restoredWorkspaces.has(savedActive)) {
+          activeIdAfter = savedActive;
+        } else {
+          activeIdAfter = restoredWorkspaces.keys().next().value as WorkspaceId;
+        }
+        const activeWs = restoredWorkspaces.get(activeIdAfter)!;
+        newRoot = activeWs.layout.tilingRoot;
+        newFloating.push(...activeWs.layout.floatingPanels);
+      } else {
+        // Legacy single-layout session - wrap in one default workspace.
+        workspaceContext = DEFAULT_WORKSPACE_ID;
+        if (session.tree) newRoot = await rebuildNode(session.tree);
+        if (Array.isArray(session.floating)) {
+          // TASK-117: parallelize legacy-format floating-pane spawns.
+          const floatingPairs = await Promise.all(
+            (session.floating as any[]).map(async (f) => ({ result: await createTerm({ ...f.terminal, workspaceId: DEFAULT_WORKSPACE_ID }), f })),
+          );
+          for (const { result, f } of floatingPairs) {
+            if (result) {
+              result.instance.mode = 'floating';
+              newTerminals.set(result.id, result.instance);
+              newFloating.push({ terminalId: result.id, x: f.x ?? 200, y: f.y ?? 150, width: f.width ?? 600, height: f.height ?? 400, zIndex: 100 });
+              if (!firstId) firstId = result.id;
+            }
+          }
+        }
+        restoredWorkspaces.set(DEFAULT_WORKSPACE_ID, {
+          id: DEFAULT_WORKSPACE_ID,
+          name: DEFAULT_WORKSPACE_NAME,
+          layout: { tilingRoot: newRoot, floatingPanels: [...newFloating] },
+        });
+        activeIdAfter = DEFAULT_WORKSPACE_ID;
+      }
+
+      if (newTerminals.size === 0) return false;
+      set({
+        terminals: newTerminals,
+        layout: { tilingRoot: newRoot, floatingPanels: newFloating },
+        workspaces: restoredWorkspaces,
+        activeWorkspaceId: activeIdAfter,
+        focusedTerminalId: firstId,
+      });
+      return true;
+    }
+
+    // Legacy flat format fallback
+    const legacyTerminals = (session as any).terminals as { title: string; shellProfileId: string; cwd: string }[] | undefined;
+    if (!legacyTerminals?.length) return false;
+
+    for (const saved of legacyTerminals) {
+      const profile = config.shells.find((s) => s.id === saved.shellProfileId) ?? config.shells[0];
+      if (!profile) continue;
+      const id = uuidv4();
+      try {
+        const { pid } = await window.terminalAPI.createPty({ id, shellPath: profile.path, args: profile.args, cwd: saved.cwd || 'C:\\Users', env: profile.env, cols: 80, rows: 24 });
+        const instance: TerminalInstance = { id, title: saved.title || profile.name, shellProfileId: profile.id, cwd: saved.cwd, mode: 'tiled', pid };
+        const { terminals, layout } = get();
+        const newTerminals = new Map(terminals);
+        newTerminals.set(id, instance);
+        const newLeaf: LayoutLeafNode = { kind: 'leaf', terminalId: id };
+        let newRoot: LayoutNode;
+        if (layout.tilingRoot === null) { newRoot = newLeaf; } else {
+          const order = getLeafOrder(layout.tilingRoot);
+          newRoot = insertLeaf(layout.tilingRoot, order[order.length - 1], id, 'right');
+        }
+        set({ terminals: newTerminals, layout: { ...layout, tilingRoot: newRoot }, focusedTerminalId: id });
+      } catch { /* skip */ }
+    }
+    return true;
+    } finally {
+      // Always flip the loading flag off so TilingLayout stops showing
+      // the loading indicator. App.tsx also clears this in its init's
+      // finally clause as a belt-and-suspenders against early throws
+      // before restoreSession is reached.
+      set({ isRestoring: false });
+    }
+  },
+
+  setDragging: (isDragging: boolean, terminalId?: TerminalId) => {
+    set({
+      isDragging,
+      draggedTerminalId: isDragging ? (terminalId ?? null) : null,
+    });
+  },
+
+  // ── Prompts dialog actions ─────────────────────────────────────────
+  showPromptsForTerminal: (terminalId: TerminalId) => {
+    set({ promptsDialogRequest: { terminalId } });
+  },
+  showPromptsForSession: (sessionId: string, scrollToPromptIndex?: number) => {
+    set({ promptsDialogRequest: { sessionId, scrollToPromptIndex } });
+  },
+  clearPromptsDialogRequest: () => {
+    set({ promptsDialogRequest: null });
+  },
+  showSessionSummary: (sessionId: string) => {
+    set({ sessionSummaryRequest: sessionId });
+  },
+  clearSessionSummary: () => {
+    set({ sessionSummaryRequest: null });
+  },
+
+  // ── Prompt composer actions ────────────────────────────────────────
+  openPromptComposer: (terminalId: TerminalId) => {
+    // Seed the draft from the pane's current input line, but only when there's
+    // no draft yet (don't clobber an in-progress composition).
+    let drafts = get().composerDrafts;
+    if (!drafts[terminalId]) {
+      const input = getCurrentInputLine(terminalId);
+      if (input) drafts = updateComposerDrafts(drafts, terminalId, input);
+    }
+    set({ promptComposerRequest: terminalId, composerDrafts: drafts });
+  },
+  closePromptComposer: () => {
+    set({ promptComposerRequest: null });
+  },
+  setPromptComposerDraft: (terminalId: TerminalId, draft: string) => {
+    set({ composerDrafts: updateComposerDrafts(get().composerDrafts, terminalId, draft) });
+  },
+
+  // ── Workspaces (TASK-40) ─────────────────────────────────────────
+  // Phase 1 keeps the top-level `layout` as the canonical mutable
+  // source for the active workspace. Workspaces map mirrors it; on
+  // setActiveWorkspace, current layout is snapshotted to the leaving
+  // workspace and the entering workspace's layout becomes top-level.
+  // This minimizes the diff against existing layout-mutating code.
+  createWorkspace: (initialName?: string) => {
+    const id = uuidv4();
+    const existingNames = new Set([...get().workspaces.values()].map((w) => w.name));
+    let name = initialName;
+    if (!name) {
+      // Auto-number: "Workspace 2", "Workspace 3", ...
+      let n = get().workspaces.size + 1;
+      while (existingNames.has(`Workspace ${n}`)) n++;
+      name = `Workspace ${n}`;
+    }
+    // Snapshot current top-level layout to the leaving workspace before
+    // we swap top-level to the new (empty) one.
+    set((state) => {
+      const next = new Map(state.workspaces);
+      const leaving = next.get(state.activeWorkspaceId);
+      if (leaving) next.set(state.activeWorkspaceId, { ...leaving, layout: state.layout });
+      next.set(id, { id, name: name!, layout: { tilingRoot: null, floatingPanels: [] } });
+      return {
+        workspaces: next,
+        activeWorkspaceId: id,
+        layout: { tilingRoot: null, floatingPanels: [] },
+        focusedTerminalId: null,
+        // Clear multi-pane selection when switching to a new workspace,
+        // matching the behavior in setActiveWorkspace (TASK-72).
+        selectedTerminalIds: {} as Record<TerminalId, true>,
+        // GH #115: also reset dnd-kit drag flag here for the same reason
+        // as setActiveWorkspace - a drag in flight when the user clicks
+        // "+ new tab" could leave PaneDropZones overlays covering every
+        // existing pane.
+        isDragging: false,
+        draggedTerminalId: null,
+      };
+    });
+    get().saveSession();
+    return id;
+  },
+
+  setActiveWorkspace: (id: WorkspaceId) => {
+    const { activeWorkspaceId, workspaces, layout } = get();
+    if (id === activeWorkspaceId) return;
+    const target = workspaces.get(id);
+    if (!target) return;
+    // Snapshot the leaving workspace's layout, install the entering one.
+    const next = new Map(workspaces);
+    const leaving = next.get(activeWorkspaceId);
+    if (leaving) next.set(activeWorkspaceId, { ...leaving, layout });
+    // Pick a sensible focus target: first leaf terminal in the entering
+    // workspace's tiling tree, or the first floating panel, or null.
+    const firstLeaf = (function findFirst(node: LayoutNode | null): TerminalId | null {
+      if (!node) return null;
+      if (node.kind === 'leaf') return node.terminalId;
+      return findFirst(node.first) ?? findFirst(node.second);
+    })(target.layout.tilingRoot);
+    const newFocus =
+      firstLeaf ?? target.layout.floatingPanels[0]?.terminalId ?? null;
+    set({
+      workspaces: next,
+      activeWorkspaceId: id,
+      layout: target.layout,
+      focusedTerminalId: newFocus,
+      // TASK-72: multi-pane selection is per-workspace. Clearing prevents
+      // a stale selection from a previous workspace leaking into the next
+      // one (where IDs would not match anyway).
+      selectedTerminalIds: {},
+      // GH #115: a dnd-kit drag in flight when a workspace switch happens
+      // (e.g. drag a tab, hover a workspace-switch shortcut, the active
+      // pane re-renders out from under the drag) sometimes never gets an
+      // onDragEnd / onDragCancel fired. The flag stays true, PaneDropZones
+      // stay mounted on every pane with pointer-events: auto, and the user
+      // can no longer wheel-scroll or text-select the previously focused
+      // pane. Force the reset on every workspace switch as a hard fallback;
+      // even if dnd-kit's own cleanup also fires, this is a no-op when the
+      // flag is already false.
+      isDragging: false,
+      draggedTerminalId: null,
+    });
+  },
+
+  renameWorkspace: (id: WorkspaceId, name: string) => {
+    const trimmed = name.trim();
+    if (!trimmed) return;
+    set((state) => {
+      const next = new Map(state.workspaces);
+      const ws = next.get(id);
+      if (!ws) return state;
+      next.set(id, { ...ws, name: trimmed });
+      return { workspaces: next };
+    });
+    get().saveSession();
+  },
+
+  setWorkspaceColor: (id: WorkspaceId, color: string | undefined) => {
+    set((state) => {
+      const next = new Map(state.workspaces);
+      const ws = next.get(id);
+      if (!ws) return state;
+      next.set(id, { ...ws, color });
+      return { workspaces: next };
+    });
+    get().saveSession();
+  },
+
+  clearAllWorkspaceColors: () => {
+    set((state) => {
+      const next = new Map(state.workspaces);
+      for (const [k, ws] of next) {
+        if (ws.color !== undefined) next.set(k, { ...ws, color: undefined });
+      }
+      return { workspaces: next };
+    });
+    get().saveSession();
+  },
+
+  reorderWorkspaces: (draggedId: WorkspaceId, overId: WorkspaceId) => {
+    if (draggedId === overId) return;
+    set((state) => {
+      const entries = Array.from(state.workspaces.entries());
+      const fromIndex = entries.findIndex(([id]) => id === draggedId);
+      const toIndex = entries.findIndex(([id]) => id === overId);
+      if (fromIndex === -1 || toIndex === -1) return state;
+      const [moved] = entries.splice(fromIndex, 1);
+      entries.splice(toIndex, 0, moved);
+      return { workspaces: new Map(entries) };
+    });
+    get().saveSession();
+  },
+
+  closeWorkspace: async (id: WorkspaceId) => {
+    const { workspaces, activeWorkspaceId, terminals, layout, closedTerminals, copilotSessions, claudeCodeSessions } = get();
+    if (!workspaces.has(id)) return;
+    const closingWs = workspaces.get(id)!;
+    // Collect terminal ids to kill: all terminals belonging to this workspace.
+    const terminalIdsToClose: TerminalId[] = [];
+    const paneSnapshots: ClosedPaneSnapshot[] = [];
+    for (const [tid, inst] of terminals) {
+      if ((inst.workspaceId ?? DEFAULT_WORKSPACE_ID) === id) {
+        terminalIdsToClose.push(tid);
+        paneSnapshots.push(snapshotPaneForRestore(inst, copilotSessions, claudeCodeSessions));
+      }
+    }
+    // TASK-275: confirm before closing a workspace when the setting is on.
+    // Single aggregate confirm for the whole workspace (like closeTerminals).
+    if (get().confirmOnCloseSession && terminalIdsToClose.length > 0) {
+      const label = closingWs.name || 'this workspace';
+      const count = terminalIdsToClose.length;
+      const ok = await confirmDialog({
+        title: 'Close workspace?',
+        message: `Close workspace "${label}"? This ends ${count} terminal session${count > 1 ? 's' : ''}.`,
+        confirmText: 'Close',
+        danger: true,
+      });
+      if (!ok) return;
+    }
+    // TASK-112: push the whole workspace as a single restore entry, but
+    // only if it had panes - restoring an empty workspace shell is
+    // meaningless. The user will see a confirm prompt before the
+    // workspace gets recreated, since spawning N PTYs from one keypress
+    // is heavier than the silent single-pane restore.
+    let newClosedTerminals = closedTerminals;
+    if (paneSnapshots.length > 0) {
+      const wsEntry: ClosedTerminalEntry = {
+        kind: 'workspace',
+        closedAt: Date.now(),
+        workspaceId: id,
+        name: closingWs.name,
+        color: closingWs.color,
+        panes: paneSnapshots,
+      };
+      newClosedTerminals = [...closedTerminals, wsEntry].slice(-10);
+    }
+    // Drop the workspace.
+    const newWorkspaces = new Map(workspaces);
+    newWorkspaces.delete(id);
+    // If we closed the active workspace, pick a successor (or fresh default).
+    let newActive = activeWorkspaceId;
+    let newLayout = layout;
+    let newFocus: TerminalId | null = get().focusedTerminalId;
+    if (id === activeWorkspaceId) {
+      let successor = newWorkspaces.values().next().value as Workspace | undefined;
+      if (!successor) {
+        const fresh = makeDefaultWorkspace();
+        newWorkspaces.set(fresh.id, fresh);
+        successor = fresh;
+      }
+      newActive = successor.id;
+      newLayout = successor.layout;
+      newFocus = (function findFirst(node: LayoutNode | null): TerminalId | null {
+        if (!node) return null;
+        if (node.kind === 'leaf') return node.terminalId;
+        return findFirst(node.first) ?? findFirst(node.second);
+      })(successor.layout.tilingRoot) ?? successor.layout.floatingPanels[0]?.terminalId ?? null;
+    }
+    // Strip the terminals from the map.
+    const newTerminals = new Map(terminals);
+    for (const tid of terminalIdsToClose) newTerminals.delete(tid);
+    set({
+      workspaces: newWorkspaces,
+      activeWorkspaceId: newActive,
+      layout: newLayout,
+      terminals: newTerminals,
+      focusedTerminalId: newFocus,
+      closedTerminals: newClosedTerminals,
+    });
+    // Tell the main process to kill those PTYs after state has settled.
+    for (const tid of terminalIdsToClose) {
+      try { window.terminalAPI.killPty(tid); } catch { /* ignore */ }
+    }
+    get().saveSession();
+  },
+
+  // TASK-78: Re-home an existing pane into a different workspace without
+  // restarting its PTY. The PTY keeps running (we only mutate the in-memory
+  // layout trees + terminal.workspaceId), so cwd/scrollback/process all
+  // survive the move.
+  movePaneToWorkspace: (terminalId: TerminalId, destWorkspaceId: WorkspaceId) => {
+    const { terminals, workspaces, activeWorkspaceId, layout, focusedTerminalId } = get();
+    const instance = terminals.get(terminalId);
+    if (!instance) return;
+    if (instance.mode !== 'tiled') return; // Only tiled panes are in tilingRoot.
+    const sourceWsId = instance.workspaceId ?? activeWorkspaceId;
+    if (sourceWsId === destWorkspaceId) return;
+    if (!workspaces.has(destWorkspaceId)) return;
+
+    // Snapshot the live `layout` into the source workspace so we mutate a
+    // canonical, up-to-date tree rather than a stale workspaces[sourceId].layout.
+    const nextWorkspaces = new Map(workspaces);
+    const sourceWs = nextWorkspaces.get(sourceWsId);
+    const liveSourceLayout = sourceWsId === activeWorkspaceId ? layout : sourceWs?.layout;
+    if (!liveSourceLayout) return;
+
+    // Remove the leaf from the source workspace's tilingRoot.
+    const sourceRoot = liveSourceLayout.tilingRoot;
+    const newSourceRoot = sourceRoot ? removeLeaf(sourceRoot, terminalId) : null;
+    const newSourceLayout: LayoutState = { ...liveSourceLayout, tilingRoot: newSourceRoot };
+    nextWorkspaces.set(sourceWsId, {
+      ...(sourceWs || { id: sourceWsId, name: sourceWsId, layout: newSourceLayout }),
+      layout: newSourceLayout,
+    });
+
+    // Insert the leaf into the destination workspace's tilingRoot, to the
+    // right of the last leaf (matches createTerminal's heuristic for "where
+    // does a fresh pane land?"). If the destination is empty, the moved pane
+    // becomes the lone leaf.
+    const destWs = nextWorkspaces.get(destWorkspaceId)!;
+    const destRoot = destWs.layout.tilingRoot;
+    let newDestRoot: LayoutNode;
+    if (destRoot === null) {
+      newDestRoot = { kind: 'leaf', terminalId };
+    } else {
+      const order = getLeafOrder(destRoot);
+      const lastId = order[order.length - 1];
+      newDestRoot = insertLeaf(destRoot, lastId, terminalId, 'right');
+    }
+    const newDestLayout: LayoutState = { ...destWs.layout, tilingRoot: newDestRoot };
+    nextWorkspaces.set(destWorkspaceId, { ...destWs, layout: newDestLayout });
+
+    // Update the terminal's workspaceId field so reconcileGridLayout / save
+    // / future workspace switches all agree on where this pane lives.
+    const newTerminals = new Map(terminals);
+    newTerminals.set(terminalId, { ...instance, workspaceId: destWorkspaceId });
+
+    // Decide whether to follow the pane. If the moved pane was focused, switch
+    // to the destination workspace so the user keeps interacting with it.
+    // Otherwise stay where we are - if the source was active, swap in the
+    // updated source layout; if neither was active, top-level layout doesn't
+    // change.
+    const shouldFollow = focusedTerminalId === terminalId;
+    let newActiveWsId = activeWorkspaceId;
+    let newTopLayout = layout;
+    let newFocus: TerminalId | null = focusedTerminalId;
+
+    if (shouldFollow) {
+      newActiveWsId = destWorkspaceId;
+      newTopLayout = newDestLayout;
+      // Focus stays on the moved pane.
+      newFocus = terminalId;
+    } else if (sourceWsId === activeWorkspaceId) {
+      // We're still on the source workspace's view, but its layout just lost
+      // a leaf. Use the updated source layout. Pick a sensible focus if the
+      // previous focus was the moved pane (shouldn't happen here since
+      // shouldFollow would be true, but be defensive).
+      newTopLayout = newSourceLayout;
+      if (focusedTerminalId === terminalId) {
+        const order = newSourceRoot ? getLeafOrder(newSourceRoot) : [];
+        newFocus = order.length > 0 ? order[0] : null;
+      }
+    } else if (destWorkspaceId === activeWorkspaceId) {
+      // We're viewing the destination workspace; show the new layout there.
+      newTopLayout = newDestLayout;
+    }
+
+    set({
+      terminals: newTerminals,
+      workspaces: nextWorkspaces,
+      activeWorkspaceId: newActiveWsId,
+      layout: newTopLayout,
+      focusedTerminalId: newFocus,
+    });
+    get().saveSession();
+  },
+
+  // Spawn a fresh AI session at the given cwd, running the configured
+  // copilotCommand / claudeCodeCommand. TASK-159 / GH #105: the AI Sessions
+  // panel exposes a "+ New session" affordance per repo group; this is
+  // what it calls. WSL paths route through the wsl shell profile and
+  // pass wslDistro through to createPty.
+  createAiSessionInCwd: async (provider, cwd, options) => {
+    const { config, terminals, layout } = get();
+    if (!config) return;
+    const isWsl = options?.wsl === true && !!options.wslDistro;
+    const profileId = isWsl ? 'wsl' : config.defaultShellId;
+    const profile = config.shells.find((s) => s.id === profileId);
+    if (!profile) return;
+    const startupCommand = provider === 'copilot'
+      ? (config.copilotCommand || 'copilot')
+      : (config.claudeCodeCommand || 'claude');
+    const id = uuidv4();
+    const { pid } = await window.terminalAPI.createPty({
+      id,
+      shellPath: profile.path,
+      args: profile.args,
+      cwd: cwd || profile.cwd || ((window as any).platformInfo?.platform === 'win32' ? 'C:\\Users' : (window as any).platformInfo?.homeDir || '/'),
+      env: profile.env,
+      cols: 80,
+      rows: 24,
+      wslDistro: isWsl ? options.wslDistro : undefined,
+    });
+    // Auto-color if autoColorTabs is on (same logic as createTerminal).
+    let tabColor: string | undefined;
+    {
+      const autoColorOn = get().autoColorTabs;
+      const activeWsId = get().activeWorkspaceId;
+      if (autoColorOn) {
+        const colorCounts = new Map<string, number>();
+        for (const c of TAB_COLORS) colorCounts.set(c.value, 0);
+        for (const t of terminals.values()) {
+          if ((t.workspaceId ?? activeWsId) !== activeWsId) continue;
+          if (t.tabColor && colorCounts.has(t.tabColor)) {
+            colorCounts.set(t.tabColor, (colorCounts.get(t.tabColor) ?? 0) + 1);
+          }
+        }
+        let minCount = Infinity;
+        for (const [color, count] of colorCounts) {
+          if (count < minCount) { minCount = count; tabColor = color; }
+        }
+      }
+    }
+
+    const instance: TerminalInstance = {
+      id,
+      title: profile.name,
+      shellProfileId: profileId,
+      cwd,
+      customTitle: false,
+      aiAutoTitle: true,
+      mode: 'tiled',
+      pid,
+      lastProcess: '',
+      startupCommand,
+      workspaceId: get().activeWorkspaceId,
+      wsl: isWsl || undefined,
+      wslDistro: isWsl ? options.wslDistro : undefined,
+      tabColor,
+    };
+    const newTerminals = new Map(terminals);
+    newTerminals.set(id, instance);
+    const newLeaf: LayoutLeafNode = { kind: 'leaf', terminalId: id };
+    let newRoot: LayoutNode;
+    if (layout.tilingRoot === null) {
+      newRoot = newLeaf;
+    } else {
+      const order = getLeafOrder(layout.tilingRoot);
+      newRoot = insertLeaf(layout.tilingRoot, order[order.length - 1], id, 'right');
+    }
+    set({
+      terminals: newTerminals,
+      layout: { ...layout, tilingRoot: newRoot },
+      focusedTerminalId: id,
+    });
+    get().saveSession();
+  },
+
+  // Soft refresh: bump the pane's refresh generation so React unmounts and
+  // remounts the xterm wrapper (keyed on the generation). PTY survives
+  // because it lives in main; renderer-side stalls (focus thief, stuck
+  // listeners) get cleared without losing scrollback. TASK-156 / GH #101.
+  refreshTerminal: (terminalId: TerminalId) => {
+    if (!get().terminals.has(terminalId)) return;
+    set((s) => ({
+      refreshGenerations: {
+        ...s.refreshGenerations,
+        [terminalId]: (s.refreshGenerations[terminalId] ?? 0) + 1,
+      },
+    }));
+    get().addToast('Pane refreshed');
+  },
+
+  // ── Copilot panel actions ──────────────────────────────────────────
+  showAiSessionsForPane: async (terminalId: TerminalId) => {
+    const { terminals, copilotSessions, claudeCodeSessions } = get();
+    const terminal = terminals.get(terminalId);
+    if (!terminal) return;
+
+    // Open the panel + focus the pane first so the UI responds immediately,
+    // even if the session-fetch round-trip takes a moment.
+    set((s) => ({
+      showCopilotPanel: true,
+      focusedTerminalId: terminalId,
+      aiSessionHighlightRequest: s.aiSessionHighlightRequest + 1,
+    }));
+
+    const aiSessionId = terminal.aiSessionId;
+    const provider = terminal.aiProvider;
+    if (!aiSessionId || !provider) return;
+
+    // CopilotPanel's highlight effect bails when the session isn't in the
+    // loaded slice. Default cap is 314 (aiSessionLoadLimit); on a busy
+    // machine with 1500+ sessions, ~80% of panes' sessions won't be
+    // present and "Show in AI sessions" silently did nothing. Fetch the
+    // missing summary by id and prepend it so the panel can find it.
+    const list = provider === 'copilot' ? copilotSessions : claudeCodeSessions;
+    if (list.some((s) => s.id === aiSessionId)) return;
+
+    try {
+      const fetched: CopilotSessionSummary | null = provider === 'copilot'
+        ? await (window.terminalAPI as any).getCopilotSession(aiSessionId)
+        : await (window.terminalAPI as any).getClaudeCodeSession(aiSessionId);
+      if (!fetched) return;
+      set((s) => {
+        // Re-check inside the set to avoid racing with a concurrent
+        // background load that may have just inserted the same row.
+        const existing = provider === 'copilot' ? s.copilotSessions : s.claudeCodeSessions;
+        if (existing.some((x) => x.id === fetched.id)) return s;
+        return provider === 'copilot'
+          ? {
+              copilotSessions: [fetched, ...existing],
+              aiSessionHighlightRequest: s.aiSessionHighlightRequest + 1,
+            }
+          : {
+              claudeCodeSessions: [fetched, ...existing],
+              aiSessionHighlightRequest: s.aiSessionHighlightRequest + 1,
+            };
+      });
+    } catch (err) {
+      console.error('[showAiSessionsForPane] fetch by id failed:', err);
+    }
+  },
+
+  toggleCopilotPanel: () => {
+    set((s) => ({ showCopilotPanel: !s.showCopilotPanel }));
+  },
+
+  toggleTranscript: () => {
+    // Toggling always returns to follow-focus mode (clears any pinned session).
+    set((s) => ({ transcriptOpen: !s.transcriptOpen, transcriptSessionId: null }));
+  },
+
+  openTranscriptForSession: (sessionId: string) => {
+    set({ transcriptOpen: true, transcriptSessionId: sessionId });
+  },
+
+  setTranscriptWidth: (width: number) => {
+    const clamped = Math.max(TRANSCRIPT_WIDTH_MIN, Math.min(TRANSCRIPT_WIDTH_MAX, Math.round(width)));
+    set({ transcriptWidth: clamped });
+    try { window.localStorage?.setItem(TRANSCRIPT_WIDTH_KEY, String(clamped)); } catch { /* ignore */ }
+  },
+
+  loadCopilotSessions: async () => {
+    const limit = get().copilotSessionsLimit;
+    const result = await (window.terminalAPI as any).listCopilotSessions(limit);
+    // Handle both new { sessions, totalEligible } shape and legacy array
+    const sessions = Array.isArray(result) ? result : (result?.sessions ?? []);
+    const totalEligible = Array.isArray(result) ? sessions.length : (result?.totalEligible ?? sessions.length);
+    const sqliteActive = !Array.isArray(result) && result?.sqliteActive === true;
+    set({ copilotSessions: sessions, copilotSessionsTotal: totalEligible, copilotSqliteActive: sqliteActive });
+    get().autoArchiveStaleSessions();
+  },
+
+  loadMoreSessions: async (extra: number) => {
+    const { copilotSessionsLimit, claudeCodeSessionsLimit } = get();
+    const newCopilotLimit = copilotSessionsLimit + extra;
+    const newClaudeLimit = claudeCodeSessionsLimit + extra;
+    set({ copilotSessionsLimit: newCopilotLimit, claudeCodeSessionsLimit: newClaudeLimit });
+    const [copilotResult, claudeResult] = await Promise.all([
+      (window.terminalAPI as any).listCopilotSessions(newCopilotLimit),
+      (window.terminalAPI as any).listClaudeCodeSessions(newClaudeLimit),
+    ]);
+    const cSessions = Array.isArray(copilotResult) ? copilotResult : (copilotResult?.sessions ?? []);
+    const cTotal = Array.isArray(copilotResult) ? cSessions.length : (copilotResult?.totalEligible ?? cSessions.length);
+    const ccSessions = Array.isArray(claudeResult) ? claudeResult : (claudeResult?.sessions ?? []);
+    const ccTotal = Array.isArray(claudeResult) ? ccSessions.length : (claudeResult?.totalEligible ?? ccSessions.length);
+    set({ copilotSessions: cSessions, copilotSessionsTotal: cTotal, claudeCodeSessions: ccSessions, claudeCodeSessionsTotal: ccTotal });
+  },
+
+  loadAllSessions: async () => {
+    const MAX = 999999;
+    set({ copilotSessionsLimit: MAX, claudeCodeSessionsLimit: MAX });
+    const [copilotResult, claudeResult] = await Promise.all([
+      (window.terminalAPI as any).listCopilotSessions(MAX),
+      (window.terminalAPI as any).listClaudeCodeSessions(MAX),
+    ]);
+    const cSessions = Array.isArray(copilotResult) ? copilotResult : (copilotResult?.sessions ?? []);
+    const cTotal = Array.isArray(copilotResult) ? cSessions.length : (copilotResult?.totalEligible ?? cSessions.length);
+    const ccSessions = Array.isArray(claudeResult) ? claudeResult : (claudeResult?.sessions ?? []);
+    const ccTotal = Array.isArray(claudeResult) ? ccSessions.length : (claudeResult?.totalEligible ?? ccSessions.length);
+    set({ copilotSessions: cSessions, copilotSessionsTotal: cTotal, claudeCodeSessions: ccSessions, claudeCodeSessionsTotal: ccTotal });
+  },
+
+  searchCopilotSessions: async (query: string) => {
+    set({ copilotSearchQuery: query });
+    if (!query.trim()) {
+      set({ copilotSearching: false });
+      const limit = get().copilotSessionsLimit;
+      const result = await (window.terminalAPI as any).listCopilotSessions(limit);
+      const sessions = Array.isArray(result) ? result : (result?.sessions ?? []);
+      const totalEligible = Array.isArray(result) ? sessions.length : (result?.totalEligible ?? sessions.length);
+      set({ copilotSessions: sessions, copilotSessionsTotal: totalEligible });
+      return;
+    }
+    set({ copilotSearching: true });
+    try {
+      const sessions = await (window.terminalAPI as any).searchCopilotSessions(query);
+      set({ copilotSessions: sessions ?? [], copilotSearching: false });
+    } catch {
+      set({ copilotSearching: false });
+    }
+  },
+
+  openCopilotSession: async (sessionId: string) => {
+    await openAiSession(sessionId, 'copilot', get, set);
+  },
+
+  acknowledgeWaitingSession: (sessionId: string) => {
+    if (get().acknowledgedWaitingSessions[sessionId]) return;
+    set((s) => ({ acknowledgedWaitingSessions: { ...s.acknowledgedWaitingSessions, [sessionId]: true } }));
+  },
+
+  setCopilotSessions: (sessions: CopilotSessionSummary[]) => {
+    set({ copilotSessions: sessions });
+  },
+
+  updateTerminalTitleFromSession: (session: CopilotSessionSummary, sessionType?: 'copilot' | 'claude') => {
+    try {
+      (window as any).terminalAPI?.diagLog?.('renderer:ai-link-call', {
+        sessionId: session.id,
+        sessionType,
+        provider: session.provider,
+        cwd: session.cwd,
+        messageCount: session.messageCount,
+        status: session.status,
+        hasSummary: !!session.summary,
+      });
+    } catch { /* ignore */ }
+    // Note: we used to early-return on empty summary, but that prevented
+    // the link itself from happening for brand-new sessions that hadn't
+    // generated a summary yet. The rename code below already gracefully
+    // falls back to current.title when summary is empty, so it's safe to
+    // proceed.
+    const { terminals, focusedTerminalId } = get();
+    const newTerminals = new Map(terminals);
+    let changed = false;
+    // Captured during the auto-link block below; applied after the loop so
+    // setSessionNameOverride doesn't fight with the in-flight `set`.
+    let pendingOverride: { sessionId: string; name: string } | null = null;
+
+    // Check if any terminal already has this session linked
+    let alreadyLinked = false;
+    for (const [, instance] of terminals) {
+      if (instance.aiSessionId === session.id) {
+        alreadyLinked = true;
+        break;
+      }
+    }
+
+    // Auto-link: pick at most one unlinked terminal as the candidate for
+    // this session. We used to gate on a process-name match (looking for
+    // 'copilot' / 'claude' / 'cc' in the OSC-set title), but that misses
+    // wrappers like ag.bat, ghcp, claude --resume via npx, custom aliases,
+    // and anything else that doesn't broadcast its agent-ness through a
+    // terminal title. cwd is far more reliable: AI session files always
+    // record the cwd they were started from.
+    //
+    // The recency guard is the safety net: we only auto-link when the
+    // session has had activity in the last 10 minutes, so opening a fresh
+    // pwsh in C:\projects\tmax doesn't get retroactively attached to a
+    // months-old session in the same folder.
+    const normCwd = (p: string) => p.replace(/[\\/]+$/, '').replace(/\\/g, '/').toLowerCase();
+    // Auto-link gate: the session must currently be active. Status is
+    // 'idle' once nothing has happened for 30s, so an actively-running
+    // agent (in this window or another tmax instance) keeps a non-idle
+    // status and attaches to a matching-cwd terminal here. A long-quiet
+    // session can't poach a fresh pwsh you just opened.
+    const sessionActive = session.status !== 'idle';
+
+    // TASK-154: a pane that has process-tree-detected Copilot/Claude was
+    // started by the user; the auto-link should match it to a session that
+    // came into being *after* the pane started, not to a long-running
+    // session that happens to be active in the same cwd (e.g. a
+    // backgrounded ClawPilot meeting helper). 30s of slack absorbs clock
+    // skew between aiProcessDetectedAt and the session's `created_at`.
+    const OLDER_SESSION_GRACE_MS = 30_000;
+    let candidateId: string | null = null;
+    if (!alreadyLinked && session.cwd && sessionActive) {
+      const sessionCwd = normCwd(session.cwd);
+      const eligible: string[] = [];
+      for (const [id, t] of terminals) {
+        if (t.aiSessionId === session.id) continue;
+        if (t.mode !== 'tiled' && t.mode !== 'floating') continue;
+        if (normCwd(t.cwd) !== sessionCwd) continue;
+        // Allow rebinding the focused pane when it already has a (now
+        // stale) aiSessionId from a previous AI process in the same cwd -
+        // the user's "click on the new claude" signal makes it the obvious
+        // host for the new session. Non-focused panes with an existing
+        // link are off-limits so we never silently move a session away
+        // from a background pane the user can't see (TASK-29).
+        // Extra guard: only steal from idle sessions to avoid yanking a
+        // pane away from an agent that's still actively running.
+        if (t.aiSessionId && id !== focusedTerminalId) continue;
+        if (t.aiSessionId) {
+          const { copilotSessions: cs, claudeCodeSessions: ccs } = get();
+          const prevSession = findSessionById(cs, ccs, t.aiSessionId);
+          if (prevSession && prevSession.status !== 'idle') continue;
+        }
+        // TASK-154 guard: if the pane has a process-tree stamp, only
+        // accept sessions that were created at or after that stamp.
+        if (
+          t.aiProcessDetectedAt != null
+          && session.createdAt != null
+          && t.aiProcessDetectedAt - session.createdAt > OLDER_SESSION_GRACE_MS
+        ) {
+          try {
+            (window as any).terminalAPI?.diagLog?.('renderer:ai-link-skip-older', {
+              sessionId: session.id,
+              terminalId: id,
+              sessionCreatedAt: session.createdAt,
+              paneDetectedAt: t.aiProcessDetectedAt,
+              ageGapMs: t.aiProcessDetectedAt - session.createdAt,
+            });
+          } catch { /* ignore */ }
+          continue;
+        }
+        eligible.push(id);
+      }
+      if (eligible.length > 0) {
+        // Two-stage preference. Stage 1: panes whose firstCommandTitle is
+        // set are evidence the user actually typed *something* there - they
+        // are far more likely to be the pane that just launched the AI than
+        // a freshly-spawned sibling pane in the same cwd. The original
+        // focused-pane heuristic backfired when a user opens a second pane
+        // in the same cwd while the first is still booting an AI: focus
+        // moves to the fresh pane and it steals the link, contaminating
+        // its title + last-prompt bar + (now) shimmer with the wrong
+        // session's data. Stage 2: among the preferred set (or the full
+        // eligible set if nothing has firstCommandTitle), prefer focused.
+        const preferred = eligible.filter((id) => terminals.get(id)?.firstCommandTitle);
+        const pool = preferred.length > 0 ? preferred : eligible;
+        candidateId = focusedTerminalId && pool.includes(focusedTerminalId)
+          ? focusedTerminalId
+          : pool[0];
+      } else {
+        // TASK-152: the session's cwd matched no eligible pane. This is the
+        // #1 reason `cop --resume` / `--continue` sessions never get the AI
+        // bar. Log what we compared against so the gap is diagnosable - which
+        // gate (cwd mismatch vs mode vs existing-link) rejected each pane.
+        try {
+          (window as any).terminalAPI?.diagLog?.('renderer:ai-link-no-eligible', {
+            sessionId: session.id,
+            sessionCwd,
+            focusedTerminalId,
+            panes: [...terminals.entries()].map(([id, t]) => ({
+              id,
+              cwd: t.cwd,
+              normCwd: normCwd(t.cwd ?? ''),
+              cwdMatch: normCwd(t.cwd ?? '') === sessionCwd,
+              mode: t.mode,
+              aiSessionId: t.aiSessionId,
+            })),
+          });
+        } catch { /* ignore */ }
+      }
+    }
+
+    // TASK-171 bridge: when cwd matching fails, fall back to panes that
+    // process-tree-detection has confirmed are running the matching AI.
+    // Multiple guards stack to make this safe against the poaching cases
+    // TASK-172 originally chased:
+    //   1. Pane has aiProcessKind == session.provider (Copilot pane only
+    //      attaches Copilot sessions, Claude pane only Claude).
+    //   2. aiProcessDetectedAt is recent (within 5 min) - if user closed
+    //      Copilot and started something else, the stale stamp will have
+    //      aged out OR been cleared on a prior link.
+    //   3. session.messageCount <= 2 - the session is genuinely brand new,
+    //      not some long-running chat in another tmax window.
+    //   4. Pane has no existing AI link.
+    const PROCESS_STAMP_FRESHNESS_MS = 5 * 60_000;
+    const FRESH_SESSION_MAX_MESSAGES = 2;
+    if (!candidateId && !alreadyLinked && sessionActive) {
+      const sessionProvider = sessionType === 'claude' ? 'claude-code' : 'copilot';
+      const sessionIsBrandNew = typeof session.messageCount === 'number'
+        && session.messageCount <= FRESH_SESSION_MAX_MESSAGES;
+      const stampedPanes = [...terminals.values()].filter((t) => t.aiProcessKind === sessionProvider).length;
+      try {
+        (window as any).terminalAPI?.diagLog?.('renderer:ai-link-bridge-check', {
+          sessionId: session.id,
+          provider: sessionProvider,
+          messageCount: session.messageCount,
+          stampedPanes,
+        });
+      } catch { /* ignore */ }
+      if (sessionIsBrandNew) {
+        const now = Date.now();
+        // Prefer focused pane, else any matching pane.
+        const candidates: TerminalId[] = [];
+        for (const [id, t] of terminals) {
+          if (t.aiSessionId) continue;
+          if (t.mode !== 'tiled' && t.mode !== 'floating') continue;
+          if (t.aiProcessKind !== sessionProvider) continue;
+          if (t.aiProcessDetectedAt == null) continue;
+          if (now - t.aiProcessDetectedAt > PROCESS_STAMP_FRESHNESS_MS) continue;
+          candidates.push(id);
+        }
+        if (candidates.length > 0) {
+          candidateId = focusedTerminalId && candidates.includes(focusedTerminalId)
+            ? focusedTerminalId
+            : candidates[0];
+          try {
+            (window as any).terminalAPI?.diagLog?.('renderer:ai-link-bridge-attach', {
+              sessionId: session.id,
+              terminalId: candidateId,
+              candidates: candidates.length,
+            });
+          } catch { /* ignore */ }
+        }
+      }
+    }
+
+    for (const [id, inst] of terminals) {
+      let current = inst;
+      let matched = current.aiSessionId === session.id;
+
+      if (!matched && id === candidateId) {
+        const isRelink = !!current.aiSessionId;
+        // A first-command title (TASK-23, e.g. 'cd C:\\') sets
+        // customTitle:true to block OSC overrides, but it's not a
+        // deliberate user rename - the AI session topic should win
+        // once a session attaches here (TASK-88 / GH #85). Treat it
+        // the same as a non-custom title for the purposes of AI link.
+        const hasUserRename = current.customTitle && !current.firstCommandTitle;
+        // If the user already renamed this pane before the AI session was
+        // matched (typed `claude` / `copilot`, renamed the pane, waited for
+        // the first summary), propagate the rename to sessionNameOverrides
+        // now. The earlier renameTerminal call couldn't propagate because
+        // aiSessionId was still undefined at that moment.
+        // Skip on re-link: the pane title was set by the previous session's
+        // auto-title, not by a deliberate user rename.
+        // Skip for first-command titles: those aren't user-set names.
+        if (
+          !isRelink &&
+          hasUserRename &&
+          current.title &&
+          !get().sessionNameOverrides[session.id] &&
+          !pendingOverride
+        ) {
+          pendingOverride = { sessionId: session.id, name: current.title };
+        }
+        current = {
+          ...current,
+          aiSessionId: session.id,
+          // On re-link from a stale session, enable auto-title so the new
+          // session's summary replaces the old pane name. On fresh link,
+          // enable auto-title unless the user explicitly renamed the pane;
+          // a first-command auto-title doesn't count.
+          aiAutoTitle: isRelink ? true : !hasUserRename,
+          customTitle: true,
+          // The pane is now AI-linked. Clear the first-command marker so
+          // a later UI rename behaves like a normal user rename. Clear
+          // the process-tree stamp too - future decisions go through
+          // aiSessionId rather than this fallback.
+          firstCommandTitle: false,
+          aiProcessKind: undefined,
+          aiProcessDetectedAt: undefined,
+          // Fresh link or relink: clear the prompt-title latch so the new
+          // session's first prompt (or its summary, when it arrives) can
+          // claim the title.
+          aiPromptTitleLatched: false,
+        };
+        newTerminals.set(id, current);
+        matched = true;
+        changed = true;
+      }
+
+      if (matched && current.aiAutoTitle) {
+        // Honor user-set name overrides first so a renamed session keeps its
+        // name in the pane title (matching what CopilotPanel shows in the
+        // session list).
+        const override = get().sessionNameOverrides[session.id];
+        let title: string;
+        let nextLatched = current.aiPromptTitleLatched;
+        if (override) {
+          title = override;
+        } else if (current.aiPromptTitleLatched) {
+          // Once we've stamped a session-derived title, leave it alone -
+          // Copilot's `summary` field gets rewritten to the latest user
+          // message on every turn, so latching only the latestPrompt path
+          // is not enough. Pane title represents the session's opening
+          // ask; later turns shouldn't keep rewriting it. The latch
+          // resets on explicit user rename or on a fresh relink.
+          title = current.title;
+        } else {
+          // First session-derived title for this pane. Source priority:
+          //   1. session.firstPrompt - the sticky opening ask, captured
+          //      once by the parser. Best fit for "what is this session?"
+          //   2. session.summary - works for Claude (parser sets it to
+          //      firstPrompt) but unreliable for Copilot (rewritten to the
+          //      latest message every turn). Used only when firstPrompt
+          //      is missing (older session shapes, or session linked
+          //      before any user.message landed).
+          //   3. session.latestPrompt - last-resort fallback.
+          // Then latch so subsequent updates can't overwrite.
+          const pickFirst = (session.firstPrompt || '').replace(/<[^>]+>/g, '').trim();
+          const pickSummary = (session.summary || '').replace(/<[^>]+>/g, '').trim();
+          const pickLatest = (session.latestPrompt || '').replace(/<[^>]+>/g, '').trim();
+          const candidate = pickFirst || pickSummary || pickLatest;
+          if (candidate) {
+            title = candidate.length > 60 ? candidate.slice(0, 57) + '...' : candidate;
+          } else {
+            title = current.title;
+          }
+          if (title && title !== current.title) nextLatched = true;
+        }
+        if (current.title !== title || nextLatched !== current.aiPromptTitleLatched) {
+          newTerminals.set(id, { ...newTerminals.get(id)!, title, aiPromptTitleLatched: nextLatched });
+          changed = true;
+        }
+      }
+    }
+    if (changed) set({ terminals: newTerminals });
+    if (pendingOverride) {
+      get().setSessionNameOverride(pendingOverride.sessionId, pendingOverride.name);
+    }
+  },
+
+  addCopilotSession: (session: CopilotSessionSummary) => {
+    set((s) => ({
+      copilotSessions: [...s.copilotSessions.filter((x) => x.id !== session.id), session],
+    }));
+    get().updateTerminalTitleFromSession(session, 'copilot');
+  },
+
+  updateCopilotSession: (session: CopilotSessionSummary) => {
+    const oldSession = get().copilotSessions.find((x) => x.id === session.id);
+    set((s) => {
+      const next: Partial<TerminalStore> = {
+        // Upsert: a session-updated IPC event can land before the matching
+        // session-added (e.g. an in-flight loadCopilotSessions response races
+        // with a fresh prompt's onSessionUpdated). A plain `.map` would drop
+        // the update silently and leave the last-prompt bar showing stale
+        // text - TASK-59. Filter+append matches addCopilotSession's shape.
+        copilotSessions: oldSession
+          ? s.copilotSessions.map((x) => (x.id === session.id ? session : x))
+          : [...s.copilotSessions, session],
+      };
+      // When a session leaves a waiting state, drop any ack so the next
+      // waiting episode produces a fresh shimmer (TASK-140 follow-up).
+      if (
+        s.acknowledgedWaitingSessions[session.id] &&
+        session.status !== 'waitingForUser' &&
+        session.status !== 'awaitingApproval'
+      ) {
+        const { [session.id]: _drop, ...rest } = s.acknowledgedWaitingSessions;
+        next.acknowledgedWaitingSessions = rest;
+      }
+      return next as TerminalStore;
+    });
+    get().updateTerminalTitleFromSession(session, 'copilot');
+    // Auto-reactivate only if session has a linked terminal in tmax
+    const lifecycle = get().sessionLifecycleOverrides[session.id];
+    if ((lifecycle === 'completed' || lifecycle === 'old') && oldSession) {
+      const hasLinkedTerminal = [...get().terminals.values()].some((t) => t.aiSessionId === session.id);
+      if (hasLinkedTerminal) {
+        // TASK-162: status alone isn't a reliable "new activity" signal -
+        // a session reloaded from disk in 'thinking' / 'waitingForUser' state
+        // matches `status !== 'idle'` on the first watcher tick after restart
+        // and bumps just-archived sessions back to Active. Compare strictly
+        // on messageCount: a real new turn is the only thing the user means
+        // by "reactivate this".
+        const hasNewActivity = session.messageCount > oldSession.messageCount;
+        if (hasNewActivity) {
+          get().setSessionLifecycle(session.id, 'active');
+          const name = get().sessionNameOverrides[session.id] || session.summary || session.id.slice(0, 8);
+          get().addToast(`"${name}" moved back to Active`);
+        }
+      }
+    }
+  },
+
+  removeCopilotSession: (sessionId: string) => {
+    set((s) => ({
+      copilotSessions: s.copilotSessions.filter((x) => x.id !== sessionId),
+      selectedCopilotSessionId: s.selectedCopilotSessionId === sessionId ? null : s.selectedCopilotSessionId,
+    }));
+  },
+
+  // ── Claude Code session actions ────────────────────────────────────
+  loadClaudeCodeSessions: async () => {
+    const limit = get().claudeCodeSessionsLimit;
+    const result = await (window.terminalAPI as any).listClaudeCodeSessions(limit);
+    const sessions = Array.isArray(result) ? result : (result?.sessions ?? []);
+    const totalEligible = Array.isArray(result) ? sessions.length : (result?.totalEligible ?? sessions.length);
+    set({ claudeCodeSessions: sessions, claudeCodeSessionsTotal: totalEligible });
+    get().autoArchiveStaleSessions();
+  },
+
+  searchClaudeCodeSessions: async (query: string) => {
+    if (!query.trim()) {
+      const limit = get().claudeCodeSessionsLimit;
+      const result = await (window.terminalAPI as any).listClaudeCodeSessions(limit);
+      const sessions = Array.isArray(result) ? result : (result?.sessions ?? []);
+      const totalEligible = Array.isArray(result) ? sessions.length : (result?.totalEligible ?? sessions.length);
+      set({ claudeCodeSessions: sessions, claudeCodeSessionsTotal: totalEligible });
+      return;
+    }
+    const sessions = await (window.terminalAPI as any).searchClaudeCodeSessions(query);
+    set({ claudeCodeSessions: sessions ?? [] });
+  },
+
+  openClaudeCodeSession: async (sessionId: string) => {
+    await openAiSession(sessionId, 'claude-code', get, set);
+  },
+
+  addClaudeCodeSession: (session: CopilotSessionSummary) => {
+    set((s) => ({
+      claudeCodeSessions: [...s.claudeCodeSessions.filter((x) => x.id !== session.id), session],
+    }));
+    get().updateTerminalTitleFromSession(session, 'claude');
+  },
+
+  updateClaudeCodeSession: (session: CopilotSessionSummary) => {
+    const oldSession = get().claudeCodeSessions.find((x) => x.id === session.id);
+    set((s) => {
+      const next: Partial<TerminalStore> = {
+        // Upsert: see updateCopilotSession for the race that motivates this
+        // (TASK-59). A `.map` over a fresh array silently drops updates for
+        // sessions that haven't been added yet, leaving the per-pane last-
+        // prompt bar wedged on whatever was loaded at startup.
+        claudeCodeSessions: oldSession
+          ? s.claudeCodeSessions.map((x) => (x.id === session.id ? session : x))
+          : [...s.claudeCodeSessions, session],
+      };
+      if (
+        s.acknowledgedWaitingSessions[session.id] &&
+        session.status !== 'waitingForUser' &&
+        session.status !== 'awaitingApproval'
+      ) {
+        const { [session.id]: _drop, ...rest } = s.acknowledgedWaitingSessions;
+        next.acknowledgedWaitingSessions = rest;
+      }
+      return next as TerminalStore;
+    });
+    get().updateTerminalTitleFromSession(session, 'claude');
+    // Auto-reactivate only if session has a linked terminal in tmax
+    const lifecycle = get().sessionLifecycleOverrides[session.id];
+    if ((lifecycle === 'completed' || lifecycle === 'old') && oldSession) {
+      const hasLinkedTerminal = [...get().terminals.values()].some((t) => t.aiSessionId === session.id);
+      if (hasLinkedTerminal) {
+        // TASK-162: status alone isn't a reliable "new activity" signal -
+        // a session reloaded from disk in 'thinking' / 'waitingForUser' state
+        // matches `status !== 'idle'` on the first watcher tick after restart
+        // and bumps just-archived sessions back to Active. Compare strictly
+        // on messageCount: a real new turn is the only thing the user means
+        // by "reactivate this".
+        const hasNewActivity = session.messageCount > oldSession.messageCount;
+        if (hasNewActivity) {
+          get().setSessionLifecycle(session.id, 'active');
+          const name = get().sessionNameOverrides[session.id] || session.summary || session.id.slice(0, 8);
+          get().addToast(`"${name}" moved back to Active`);
+        }
+      }
+    }
+  },
+
+  removeClaudeCodeSession: (sessionId: string) => {
+    set((s) => ({
+      claudeCodeSessions: s.claudeCodeSessions.filter((x) => x.id !== sessionId),
+    }));
+  },
+
+  setSessionNameOverride: (sessionId: string, name: string) => {
+    set((s) => {
+      // Also sync the terminal pane/tab title for any terminal linked to this session
+      const updatedTerminals = new Map(s.terminals);
+      for (const [id, inst] of updatedTerminals) {
+        if (inst.aiSessionId === sessionId) {
+          // Naming the session is a manual rename of its panes, so it also
+          // replaces any external (TMAX_TITLE_FILE) title for good.
+          updatedTerminals.set(id, {
+            ...inst,
+            title: name,
+            customTitle: true,
+            aiAutoTitle: false,
+            firstCommandTitle: false,
+            externalTitle: undefined,
+            externalTitleDisabled: true,
+          });
+        }
+      }
+      return {
+        sessionNameOverrides: { ...s.sessionNameOverrides, [sessionId]: name },
+        terminals: updatedTerminals,
+      };
+    });
+    for (const [id, inst] of get().terminals) {
+      if (inst.aiSessionId === sessionId) window.terminalAPI.disablePtyExternalTitle(id);
+    }
+    // Persist immediately — beforeunload often doesn't complete before renderer shutdown
+    get().saveSession();
+    // TASK-71: push the updated map to main so notifyCopilotSession can
+    // surface the user's chosen name in OS notifications. Fire-and-forget;
+    // missing API (older preload) is non-fatal.
+    try {
+      (window.terminalAPI as any).syncSessionNameOverrides?.(get().sessionNameOverrides);
+    } catch { /* ignore - main side falls back to summary if not synced */ }
+  },
+
+  setSessionLifecycle: (sessionId: string, lifecycle: import('../../shared/copilot-types').SessionLifecycle) => {
+    set((s) => ({
+      sessionLifecycleOverrides: { ...s.sessionLifecycleOverrides, [sessionId]: lifecycle },
+    }));
+    get().saveSession();
+  },
+
+  autoArchiveStaleSessions: () => {
+    const { copilotSessions, claudeCodeSessions, sessionPinned, sessionLifecycleOverrides, config } = get();
+    // Both knobs are configurable in config; defaults mirror what felt
+    // right on the user's report (252 active, mostly noise): age out
+    // anything quiet for two weeks, plus a quick archive of one-shot
+    // sessions abandoned the next day.
+    const ageDays = (config as any)?.aiAutoArchiveDays ?? 14;
+    const lowActivityDays = (config as any)?.aiAutoArchiveLowActivityDays ?? 1;
+    const ageMs = ageDays * 24 * 60 * 60 * 1000;
+    const lowActivityMs = lowActivityDays * 24 * 60 * 60 * 1000;
+    const now = Date.now();
+
+    const additions: Record<string, import('../../shared/copilot-types').SessionLifecycle> = {};
+    for (const s of [...copilotSessions, ...claudeCodeSessions]) {
+      // Manual choices win - never overwrite an existing override (user
+      // may have explicitly un-archived something).
+      if (sessionLifecycleOverrides[s.id]) continue;
+      // Pinned sessions are user-curated; never auto-archive them.
+      if (sessionPinned[s.id]) continue;
+      const last = s.lastActivityTime || 0;
+      const ageStale = last > 0 && last < now - ageMs;
+      const lowActivityStale =
+        s.messageCount < 2 && s.toolCallCount === 0 && last > 0 && last < now - lowActivityMs;
+      if (ageStale || lowActivityStale) {
+        additions[s.id] = 'old';
+      }
+    }
+
+    const archivedIds = Object.keys(additions);
+    if (archivedIds.length === 0) return;
+
+    set((state) => ({
+      sessionLifecycleOverrides: { ...state.sessionLifecycleOverrides, ...additions },
+    }));
+    // Breadcrumb so users can see what disappeared from the active list
+    // (TASK-32 AC #5). A proper status-bar / toast is a follow-up; for
+    // now this lands in DevTools and tmax's own diag log.
+    // eslint-disable-next-line no-console
+    console.info(`[auto-archive] Moved ${archivedIds.length} stale AI session${archivedIds.length === 1 ? '' : 's'} to Archived (threshold: ${ageDays}d activity / <2 prompts after ${lowActivityDays}d).`);
+    try {
+      (window as any).terminalAPI?.diagLog?.(`auto-archive: ${archivedIds.length} sessions`);
+    } catch { /* main process may not be reachable yet */ }
+    get().saveSession();
+  },
+
+  countLowPromptSessions: (threshold: number) => {
+    if (!Number.isFinite(threshold) || threshold <= 0) return 0;
+    const { copilotSessions, claudeCodeSessions, sessionPinned, sessionLifecycleOverrides } = get();
+    let count = 0;
+    for (const s of [...copilotSessions, ...claudeCodeSessions]) {
+      if (sessionPinned[s.id]) continue;
+      if (sessionLifecycleOverrides[s.id]) continue;
+      if (s.messageCount < threshold) count++;
+    }
+    return count;
+  },
+
+  lowPromptHistogram: (maxBucket: number) => {
+    if (!Number.isFinite(maxBucket) || maxBucket <= 0) return [];
+    const cap = Math.floor(maxBucket);
+    const buckets = new Array(cap + 2).fill(0) as number[];
+    const { copilotSessions, claudeCodeSessions, sessionPinned, sessionLifecycleOverrides } = get();
+    for (const s of [...copilotSessions, ...claudeCodeSessions]) {
+      if (sessionPinned[s.id]) continue;
+      if (sessionLifecycleOverrides[s.id]) continue;
+      const mc = typeof s.messageCount === 'number' && s.messageCount >= 0 ? s.messageCount : 0;
+      if (mc > cap) buckets[cap + 1]++;
+      else buckets[mc]++;
+    }
+    return buckets;
+  },
+
+  cleanupLowPromptSessions: (threshold: number) => {
+    if (!Number.isFinite(threshold) || threshold <= 0) return 0;
+    const { copilotSessions, claudeCodeSessions, sessionPinned, sessionLifecycleOverrides } = get();
+    const additions: Record<string, import('../../shared/copilot-types').SessionLifecycle> = {};
+    for (const s of [...copilotSessions, ...claudeCodeSessions]) {
+      if (sessionPinned[s.id]) continue;
+      if (sessionLifecycleOverrides[s.id]) continue;
+      if (s.messageCount < threshold) additions[s.id] = 'old';
+    }
+    const ids = Object.keys(additions);
+    if (ids.length === 0) return 0;
+    set((state) => ({
+      sessionLifecycleOverrides: { ...state.sessionLifecycleOverrides, ...additions },
+    }));
+    // eslint-disable-next-line no-console
+    console.info(`[cleanup] Archived ${ids.length} session${ids.length === 1 ? '' : 's'} with <${threshold} prompts.`);
+    try {
+      (window as any).terminalAPI?.diagLog?.(`cleanup-low-prompts: ${ids.length} sessions (threshold ${threshold})`);
+    } catch { /* main process may not be reachable yet */ }
+    get().saveSession();
+    return ids.length;
+  },
+
+  togglePinSession: (sessionId: string) => {
+    let pinned = false;
+    set((s) => {
+      const next = { ...s.sessionPinned };
+      if (next[sessionId]) {
+        delete next[sessionId];
+        pinned = false;
+      } else {
+        next[sessionId] = true;
+        pinned = true;
+      }
+      return { sessionPinned: next };
+    });
+    get().saveSession();
+    get().addToast(pinned ? 'Pinned to top' : 'Unpinned');
+  },
+
+  checkStaleActiveSessions: () => {
+    const { copilotSessions, claudeCodeSessions, sessionLifecycleOverrides, config } = get();
+    const days = (config as any)?.oldSessionDays ?? 30;
+    const cutoff = Date.now() - days * 24 * 60 * 60 * 1000;
+    const allSessions = [...copilotSessions, ...claudeCodeSessions];
+    const updates: Record<string, import('../../shared/copilot-types').SessionLifecycle> = {};
+    for (const s of allSessions) {
+      const current = sessionLifecycleOverrides[s.id];
+      if (current === 'completed') continue;
+      if (!current || current === 'active') {
+        if (s.lastActivityTime && s.lastActivityTime < cutoff) {
+          updates[s.id] = 'old';
+        }
+      }
+    }
+    if (Object.keys(updates).length > 0) {
+      set((st) => ({
+        sessionLifecycleOverrides: { ...st.sessionLifecycleOverrides, ...updates },
+      }));
+      get().saveSession();
+    }
+  },
+
+  addToast: (message: string) => {
+    const id = `toast-${Date.now()}-${Math.random().toString(36).slice(2, 6)}`;
+    set((s) => ({
+      toastNotifications: [...s.toastNotifications, { id, message, timestamp: Date.now() }],
+    }));
+    setTimeout(() => {
+      set((s) => ({
+        toastNotifications: s.toastNotifications.filter((t) => t.id !== id),
+      }));
+    }, 5000);
+  },
+
+  dismissToast: (id: string) => {
+    set((s) => ({
+      toastNotifications: s.toastNotifications.filter((t) => t.id !== id),
+    }));
+  },
+
+  resumeAllSessions: () => {
+    const { terminals, config, copilotSessions, claudeCodeSessions } = get();
+    if (!config) return;
+    for (const [id, t] of terminals) {
+      if (!t.aiSessionId && !t.startupCommand) continue;
+      let cmd = t.startupCommand;
+      if (!cmd && t.aiSessionId) {
+        if (!validateSessionId(t.aiSessionId)) continue;
+        const provider = getSessionProvider(copilotSessions, claudeCodeSessions, t.aiSessionId);
+        if (provider) cmd = buildResumeCommand(config, provider, t.aiSessionId);
+      }
+      if (cmd) {
+        window.terminalAPI.writePty(id, cmd + '\r');
+      }
+    }
+  },
+
+  // ── Tab group actions ────────────────────────────────────────────
+  createTabGroup: (name: string, color: string) => {
+    const id = uuidv4();
+    const newGroups = new Map(get().tabGroups);
+    newGroups.set(id, { id, name, color, collapsed: false });
+    set({ tabGroups: newGroups });
+    return id;
+  },
+
+  deleteTabGroup: (groupId: string) => {
+    const { terminals, tabGroups } = get();
+    const newGroups = new Map(tabGroups);
+    newGroups.delete(groupId);
+    const newTerminals = new Map(terminals);
+    for (const [id, t] of newTerminals) {
+      if (t.groupId === groupId) {
+        newTerminals.set(id, { ...t, groupId: undefined });
+      }
+    }
+    set({ tabGroups: newGroups, terminals: newTerminals });
+  },
+
+  renameTabGroup: (groupId: string, name: string) => {
+    const { tabGroups } = get();
+    const group = tabGroups.get(groupId);
+    if (!group) return;
+    const newGroups = new Map(tabGroups);
+    newGroups.set(groupId, { ...group, name });
+    set({ tabGroups: newGroups });
+  },
+
+  toggleTabGroupCollapse: (groupId: string) => {
+    const { tabGroups } = get();
+    const group = tabGroups.get(groupId);
+    if (!group) return;
+    const newGroups = new Map(tabGroups);
+    newGroups.set(groupId, { ...group, collapsed: !group.collapsed });
+    set({ tabGroups: newGroups });
+  },
+
+  addToGroup: (terminalId: TerminalId, groupId: string) => {
+    const { terminals } = get();
+    const instance = terminals.get(terminalId);
+    if (!instance) return;
+    const newTerminals = new Map(terminals);
+    newTerminals.set(terminalId, { ...instance, groupId });
+    set({ terminals: newTerminals });
+  },
+
+  removeFromGroup: (terminalId: TerminalId) => {
+    const { terminals } = get();
+    const instance = terminals.get(terminalId);
+    if (!instance) return;
+    const newTerminals = new Map(terminals);
+    newTerminals.set(terminalId, { ...instance, groupId: undefined });
+    set({ terminals: newTerminals });
+  },
+
+  // ── Diff review actions ───────────────────────────────────────────
+  openDiffReview: (terminalId: TerminalId) => {
+    set({ diffReviewOpen: true, diffReviewTerminalId: terminalId, diffReviewMode: 'unstaged' });
+  },
+  closeDiffReview: () => {
+    set({ diffReviewOpen: false, diffReviewTerminalId: null });
+  },
+  setDiffReviewMode: (mode: DiffMode) => {
+    set({ diffReviewMode: mode });
+  },
+}));

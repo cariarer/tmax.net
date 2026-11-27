@@ -9,8 +9,8 @@ public class PtyManagerTests
     private static readonly TimeSpan Timeout = TimeSpan.FromSeconds(15);
 
     private static ShellProfile TestShell() => OperatingSystem.IsWindows()
-        ? new("cmd", Path.Combine(Environment.SystemDirectory, "cmd.exe"), [])
-        : new("sh", "/bin/sh", []);
+        ? new("cmd", "cmd", Path.Combine(Environment.SystemDirectory, "cmd.exe"), [])
+        : new("sh", "sh", "/bin/sh", []);
 
     [Fact]
     public async Task Spawned_shell_echoes_output_and_exposes_it_in_the_buffer()

@@ -1,0 +1,508 @@
+import { useEffect } from 'react';
+import { useTerminalStore } from '../state/terminal-store';
+import type { SplitDirection } from '../state/types';
+import { isMac } from '../utils/platform';
+import { getTerminalEntry } from '../terminal-registry';
+import { smartUnwrapForCopy } from '../utils/smart-unwrap';
+
+interface KeyCombo {
+  ctrlKey: boolean;
+  shiftKey: boolean;
+  altKey: boolean;
+  key: string;
+}
+
+function parseKeyCombo(combo: string): KeyCombo {
+  // Handle special cases: "Ctrl+=" ends with "+" then "=" which splits oddly
+  // Also "Ctrl+-" and "Ctrl+Shift+?" need care
+  // Accept Meta/Cmd as aliases for Ctrl (cross-platform config support)
+  const ctrlKey = /\b(ctrl|meta|cmd)\b/i.test(combo);
+  const shiftKey = /\bshift\b/i.test(combo);
+  const altKey = /\balt\b/i.test(combo);
+
+  // Extract the actual key: everything after the last modifier+
+  let key = combo;
+  key = key.replace(/\b(ctrl|meta|cmd|shift|alt)\s*\+\s*/gi, '');
+  key = key.toLowerCase().trim();
+
+  // Normalize common key names
+  if (key === '') key = '+'; // "Ctrl+Shift++" edge case
+
+  return { ctrlKey, shiftKey, altKey, key };
+}
+
+// On macOS, Cmd suppresses Shift key transformation in event.key,
+// so Cmd+Shift+/ reports key='/' instead of '?'. Map unshifted → shifted.
+const MAC_SHIFT_MAP: Record<string, string> = {
+  '/': '?', '=': '+', '-': '_', '[': '{', ']': '}', '\\': '|',
+  ';': ':', "'": '"', ',': '<', '.': '>', '`': '~',
+  '1': '!', '2': '@', '3': '#', '4': '$', '5': '%',
+  '6': '^', '7': '&', '8': '*', '9': '(', '0': ')',
+};
+
+function matchesCombo(event: KeyboardEvent, combo: KeyCombo): boolean {
+  const eventKey = event.key.toLowerCase();
+  // On macOS, Cmd (metaKey) is the primary app modifier instead of Ctrl
+  if (isMac) {
+    const shiftedKey = combo.shiftKey ? (MAC_SHIFT_MAP[eventKey] ?? eventKey) : eventKey;
+    // When Option/Alt is held on macOS, event.key contains the special
+    // character the OS produces (Option+P → "π", Option+R → "®", etc.),
+    // not the underlying letter. event.code stays layout-stable
+    // ("KeyP", "KeyR"...) so we fall back to it for letter/digit
+    // shortcuts. Without this, every Cmd+Option+<letter> binding
+    // silently no-ops on Mac.
+    const codeKey = (() => {
+      const c = event.code;
+      if (c.startsWith('Key') && c.length === 4) return c.slice(3).toLowerCase();
+      if (c.startsWith('Digit') && c.length === 6) return c.slice(5);
+      return '';
+    })();
+    return (
+      event.metaKey === combo.ctrlKey &&
+      event.shiftKey === combo.shiftKey &&
+      event.altKey === combo.altKey &&
+      (eventKey === combo.key || shiftedKey === combo.key || codeKey === combo.key)
+    );
+  }
+  return (
+    event.ctrlKey === combo.ctrlKey &&
+    event.shiftKey === combo.shiftKey &&
+    event.altKey === combo.altKey &&
+    eventKey === combo.key
+  );
+}
+
+export const DEFAULT_BINDINGS: Record<string, string> = {
+  'Ctrl+T': 'createTerminal',
+  // Ctrl+W intentionally NOT mapped: it's the universal readline /
+  // bash / zsh / Claude Code shortcut for "delete previous word".
+  // Intercepting it to close the pane was destructive - users typing
+  // Ctrl+W expecting to delete a word lost their pane. Close pane is
+  // Ctrl+Shift+W only. (TASK-38)
+  'Ctrl+Shift+N': 'createTerminal',
+  'Ctrl+Shift+W': 'closeTerminal',
+  // Workspaces (TASK-40). No-op when only one workspace exists.
+  // Ctrl+Tab / Ctrl+Shift+Tab are intentionally NOT bound here — they
+  // already drive focusNext/focusPrev across panes (see below) and that
+  // pane-cycling behavior is the more frequent operation.
+  'Ctrl+Shift+]': 'nextWorkspace',
+  'Ctrl+Shift+[': 'prevWorkspace',
+  'Ctrl+1': 'goToWorkspace1',
+  'Ctrl+2': 'goToWorkspace2',
+  'Ctrl+3': 'goToWorkspace3',
+  'Ctrl+4': 'goToWorkspace4',
+  'Ctrl+5': 'goToWorkspace5',
+  'Ctrl+6': 'goToWorkspace6',
+  'Ctrl+7': 'goToWorkspace7',
+  'Ctrl+8': 'goToWorkspace8',
+  'Ctrl+9': 'goToWorkspace9',
+  'Shift+ArrowUp': 'focusUp',
+  'Shift+ArrowDown': 'focusDown',
+  'Shift+ArrowLeft': 'focusLeft',
+  'Shift+ArrowRight': 'focusRight',
+  'Ctrl+Shift+ArrowRight': 'moveRight',
+  'Ctrl+Shift+ArrowDown': 'moveDown',
+  'Ctrl+Shift+ArrowLeft': 'moveLeft',
+  'Ctrl+Shift+ArrowUp': 'moveUp',
+  'Ctrl+=': 'zoomIn',
+  'Ctrl+Shift++': 'zoomIn', // User presses Ctrl and the physical + key (which requires Shift on US)
+  'Ctrl+-': 'zoomOut',
+  'Ctrl+0': 'zoomReset',
+  'Ctrl+Shift+F': 'toggleFocusMode',
+  // Ctrl+Alt+F clashes with the Windows Files app shortcut, so use
+  // Ctrl+Shift+U for "pop up / float" instead. Free across the app and
+  // the Electron defaults.
+  'Ctrl+Shift+U': 'toggleFloat',
+  'Ctrl+Shift+A': 'toggleBroadcastMode',
+  'Ctrl+Shift+H': 'toggleDormant',
+  'Ctrl+Shift+E': 'equalizeLayout',
+  'Ctrl+,': 'openSettings',
+  'Ctrl+Alt+B': 'openBacklog',
+  'Ctrl+Shift+R': 'renameTerminal',
+  'Ctrl+Shift+?': 'showShortcuts',
+  'Ctrl+Shift+G': 'switchTerminalList',
+  'Ctrl+Shift+J': 'switchTerminal',
+  'Ctrl+Shift+D': 'dirPicker',
+  'Ctrl+Shift+P': 'commandPalette',
+  'Ctrl+Tab': 'focusNext',
+  'Ctrl+Shift+Tab': 'focusPrev',
+  'Ctrl+Alt+ArrowUp': 'splitVerticalUp',
+  'Ctrl+Alt+ArrowDown': 'splitVertical',
+  'Ctrl+Alt+ArrowLeft': 'splitHorizontalLeft',
+  'Ctrl+Alt+ArrowRight': 'splitHorizontal',
+  'Ctrl+Shift+Alt+ArrowUp': 'resizeUp',
+  'Ctrl+Shift+Alt+ArrowDown': 'resizeDown',
+  'Ctrl+Shift+Alt+ArrowLeft': 'resizeLeft',
+  'Ctrl+Shift+Alt+ArrowRight': 'resizeRight',
+  'Ctrl+Shift+M': 'tabMenu',
+  'Ctrl+Shift+C': 'copilotPanel',
+  // Ctrl+Alt+T: open/close the read-only transcript panel for the focused
+  // AI pane (same panel as the pane's 💬 title-bar button). Ctrl+Shift+S
+  // was taken, so Alt instead of Shift (matches the Ctrl+Alt+R/N family).
+  'Ctrl+Alt+T': 'toggleTranscript',
+  // Ctrl+Shift+T: browser-style undo close (TASK-112). Reused from the
+  // worktree panel because undo-close is the more frequent action; the
+  // worktree panel still opens via the command palette and the
+  // StatusBar button.
+  'Ctrl+Shift+T': 'restoreClosedTerminal',
+  'Ctrl+Shift+K': 'showPrompts',
+  'Ctrl+Shift+Y': 'searchPrompts',
+  'Ctrl+Shift+B': 'hideTabBar',
+  'Ctrl+Shift+X': 'fileExplorer',
+  'Ctrl+Shift+L': 'cycleGridColumns',
+  'Ctrl+Shift+O': 'colorizeAllTabs',
+  'F5': 'continueAgent',
+  // Ctrl+Insert: Windows-classic copy idiom (mirror of Shift+Insert paste).
+  // Issue #102. No-op when there's no selection. xterm has no default for
+  // Ctrl+Insert so binding it here doesn't clobber anything.
+  'Ctrl+Insert': 'copySelection',
+  // Ctrl+Alt+R: soft refresh of the focused pane (xterm remount, PTY
+  // untouched). Escape hatch for renderer-side input-freeze. Issue #101.
+  // Ctrl+Shift+R is taken by rename, so Alt instead of Shift.
+  'Ctrl+Alt+R': 'refreshPane',
+  // Ctrl+Alt+N: replace the focused pane with a fresh shell in the same
+  // slot. TASK-173.
+  'Ctrl+Alt+N': 'replaceTerminal',
+  // Ctrl+Alt+E: open the prompt editor for the focused pane (TASK-180).
+  // ("E" for Editor; Ctrl+Alt+C collided with other tools on Windows.)
+  'Ctrl+Alt+E': 'promptComposer',
+};
+
+export function useKeybindings(): void {
+  const config = useTerminalStore((s) => s.config);
+
+  useEffect(() => {
+    // Start with hardcoded defaults, then overlay config bindings
+    // This ensures new shortcuts always work even if config is stale
+    const mergedBindings: Record<string, string> = { ...DEFAULT_BINDINGS };
+
+    const configBindings = config?.keybindings;
+    if (Array.isArray(configBindings)) {
+      // Config array format: clear defaults for actions that config defines, then apply
+      const configActions = new Set(configBindings.map((b: { action: string }) => b.action));
+      for (const [key, action] of Object.entries(mergedBindings)) {
+        if (configActions.has(action)) delete mergedBindings[key];
+      }
+      for (const b of configBindings as { action: string; key: string }[]) {
+        mergedBindings[b.key] = b.action;
+      }
+    }
+
+    const parsedBindings = Object.entries(mergedBindings).map(([combo, action]) => ({
+      combo: parseKeyCombo(combo),
+      action,
+    }));
+
+    // Sort bindings: more modifiers first so Ctrl+Shift+X matches before Shift+X
+    parsedBindings.sort((a, b) => {
+      const modCount = (c: KeyCombo) => +c.ctrlKey + +c.shiftKey + +c.altKey;
+      return modCount(b.combo) - modCount(a.combo);
+    });
+
+    function handleKeyDown(event: KeyboardEvent): void {
+      for (const { combo, action } of parsedBindings) {
+        if (matchesCombo(event, combo)) {
+          event.preventDefault();
+          event.stopPropagation();
+          dispatchAction(action);
+          return;
+        }
+      }
+    }
+
+    // Use document capture to intercept before xterm.js textarea
+    document.addEventListener('keydown', handleKeyDown, true);
+    return () => {
+      document.removeEventListener('keydown', handleKeyDown, true);
+    };
+  }, [config]);
+}
+
+function dispatchAction(action: string): void {
+  const store = useTerminalStore.getState();
+  const focusedId = store.focusedTerminalId;
+
+  switch (action) {
+    case 'createTerminal':
+      store.createTerminal();
+      break;
+    case 'closeTerminal': {
+      // Mirror TabContextMenu's "Close" behavior (TabContextMenu.tsx ~L443):
+      // when panes are multi-selected, the shortcut closes every selected
+      // pane (union with the focused pane in case it's not in the set).
+      // Without this, Ctrl+Shift+W silently dropped all but the focused
+      // pane from a multi-pane close (TASK-172).
+      const sel = Object.keys(store.selectedTerminalIds);
+      const ids = sel.length > 0
+        ? Array.from(new Set([...sel, ...(focusedId ? [focusedId] : [])]))
+        : (focusedId ? [focusedId] : []);
+      if (ids.length === 0) break;
+      if (sel.length > 0) store.clearSelection();
+      store.closeTerminals(ids);
+      break;
+    }
+    case 'restoreClosedTerminal':
+      store.restoreClosedTerminal();
+      break;
+    case 'focusNext':
+      store.focusNext();
+      break;
+    case 'focusPrev':
+      store.focusPrev();
+      break;
+    case 'focusUp':
+      store.focusDirection('up');
+      break;
+    case 'focusDown':
+      store.focusDirection('down');
+      break;
+    case 'focusLeft':
+      store.focusDirection('left');
+      break;
+    case 'focusRight':
+      store.focusDirection('right');
+      break;
+    case 'splitHorizontal':
+      if (focusedId) store.splitTerminal(focusedId, 'horizontal' as SplitDirection, undefined, 'right');
+      break;
+    case 'splitHorizontalLeft':
+      if (focusedId) store.splitTerminal(focusedId, 'horizontal' as SplitDirection, undefined, 'left');
+      break;
+    case 'splitVertical':
+      if (focusedId) store.splitTerminal(focusedId, 'vertical' as SplitDirection, undefined, 'bottom');
+      break;
+    case 'splitVerticalUp':
+      if (focusedId) store.splitTerminal(focusedId, 'vertical' as SplitDirection, undefined, 'top');
+      break;
+    case 'toggleFloat':
+      if (focusedId) {
+        const terminal = store.terminals.get(focusedId);
+        if (terminal?.mode === 'tiled') {
+          store.moveToFloat(focusedId);
+        } else if (terminal?.mode === 'floating') {
+          store.moveToTiling(focusedId);
+        }
+      }
+      break;
+    case 'switchTerminal':
+      store.togglePaneHints();
+      break;
+    case 'switchTerminalList':
+      store.toggleSwitcher();
+      break;
+    case 'renameTerminal':
+      if (focusedId) store.startRenaming(focusedId);
+      break;
+    case 'zoomIn':
+      store.zoomIn();
+      break;
+    case 'zoomOut':
+      store.zoomOut();
+      break;
+    case 'zoomReset':
+      store.zoomReset();
+      break;
+    case 'showShortcuts':
+      store.toggleShortcuts();
+      break;
+    case 'openSettings':
+      store.toggleSettings();
+      break;
+    case 'openBacklog':
+      store.toggleBacklog();
+      break;
+    case 'dirPicker':
+      store.toggleDirPicker();
+      break;
+    case 'equalizeLayout':
+      store.equalizeLayout();
+      break;
+    case 'toggleFocusMode':
+      store.toggleViewMode();
+      break;
+    case 'toggleBroadcastMode':
+      store.toggleBroadcastMode();
+      break;
+    case 'toggleDormant':
+      if (focusedId) {
+        const t = store.terminals.get(focusedId);
+        if (t?.mode === 'dormant') {
+          store.wakeFromDormant(focusedId);
+        } else {
+          store.moveToDormant(focusedId);
+        }
+      }
+      break;
+    case 'commandPalette':
+      store.toggleCommandPalette();
+      break;
+    case 'tabMenu':
+      store.openTabMenu();
+      break;
+    case 'copilotPanel':
+      store.toggleCopilotPanel();
+      break;
+    case 'toggleTranscript':
+      store.toggleTranscript();
+      break;
+    case 'worktreePanel':
+      store.toggleWorktreePanel();
+      break;
+    case 'showPrompts':
+      if (focusedId) store.showPromptsForTerminal(focusedId);
+      break;
+    case 'promptComposer':
+      // Available on any pane - drafting multi-line input is useful for
+      // shells too, not only AI sessions.
+      if (focusedId) store.openPromptComposer(focusedId);
+      break;
+    case 'searchPrompts':
+      store.togglePromptSearch();
+      break;
+    case 'hideTabBar':
+      store.toggleHideTabTitles();
+      break;
+    case 'fileExplorer':
+      store.toggleFileExplorer();
+      break;
+    case 'cycleGridColumns':
+      store.cycleGridColumns();
+      break;
+    case 'colorizeAllTabs':
+      store.colorizeAllTabs();
+      break;
+    case 'moveUp':
+    case 'moveDown':
+    case 'moveLeft':
+    case 'moveRight': {
+      if (!focusedId) break;
+      const moveDir = action.replace('move', '').toLowerCase() as 'up' | 'down' | 'left' | 'right';
+      store.moveTerminalDirection(focusedId, moveDir);
+      break;
+    }
+    case 'continueAgent': {
+      if (!focusedId) break;
+      const terminal = store.terminals.get(focusedId);
+      if (terminal?.aiSessionId) {
+        window.terminalAPI.writePty(focusedId, 'continue\r');
+      }
+      break;
+    }
+    case 'refreshPane': {
+      // Ctrl+Alt+R (issue #101): soft refresh - bumps the pane's refresh
+      // generation, forcing a React remount of the xterm wrapper. The
+      // PTY lives in main and is untouched, so the shell process keeps
+      // running and scrollback survives the remount.
+      if (!focusedId) break;
+      store.refreshTerminal(focusedId);
+      break;
+    }
+    case 'replaceTerminal': {
+      // Ctrl+Alt+N (TASK-173): close the focused pane's PTY and spawn a
+      // fresh one in the same layout slot. Hard reset; PTY does NOT
+      // survive.
+      if (!focusedId) break;
+      store.replaceTerminal(focusedId);
+      break;
+    }
+    case 'copySelection': {
+      // Ctrl+Insert (issue #102): copy the focused terminal's current
+      // selection. Silent no-op when there's nothing selected so the user's
+      // existing clipboard contents aren't stomped with an empty string.
+      if (!focusedId) break;
+      const entry = getTerminalEntry(focusedId);
+      const term = entry?.terminal;
+      if (!term || !term.hasSelection()) break;
+      const sel = term.getSelection();
+      if (!sel) break;
+      const smartEnabled = store.config?.terminal?.smartUnwrapCopy !== false;
+      window.terminalAPI.clipboardWrite(smartUnwrapForCopy(sel, smartEnabled));
+      term.clearSelection();
+      break;
+    }
+    case 'resizeUp':
+    case 'resizeDown':
+    case 'resizeLeft':
+    case 'resizeRight': {
+      if (!focusedId) break;
+      const direction = action.replace('resize', '').toLowerCase() as 'up' | 'down' | 'left' | 'right';
+      const delta = direction === 'up' || direction === 'left' ? -5 : 5;
+      adjustFocusedSplitRatio(store, focusedId, direction, delta);
+      break;
+    }
+    // Workspaces (TASK-40). No-op when only one workspace exists.
+    case 'nextWorkspace': {
+      const ids = [...store.workspaces.keys()];
+      if (ids.length < 2) break;
+      const i = ids.indexOf(store.activeWorkspaceId);
+      store.setActiveWorkspace(ids[(i + 1) % ids.length]);
+      break;
+    }
+    case 'prevWorkspace': {
+      const ids = [...store.workspaces.keys()];
+      if (ids.length < 2) break;
+      const i = ids.indexOf(store.activeWorkspaceId);
+      store.setActiveWorkspace(ids[(i - 1 + ids.length) % ids.length]);
+      break;
+    }
+    case 'newWorkspace': {
+      store.createWorkspace();
+      store.createTerminal();
+      break;
+    }
+    default: {
+      // Ctrl+1..9 → goToWorkspaceN. Only meaningful in workspaces mode.
+      const m = /^goToWorkspace([1-9])$/.exec(action);
+      if (m) {
+        if (store.config?.tabMode !== 'workspaces') break;
+        const idx = parseInt(m[1], 10) - 1;
+        const ids = [...store.workspaces.keys()];
+        if (idx < ids.length) store.setActiveWorkspace(ids[idx]);
+      }
+      break;
+    }
+  }
+}
+
+function adjustFocusedSplitRatio(
+  store: ReturnType<typeof useTerminalStore.getState>,
+  terminalId: string,
+  direction: 'up' | 'down' | 'left' | 'right',
+  delta: number
+): void {
+  const root = store.layout.tilingRoot;
+  if (!root || root.kind === 'leaf') return;
+
+  const splitDirection: SplitDirection =
+    direction === 'left' || direction === 'right' ? 'horizontal' : 'vertical';
+
+  function findParentSplit(
+    node: typeof root,
+    targetId: string
+  ): { id: string; ratio: number } | null {
+    if (!node || node.kind === 'leaf') return null;
+    if (node.direction === splitDirection) {
+      if (containsTerminal(node.first, targetId) || containsTerminal(node.second, targetId)) {
+        return { id: node.id, ratio: node.splitRatio };
+      }
+    }
+    const fromFirst = findParentSplit(node.first, targetId);
+    if (fromFirst) return fromFirst;
+    return findParentSplit(node.second, targetId);
+  }
+
+  function containsTerminal(
+    node: typeof root,
+    targetId: string
+  ): boolean {
+    if (!node) return false;
+    if (node.kind === 'leaf') return node.terminalId === targetId;
+    return containsTerminal(node.first, targetId) || containsTerminal(node.second, targetId);
+  }
+
+  const parent = findParentSplit(root, terminalId);
+  if (parent) {
+    const newRatio = Math.max(0.1, Math.min(0.9, parent.ratio + delta / 100));
+    store.setSplitRatio(parent.id, newRatio);
+  }
+}

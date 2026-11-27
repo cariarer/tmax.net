@@ -1,0 +1,3882 @@
+import React, { useEffect, useRef, useCallback, useState, useReducer } from 'react';
+import ReactDOM from 'react-dom';
+import { Terminal } from '@xterm/xterm';
+import { FitAddon } from '@xterm/addon-fit';
+import { SearchAddon } from '@xterm/addon-search';
+import { SerializeAddon } from '@xterm/addon-serialize';
+import { useTerminalStore, TAB_COLORS, computeTabTint, findSessionById, getSessionProvider } from '../state/terminal-store';
+import { registerTerminal, unregisterTerminal, getTerminalEntry } from '../terminal-registry';
+
+import { saveTerminalBuffer, popTerminalBuffer } from '../terminal-buffer-cache';
+import { isMac, formatKeyForPlatform, isLetterShortcut } from '../utils/platform';
+import { runJumpToPromptSearch } from '../utils/jump-to-prompt';
+import { prepareClipboardPaste, resolveClipboardPaste } from '../utils/paste';
+import { smartUnwrapForCopy } from '../utils/smart-unwrap';
+import { detectCwdFromChunk } from '../utils/cwd-detect';
+import { MD_PATH_PATTERN } from '../utils/md-link-parser';
+import { buildSessionHoverText } from '../utils/session-tooltip';
+import type { AppConfig } from '../state/types';
+import { getTerminalDisplayTitle } from '../state/types';
+import '@xterm/xterm/css/xterm.css';
+
+const PING_PROMPTS = [
+  "Quick status update please - what's the current state, what just finished, and what's next? Keep it brief.",
+  "Where are we at? Briefly: what did you just finish, what's in progress, and what's next.",
+  "Status check - drop a short summary of where things stand and what the next step is.",
+  "Give me a quick read on progress: last completed step, current step, and what's coming up. Short answer.",
+  "Status ping - in a sentence or two, what's done, what's pending, and any blockers?",
+  "Brief progress check please - what just shipped, what you're working on now, and what's queued next.",
+  "What's the current status? Just a short recap: latest milestone, what's in flight, what's next.",
+  "Quick check-in: where are we, what's the next move, and is anything blocking you? Keep it tight.",
+];
+
+function pickRandomPingPrompt(): string {
+  return PING_PROMPTS[Math.floor(Math.random() * PING_PROMPTS.length)];
+}
+
+// Varied phrasings for the backlog-update ping so it doesn't read as a canned,
+// deterministic macro each time.
+const BACKLOG_PING_PROMPTS = [
+  "Take a moment to bring the Backlog.md tasks up to date: set the right status, tick off any acceptance criteria you've completed, and add a short final summary to anything you've finished.",
+  "Reconcile the Backlog.md board with where things actually stand - update statuses, check the criteria that are done, and write a brief summary on completed tasks.",
+  "Sync the Backlog.md tasks to reality: move tasks to their correct status, mark finished acceptance criteria, and drop a concise final summary on the ones that are done.",
+  "Could you refresh the Backlog.md tasks? Set statuses correctly, check completed criteria, and append a short wrap-up to each finished task.",
+  "Update the backlog to match the work so far - correct each task's status, check off completed acceptance criteria, and add a brief summary where a task is done.",
+  "Give the Backlog.md tasks a pass: fix statuses, tick completed criteria, and add a short final summary to anything you've wrapped up.",
+];
+
+function pickRandomBacklogPrompt(): string {
+  return BACKLOG_PING_PROMPTS[Math.floor(Math.random() * BACKLOG_PING_PROMPTS.length)];
+}
+
+// TASK-171: AI CLI process names we look for in a pane's descendant tree.
+// Matched on the cleaned name (no path, no .exe, lowercased). Direct name
+// for the canonical binaries plus the common wrapper shims users have
+// reported (Ronny's `agency`, Copilot CLI on macOS as `copilot`, etc.).
+const AI_PROCESS_NAMES: Record<string, { title: string; kind: 'copilot' | 'claude-code' }> = {
+  'copilot': { title: 'GitHub Copilot', kind: 'copilot' },
+  'github-copilot': { title: 'GitHub Copilot', kind: 'copilot' },
+  'gh-copilot': { title: 'GitHub Copilot', kind: 'copilot' },
+  'claude': { title: 'Claude Code', kind: 'claude-code' },
+  'cc': { title: 'Claude Code', kind: 'claude-code' },
+  'claude-code': { title: 'Claude Code', kind: 'claude-code' },
+};
+
+function detectAiInChildren(names: string[]): { title: string; kind: 'copilot' | 'claude-code' } | null {
+  for (const n of names) {
+    const hit = AI_PROCESS_NAMES[n];
+    if (hit) return hit;
+  }
+  return null;
+}
+
+// TASK-172: format a dropped file path for typing into the PTY.
+// - WSL panes: translate C:\foo\bar to /mnt/c/foo/bar so the shell inside
+//   WSL can use it directly.
+// - Quote with double quotes when the path contains whitespace; safe in
+//   cmd / PowerShell / bash / zsh. We don't try to escape embedded quotes -
+//   if a user has a file path with a literal `"` we accept they'll need to
+//   touch it up; that's a tiny minority.
+function formatPathForPty(path: string, isWsl: boolean, wslDistro?: string): string {
+  let formatted = path;
+  if (isWsl) {
+    // C:\foo\bar -> /mnt/c/foo/bar (lowercase drive letter; forward slashes).
+    // The wslDistro hint isn't used here - a WSL terminal's filesystem
+    // already has /mnt/* mounts, and Linux paths (/foo/bar) stay as-is.
+    void wslDistro;
+    const winMatch = /^([A-Za-z]):[\\/](.*)$/.exec(formatted);
+    if (winMatch) {
+      const drive = winMatch[1].toLowerCase();
+      const rest = winMatch[2].replace(/\\/g, '/');
+      formatted = `/mnt/${drive}/${rest}`;
+    }
+  }
+  if (/\s/.test(formatted)) {
+    return `"${formatted}"`;
+  }
+  return formatted;
+}
+
+function relativeTime(ts: number): string {
+  const diff = Math.floor((Date.now() - ts) / 1000);
+  if (diff < 5) return 'just now';
+  if (diff < 60) return `${diff}s ago`;
+  if (diff < 3600) return `${Math.floor(diff / 60)}m ago`;
+  if (diff < 86400) return `${Math.floor(diff / 3600)}h ago`;
+  return `${Math.floor(diff / 86400)}d ago`;
+}
+
+function hexToTerminalRgba(hex: string, alpha: number): string {
+  const m = /^#?([a-f\d]{2})([a-f\d]{2})([a-f\d]{2})$/i.exec(hex);
+  if (!m) return hex;
+  return `rgba(${parseInt(m[1], 16)}, ${parseInt(m[2], 16)}, ${parseInt(m[3], 16)}, ${alpha})`;
+}
+
+/**
+ * Force xterm's viewport to sync its native scroll area with the buffer.
+ *
+ * xterm 5.5's `Viewport.syncScrollArea()` is gated by four cached fields
+ * (`_lastRecordedBufferLength`, `_lastRecordedViewportHeight`,
+ * `_lastRecordedBufferHeight`, `_currentDeviceCellHeight`). After a
+ * grid/float layout change ends up at the same render dimensions as a
+ * previous layout, all four caches match and the call is a no-op — so the
+ * .xterm-viewport scrollHeight stays at the stale (often smaller) value:
+ *   - Scrollbar thumb is missing or tiny (TASK-50)
+ *   - Wheel can only scroll within the stale range (TASK-49)
+ *
+ * We invalidate the caches and call syncScrollArea(true) (immediate=true,
+ * skip rAF) only when the viewport has real geometry — calling against
+ * a zero-sized container would just refresh into another bad state.
+ *
+ * NOTE: Touches xterm 5.5 internals. If you upgrade xterm, re-verify the
+ * field names in node_modules/@xterm/xterm/src/browser/Viewport.ts.
+ */
+function syncViewportScrollArea(term: Terminal): void {
+  try {
+    const v = (term as any)?._core?.viewport;
+    if (!v || typeof v.syncScrollArea !== 'function') return;
+    // Bail if the viewport has no real layout yet — _innerRefresh would
+    // record zeros and we'd just have to redo this.
+    const el: HTMLElement | undefined = v._viewportElement;
+    if (el && el.offsetHeight === 0) return;
+    v._lastRecordedBufferLength = -1;
+    v._lastRecordedViewportHeight = -1;
+    v._lastRecordedBufferHeight = -1;
+    v._currentDeviceCellHeight = -1;
+    v.syncScrollArea(true);
+  } catch { /* viewport may not be ready */ }
+}
+
+/**
+ * True when the terminal is showing its normal (scrollback) buffer.
+ *
+ * Alt-screen TUIs (vim, less, htop, and Copilot CLI's full-screen UI with
+ * its own scrollbar) render into the alternate buffer, which has no
+ * scrollback and is fixed to the viewport size. Those apps own their own
+ * scrolling, so tmax's viewport scroll-sync workarounds below must stay out
+ * of their way — otherwise they fight the app's scrollbar (e.g. a stray
+ * scrollToBottom) instead of helping.
+ */
+function isNormalBuffer(term: Terminal): boolean {
+  return term.buffer.active.type === 'normal';
+}
+
+const WSL_PROMPT_DEBOUNCE_MS = 200;
+const WSL_PROMPT_FALLBACK_MS = 5000;
+
+/**
+ * Sends a command to a WSL terminal after detecting the shell prompt.
+ * Uses debounce to avoid firing on MOTD/banner text, with a fallback timeout.
+ * Returns a cleanup function for useEffect teardown.
+ */
+function sendCommandOnWslPrompt(
+  terminalId: string,
+  cmd: string,
+  onSent?: (cmd: string) => void,
+): () => void {
+  let promptSent = false;
+  let debounceTimer: ReturnType<typeof setTimeout> | null = null;
+
+  const checkPrompt = (id: string, data: string) => {
+    if (id !== terminalId || promptSent) return;
+    const clean = data.replace(/\x1b\[[^m]*m/g, '').replace(/\x1b\][^\x07]*\x07/g, '');
+    // $/#/% = sh/bash/zsh; ❯/➜ = Oh-My-Zsh/Starship; > = fish/generic
+    if (/[$#%❯➜>]\s*$/.test(clean)) {
+      if (debounceTimer) clearTimeout(debounceTimer);
+      debounceTimer = setTimeout(() => {
+        if (!promptSent) {
+          promptSent = true;
+          promptUnsub();
+          window.terminalAPI.writePty(terminalId, cmd + '\r');
+          onSent?.(cmd);
+        }
+      }, WSL_PROMPT_DEBOUNCE_MS);
+    }
+  };
+
+  const promptUnsub = window.terminalAPI.onPtyData(checkPrompt);
+
+  const fallbackTimer = setTimeout(() => {
+    if (!promptSent) {
+      promptSent = true;
+      promptUnsub();
+      if (debounceTimer) clearTimeout(debounceTimer);
+      window.terminalAPI.writePty(terminalId, cmd + '\r');
+      onSent?.(cmd);
+    }
+  }, WSL_PROMPT_FALLBACK_MS);
+
+  return () => {
+    promptUnsub();
+    clearTimeout(fallbackTimer);
+    if (debounceTimer) clearTimeout(debounceTimer);
+  };
+}
+
+function ago(ts: number): string {
+  if (!ts) return 'never';
+  const s = (Date.now() - ts) / 1000;
+  if (s < 60) return `${s.toFixed(1)}s ago`;
+  return `${Math.floor(s / 60)}m ago`;
+}
+
+interface DiagnosticsOverlayProps {
+  terminalId: string;
+  diagRef: React.RefObject<{ keystrokeCount: number; lastKeystrokeTime: number; outputEventCount: number; lastOutputTime: number; outputBytes: number; focusEventCount: number; lastFocusTime: number }>;
+  mainDiag: { pid: number; writeCount: number; lastWriteTime: number; dataCount: number; lastDataTime: number; dataBytes: number } | null;
+  logPath: string;
+  onClose: () => void;
+}
+
+const DiagnosticsOverlay: React.FC<DiagnosticsOverlayProps> = ({ terminalId, diagRef, mainDiag, logPath, onClose }) => {
+  const d = diagRef.current;
+  const xtermEl = document.activeElement;
+  const xtermFocused = xtermEl?.tagName === 'TEXTAREA' && xtermEl.closest('.xterm-helper-textarea') !== null ||
+    xtermEl?.classList.contains('xterm-helper-textarea');
+  const winFocused = document.hasFocus();
+
+  return (
+    <div className="terminal-diag-overlay" onMouseDown={(e) => e.stopPropagation()}>
+      <div className="terminal-diag-header">
+        <span>Diagnostics · {terminalId.slice(0, 8)}</span>
+        <button className="terminal-diag-close" onClick={onClose}>✕</button>
+      </div>
+      <table className="terminal-diag-table">
+        <tbody>
+          <tr><td>window focused</td><td className={winFocused ? 'diag-ok' : 'diag-warn'}>{winFocused ? 'yes' : 'NO'}</td></tr>
+          <tr><td>xterm focused</td><td className={xtermFocused ? 'diag-ok' : 'diag-warn'}>{xtermFocused ? 'yes' : 'NO'}</td></tr>
+          <tr><td colSpan={2} className="diag-section">Renderer</td></tr>
+          <tr><td>keystrokes → IPC</td><td>{d.keystrokeCount} · {ago(d.lastKeystrokeTime)}</td></tr>
+          <tr><td>output events ← IPC</td><td>{d.outputEventCount} · {ago(d.lastOutputTime)}</td></tr>
+          <tr><td>output bytes</td><td>{d.outputBytes.toLocaleString()}</td></tr>
+          <tr><td>focus events</td><td>{d.focusEventCount} · {ago(d.lastFocusTime)}</td></tr>
+          <tr><td colSpan={2} className="diag-section">Main process (PTY)</td></tr>
+          {mainDiag ? <>
+            <tr><td>PID</td><td>{mainDiag.pid}</td></tr>
+            <tr><td>write calls → PTY</td><td>{mainDiag.writeCount} · {ago(mainDiag.lastWriteTime)}</td></tr>
+            <tr><td>data events ← PTY</td><td>{mainDiag.dataCount} · {ago(mainDiag.lastDataTime)}</td></tr>
+            <tr><td>data bytes</td><td>{mainDiag.dataBytes.toLocaleString()}</td></tr>
+          </> : <tr><td colSpan={2} className="diag-warn">PTY not found (exited?)</td></tr>}
+        </tbody>
+      </table>
+      {logPath && (
+        <div className="terminal-diag-logpath">
+          <span className="terminal-diag-logpath-label">log:</span>
+          <span className="terminal-diag-logpath-value" title={logPath}>{logPath}</span>
+          <button className="terminal-diag-copy-btn" onClick={() => window.terminalAPI.clipboardWrite(logPath)} title="Copy path">⧉</button>
+        </div>
+      )}
+      <div className="terminal-diag-hint">{formatKeyForPlatform('Ctrl+Shift+`')} to close · refreshes every 500ms</div>
+    </div>
+  );
+};
+
+interface TerminalPanelProps {
+  terminalId: string;
+  // Drag/maximize handlers for when this pane is rendered inside a
+  // FloatingPanel. The float wrapper hands these in so the per-pane title
+  // bar can act as the float window's title bar (drag handle + maximize on
+  // double-click) - removing the need for a second bar above it.
+  floatTitleBar?: {
+    onMouseDown: (e: React.MouseEvent) => void;
+    onDoubleClick: (e: React.MouseEvent) => void;
+  };
+}
+
+const TerminalPanel: React.FC<TerminalPanelProps> = ({ terminalId, floatTitleBar }) => {
+  const containerRef = useRef<HTMLDivElement>(null);
+  const terminalRef = useRef<Terminal | null>(null);
+  const fitAddonRef = useRef<FitAddon | null>(null);
+  const searchAddonRef = useRef<SearchAddon | null>(null);
+  const serializeAddonRef = useRef<SerializeAddon | null>(null);
+  const [showSearch, setShowSearch] = useState(false);
+  const [searchQuery, setSearchQuery] = useState('');
+  const [searchResult, setSearchResult] = useState<{ resultIndex: number; resultCount: number } | null>(null);
+  const searchInputRef = useRef<HTMLInputElement>(null);
+  const [processStatus, setProcessStatus] = useState<'active' | 'idle' | 'exited-ok' | 'exited-error'>('idle');
+  const processStatusRef = useRef(processStatus);
+  // TASK-160: shows the floating "scroll to bottom" arrow only while the
+  // user is reading scrollback (xterm's viewportY is behind baseY). Updated
+  // on every onScroll tick from xterm.
+  const [isScrolledAway, setIsScrolledAway] = useState(false);
+  const [showDiag, setShowDiag] = useState(false);
+  const [isRenamingPane, setIsRenamingPane] = useState(false);
+  const statusDotMouseDownDuringRename = useRef(false);
+  const [renameValue, setRenameValue] = useState('');
+  // Per-pane overflow menu (replaces the row of inline title-bar buttons).
+  // Stored as anchor coords so the menu renders fixed-positioned next to ⋯.
+  const [paneMenuPos, setPaneMenuPos] = useState<{ x: number; y: number } | null>(null);
+  // TASK-78: "Move to workspace" submenu anchor. When set, renders the list
+  // of workspaces alongside the main overflow menu so the user can pick a
+  // destination without losing the parent context. Coords are the right edge
+  // of the parent submenu trigger so the panel hangs to the right of it.
+  const [moveToWsSubmenuPos, setMoveToWsSubmenuPos] = useState<{ x: number; y: number; anchorRight?: boolean } | null>(null);
+  // TASK-170: inline pane-color swatch grid inside the overflow menu.
+  // Mirrors the TabContextMenu / WorkspaceTabBar swatch-grid pattern so
+  // the three color-picker surfaces stay consistent. Auto-resets when the
+  // pane menu closes so reopening lands on the regular menu items again.
+  const [showPaneColorPicker, setShowPaneColorPicker] = useState(false);
+  useEffect(() => {
+    if (!paneMenuPos) setShowPaneColorPicker(false);
+  }, [paneMenuPos]);
+  const [, tickDiag] = useReducer((x: number) => x + 1, 0);
+  const diagRef = useRef({ keystrokeCount: 0, lastKeystrokeTime: 0, outputEventCount: 0, lastOutputTime: 0, outputBytes: 0, focusEventCount: 0, lastFocusTime: 0 });
+  // Timestamp of the last REAL key press in this pane (keydown), as opposed to
+  // term.onData which also fires for DEC focus escapes (\x1b[I/\x1b[O). Used by
+  // the blur->refocus guard to tell "user is actively typing" (RDP, where
+  // document.hasFocus() is false) apart from "window just isn't OS-focused"
+  // (where refocusing would thrash - GH #126).
+  const lastRealKeyAtRef = useRef(0);
+  const mainDiagRef = useRef<{ pid: number; writeCount: number; lastWriteTime: number; dataCount: number; lastDataTime: number; dataBytes: number } | null>(null);
+  const logPathRef = useRef<string>('');
+
+  const config = useTerminalStore((s) => s.config);
+  const focusedTerminalId = useTerminalStore((s) => s.focusedTerminalId);
+  const fontSize = useTerminalStore((s) => s.fontSize);
+  // Track modal overlay state — sidebars (copilot, dirs, explorer) should NOT block terminal focus
+  const anyOverlayOpen = useTerminalStore((s) =>
+    s.showCommandPalette || s.showSettings || s.showSwitcher || s.showShortcuts
+  );
+  const aiResumeCommandRef = useRef<string>('');
+  const aiSessionStartedRef = useRef(false);
+  // TASK-171: scan the PTY's process tree for an AI CLI on each big output
+  // burst until we either find one, hit the scan cap, or the pane gets a
+  // real AI session link. A single scan up-front used to miss the case
+  // where the user types other commands first (`cd c:\\tmp`, then much
+  // later `copilot`): the early scan finishes empty, the late one would
+  // succeed but we'd never run it. Throttled by lastScanAtRef so back-to-
+  // back bursts don't all queue scans.
+  const aiProcessScanInFlightRef = useRef(false);
+  const aiProcessScanCountRef = useRef(0);
+  const aiProcessLastScanAtRef = useRef(0);
+  const aiProcessGiveUpRef = useRef(false);
+  // TASK-172: ping button double-fire guard. Cleared after 1.2 s.
+  const pingInFlightRef = useRef(false);
+  // Independent double-fire guard for the backlog-update ping, so it and the
+  // status ping don't block each other.
+  const backlogPingInFlightRef = useRef(false);
+  // Buffer the user's first typed command so we can use it as the pane title
+  // when the shell's OSC title is just "cmd.exe" / "pwsh.exe" / "bash" -
+  // those generic names tell you nothing about what's actually running here.
+  const firstCmdBufferRef = useRef<string>('');
+  const firstCmdSavedRef = useRef(false);
+  const wslPromptCleanupRef = useRef<(() => void) | null>(null);
+  const textareaDiagCleanupRef = useRef<(() => void) | null>(null);
+  // Tracks signals that mean "an app is drawing its own cursor"; either one
+  // being on is enough to keep xterm's cursor hidden. See syncCursorVisibility.
+  const cursorHideSignalsRef = useRef({ bracketedPaste: false, altScreen: false, appCursorShown: true });
+  // TASK-52: read latest config in the copy handlers without rebuilding
+  // the terminal. Updated by a small effect below.
+  const smartUnwrapRef = useRef<boolean>(true);
+  // TASK-261: snapshot of the text the user dragged over in a mouse-reporting
+  // pane (Claude Code / TUI apps), where xterm makes no native selection.
+  // Lifted to a component-scoped ref so BOTH the keyboard handler (Ctrl+C /
+  // Ctrl+Shift+C) and the mouse handlers (right-click copy) can read it -
+  // otherwise Ctrl+C in those panes finds no selection and falls through to
+  // ^C/SIGINT instead of copying.
+  const pendingTuiCopyRef = useRef<string | null>(null);
+  // TASK-224: image-path link ranges, keyed by absolute buffer row, captured
+  // as the image-path link provider computes them on hover. A capture-phase
+  // mouseup handler uses these to activate the preview on a plain single click
+  // even when xterm's own hover-dependent link activation misfires (it does in
+  // AI CLI panes that redraw under a stationary cursor and have mouse tracking
+  // on, where a click is forwarded to the pty instead of the linkifier). The
+  // `lastActivateAt` timestamp dedupes against xterm's own activate() so a
+  // click that xterm DID handle doesn't open the preview twice.
+  const imgLinkHitsRef = useRef<{
+    rows: Map<number, Array<{ startX: number; endX: number; activate: () => void }>>;
+    lastActivateAt: number;
+  }>({ rows: new Map(), lastActivateAt: 0 });
+  const isFocused = focusedTerminalId === terminalId;
+  // TASK-72: pane is part of the user's multi-selection set (Ctrl/Cmd+click
+  // on the title bar). Drives the .multi-selected accent border and is the
+  // input to the "Show selected panes" command.
+  const isMultiSelected = useTerminalStore(
+    (s) => !!s.selectedTerminalIds[terminalId],
+  );
+  // TASK-79: workspace mode + filter state for the pane overflow menu's
+  // discoverable Select / Show Selected entries. Same gating as the
+  // WorkspaceTabBar toolbar button so the two stay coherent. Filter-active
+  // requires both grid plumbing AND a live selection (showSelectedPanes
+  // preserves it; the regular grid toggle does not have one).
+  const tabModeForMenu = useTerminalStore((s) => s.config?.tabMode);
+  const viewModeForMenu = useTerminalStore((s) => s.viewMode);
+  const preGridRootForMenu = useTerminalStore((s) => s.preGridRoot);
+  const selectionCountForMenu = useTerminalStore(
+    (s) => Object.keys(s.selectedTerminalIds).length,
+  );
+  const isWorkspacesModeForMenu = tabModeForMenu === 'workspaces';
+  const isShowSelectedActiveForMenu =
+    viewModeForMenu === 'grid' && !!preGridRootForMenu && selectionCountForMenu >= 2;
+
+  const handleFocus = useCallback(() => {
+    const prevFocused = useTerminalStore.getState().focusedTerminalId;
+    useTerminalStore.getState().setFocus(terminalId);
+    // A user click reaching this pane means the tmax window has OS focus,
+    // even if the window-level 'focus' event was lost (e.g. after restoring
+    // a minimized window or coming back from a different desktop). Without
+    // this reassert, `windowFocused` could stay stuck at false and the
+    // per-pane AI shimmer would never clear (TASK-140 follow-up).
+    if (!useTerminalStore.getState().windowFocused) {
+      useTerminalStore.setState({ windowFocused: true });
+    }
+    diagRef.current.focusEventCount++;
+    diagRef.current.lastFocusTime = Date.now();
+    window.terminalAPI.diagLog('renderer:focus-gained', { terminalId });
+    // Re-focus xterm textarea — the store won't trigger a re-focus
+    // if this panel is already the focused one (isFocused won't change).
+    // Skip when textarea already has DOM focus: a redundant term.focus()
+    // in the same frame corrupts xterm's cursor-blink state and paints a
+    // stale cursor (#41).
+    // Also skip when the pane's rename input has DOM focus - re-focusing
+    // xterm here would synchronously blur the rename input, flip
+    // isRenamingPane to false, and (because this fires from the root's
+    // onMouseDownCapture) flush a re-render before the target's mousedown
+    // handler runs. That breaks the "click status-dot while renaming
+    // doesn't close the pane" guard further down the title bar.
+    try {
+      const textarea = containerRef.current?.querySelector('textarea');
+      const renameActive = containerRef.current?.parentElement
+        ?.querySelector('.pane-rename-input') === document.activeElement;
+      if (!renameActive && (!textarea || document.activeElement !== textarea)) {
+        terminalRef.current?.focus();
+      }
+    } catch { /* terminal may be disposed */ }
+    // Ensure DEC focus reporting reaches the PTY even if xterm.js lost
+    // its internal focus-reporting state (e.g. after a pane split/resize).
+    // Without this, Copilot CLI stays in isFocused=false and drops input.
+    // Only inject when actually switching between two terminals — not on
+    // first focus (prevFocused=null) to avoid stray sequences.
+    // Guard: skip the manual injection when xterm's textarea already has
+    // DOM focus — in that case xterm.js sends the DEC sequence natively
+    // and a second one causes duplicate cursors (#41).
+    if (prevFocused && prevFocused !== terminalId) {
+      window.terminalAPI.writePty(prevFocused, '\x1b[O');
+      window.terminalAPI.diagLog('renderer:focus-inject-out', { terminalId: prevFocused });
+      const textarea = containerRef.current?.querySelector('textarea');
+      if (!textarea || document.activeElement !== textarea) {
+        requestAnimationFrame(() => {
+          window.terminalAPI.writePty(terminalId, '\x1b[I');
+          window.terminalAPI.diagLog('renderer:focus-inject-in', { terminalId });
+        });
+      }
+    }
+  }, [terminalId]);
+
+  useEffect(() => {
+    if (!containerRef.current) return;
+
+    const themeConfig = config?.theme;
+    const termConfig = config?.terminal;
+
+    const rawBg = themeConfig?.background ?? '#1e1e2e';
+    const materialActive = (config as AppConfig)?.backgroundMaterial && (config as AppConfig).backgroundMaterial !== 'none';
+    const bgOpacity = materialActive ? ((config as AppConfig)?.backgroundOpacity ?? 0.8) : 1;
+    const bgColor = bgOpacity < 1 ? hexToTerminalRgba(rawBg, bgOpacity) : rawBg;
+    const term = new Terminal({
+      theme: themeConfig
+        ? {
+            background: bgColor,
+            foreground: themeConfig.foreground,
+            cursor: themeConfig.cursor,
+            selectionBackground: themeConfig.selectionBackground,
+          }
+        : {
+            background: bgColor,
+            foreground: '#cdd6f4',
+            cursor: '#f5e0dc',
+            selectionBackground: '#585b70',
+          },
+      fontSize: termConfig?.fontSize ?? 14,
+      fontFamily: termConfig?.fontFamily ?? "'Cascadia Code', 'Consolas', monospace",
+      scrollback: termConfig?.scrollback ?? 5000,
+      cursorStyle: termConfig?.cursorStyle ?? 'block',
+      cursorBlink: termConfig?.cursorBlink ?? true,
+      cursorInactiveStyle: 'none',
+      allowTransparency: bgOpacity < 1,
+      allowProposedApi: true,
+    });
+
+    const fitAddon = new FitAddon();
+    const searchAddon = new SearchAddon();
+    const serializeAddon = new SerializeAddon();
+
+    term.loadAddon(fitAddon);
+    term.loadAddon(searchAddon);
+    term.loadAddon(serializeAddon);
+
+    // TASK-58: xterm auto-registers an OscLinkProvider for OSC 8 hyperlinks
+    // emitted by tools like `gh auth login`. Two real-world bugs result:
+    //   (1) On click it falls through to xterm's defaultActivate, which calls
+    //       `confirm()` then `window.open()` (no URL) - in Electron our
+    //       setWindowOpenHandler denies that empty open AND our custom URL
+    //       provider's activate ALSO fires for the same visible text, so the
+    //       user sees a confirm dialog plus a stray double-fire.
+    //   (2) When a CLI emits an OSC 8 closer that the parser fails to honor,
+    //       the urlId attribute leaks across subsequent cells, so EVERY click
+    //       on any URL in that scrollback returns the original (e.g. SSO)
+    //       URI - clicks get hijacked to one URL.
+    // Our custom URL link provider below handles every visible URL uniformly,
+    // so the safe fix is to remove the built-in OscLinkProvider and let our
+    // provider be the single source of truth for URL clicks.
+    try {
+      const core = (term as unknown as { _core: { _linkProviderService?: { linkProviders?: unknown[]; _linkProviders?: unknown[] } } })._core;
+      const svc = core?._linkProviderService;
+      const arr = svc?.linkProviders || svc?._linkProviders;
+      if (Array.isArray(arr)) {
+        // OscLinkProvider is the only provider auto-registered by xterm's
+        // Terminal constructor (see node_modules/@xterm/xterm/.../Terminal.ts).
+        // Splice it out before we add our own providers.
+        arr.length = 0;
+      }
+    } catch {
+      // If xterm internals change shape, fail open - our custom provider still
+      // works, we just may see the OSC 8 issues again. A test guard below
+      // (task-58-url-real-click.spec.ts) catches that regression.
+    }
+
+    // Custom multi-line URL link provider (#62): xterm's built-in WebLinksAddon
+    // stops detecting wrapped URLs past a certain row count, so very long links
+    // (e.g. Outlook safelinks) only highlight their first row. We walk the
+    // buffer manually to reconstruct the full URL and emit a link range that
+    // spans every row the URL visually occupies.
+    //
+    // Two stitching modes:
+    //  - Soft wrap: xterm's `isWrapped` flag groups continuation rows. Each
+    //    row holds exactly `cols` cells, so reverse-mapping is just modulo.
+    //  - Hard newline (e.g. `gh auth login` formats its SSO URL with explicit
+    //    line breaks at ~88 cols): the wrapped flag is false but a URL still
+    //    visually continues. We append the next non-wrapped row when (a) the
+    //    current row ends in URL-safe characters with no trailing space and
+    //    (b) the next row starts with URL-safe characters with no leading
+    //    space. That heuristic is tight enough to avoid false-merging unrelated
+    //    adjacent text - regular prose has spaces or punctuation at line ends.
+    //
+    // Regex excludes whitespace/quotes/parens/angle-brackets at the ends, allows
+    // `|` and `%` inside (dev tools / URL-encoded chars). Mirrors the old
+    // WebLinksAddon regex.
+    const urlRegex = /(https?|HTTPS?):\/\/[^\s"'!*(){}\\\^<>`]*[^\s"':,.!?{}\\\^~\[\]`()<>]/g;
+    // Characters that can plausibly appear inside a URL split point. Anything
+    // outside this set means "this isn't a URL continuation". RFC-3986 ASCII
+    // chars + `|`, plus Unicode property classes for letters, numbers,
+    // marks (variation selectors like U+FE0F), and symbols (emoji). The
+    // ASCII-only original truncated URLs whose hard-newline seam landed on
+    // an emoji or its variation selector (TASK-65). The single-token guard
+    // on the next row keeps over-stitching risk minimal even with the
+    // broader char class.
+    const URL_BODY = /^[A-Za-z0-9%\-._~!$&'()*+,;=:@/?#\[\]|\p{L}\p{N}\p{M}\p{S}]+$/u;
+    term.registerLinkProvider({
+      provideLinks(bufferLineNumber, callback) {
+        const buf = term.buffer.active;
+        // buffer line indexing in provideLinks is 1-based.
+        const lineIdx0 = bufferLineNumber - 1;
+        if (lineIdx0 < 0 || lineIdx0 >= buf.length) { callback(undefined); return; }
+
+        // Walk back to the logical start of the soft-wrap chain.
+        let softStart = lineIdx0;
+        while (softStart > 0) {
+          const cur = buf.getLine(softStart);
+          if (!cur?.isWrapped) break;
+          softStart--;
+        }
+        // Walk forward while the next line is a wrap continuation.
+        let softEnd = softStart;
+        while (softEnd + 1 < buf.length) {
+          const next = buf.getLine(softEnd + 1);
+          if (!next?.isWrapped) break;
+          softEnd++;
+        }
+
+        const cols = term.cols;
+        // Each segment maps a buffer row to a slice of `logical`. We tag soft-
+        // vs hard-newlined because they're textualised differently:
+        //  - soft-wrapped middle rows are exactly cols-wide (no trim) so the
+        //    reverse offset->row math stays simple
+        //  - hard-newlined rows have padding spaces past their content, so we
+        //    trim those (otherwise the URL regex's anti-whitespace anchor
+        //    would clip the match at the first padding char)
+        interface Seg { rowIdx: number; text: string; logicalStart: number; soft: boolean; leadingWS: number }
+        const segs: Seg[] = [];
+        let logical = '';
+        for (let i = softStart; i <= softEnd; i++) {
+          const line = buf.getLine(i);
+          if (!line) continue;
+          // The trailing soft row also needs trim - it's the only one that
+          // may not be cols-wide.
+          const text = i < softEnd ? line.translateToString(false) : line.translateToString(true);
+          segs.push({ rowIdx: i, text, logicalStart: logical.length, soft: true, leadingWS: 0 });
+          logical += text;
+        }
+
+        // Hard-newline forward stitch: keep eating the next non-wrapped row
+        // as long as the boundary looks URL-shaped on both sides. Bounded to
+        // avoid runaway walks through a buffer full of URL-safe lines.
+        const MAX_HARD_NEWLINE = 8;
+        let stitchedFwd = 0;
+        while (stitchedFwd < MAX_HARD_NEWLINE && segs[segs.length - 1] && segs[segs.length - 1].rowIdx + 1 < buf.length) {
+          const lastSeg = segs[segs.length - 1];
+          const nextRow = lastSeg.rowIdx + 1;
+          const next = buf.getLine(nextRow);
+          if (!next || next.isWrapped) break;
+          // Seam check: no whitespace at end of logical, last char URL-safe.
+          if (/\s$/.test(logical)) break;
+          const lastCh = logical.charAt(logical.length - 1);
+          if (!URL_BODY.test(lastCh)) break;
+          const nextTextRaw = next.translateToString(true);
+          if (!nextTextRaw) break;
+          // Allow an indented continuation: gh and similar CLIs hard-wrap
+          // long URLs with the continuation indented under the start of the
+          // line. Trim leading whitespace + table-border chars (`|`, `│`)
+          // and remember the visual offset for the offset->col mapping. To
+          // avoid false-positives where an indented prose paragraph follows
+          // a URL ("    bar for more info"), require the meaningful payload
+          // to be a SINGLE non-whitespace, non-pipe token between optional
+          // table-noise borders. Markdown tables that wrap a long URL onto
+          // the next row would otherwise look like `|   |   4)   |` and the
+          // older /^(\s*)(\S+)\s*$/ check rejected them, leaving the URL
+          // truncated at the wrap point.
+          const wsMatch = nextTextRaw.match(/^([\s|│]*)([^\s|│]+)[\s|│]*$/);
+          if (!wsMatch) break;
+          const leadingWS = wsMatch[1].length;
+          const nextText = wsMatch[2];
+          if (!URL_BODY.test(nextText)) break;
+
+          segs.push({ rowIdx: nextRow, text: nextText, logicalStart: logical.length, soft: false, leadingWS });
+          logical += nextText;
+          stitchedFwd++;
+        }
+
+        // Hard-newline backward stitch: same heuristic, in reverse, so a
+        // continuation-row query can rebuild the full URL too.
+        let stitchedBack = 0;
+        while (stitchedBack < MAX_HARD_NEWLINE && segs[0] && segs[0].rowIdx > 0) {
+          const firstSeg = segs[0];
+          const prevRow = firstSeg.rowIdx - 1;
+          const prev = buf.getLine(prevRow);
+          if (!prev) break;
+          const prevText = prev.translateToString(true);
+          if (!prevText || /\s$/.test(prevText)) break;
+          const lastCh = prevText.charAt(prevText.length - 1);
+          if (!URL_BODY.test(lastCh)) break;
+          // Current first seg must start with a URL-safe token. Tolerate
+          // indented continuations: trim leading whitespace before checking
+          // the head token, and remember the indent on the seg we're
+          // potentially continuing FROM.
+          const wsMatch = firstSeg.text.match(/^(\s*)(\S.*)$/);
+          if (!wsMatch) break;
+          const trimmedFirst = wsMatch[2];
+          const tokMatch = trimmedFirst.match(/^(\S+)/);
+          if (!tokMatch || !URL_BODY.test(tokMatch[1])) break;
+          // If we trimmed the first seg's indent here, persist it so
+          // offsetToRowCol places the cursor at the correct visual col on
+          // the continuation row.
+          if (firstSeg.leadingWS === 0 && wsMatch[1].length > 0) {
+            firstSeg.text = trimmedFirst;
+            firstSeg.leadingWS = wsMatch[1].length;
+            // logical was built before the trim; fix it up.
+            logical = logical.slice(0, firstSeg.logicalStart) + trimmedFirst + logical.slice(firstSeg.logicalStart + wsMatch[1].length + trimmedFirst.length);
+            for (let s = 1; s < segs.length; s++) segs[s].logicalStart -= wsMatch[1].length;
+          }
+
+          // Prepend: shift everything's logicalStart by prevText.length.
+          for (const s of segs) s.logicalStart += prevText.length;
+          segs.unshift({ rowIdx: prevRow, text: prevText, logicalStart: 0, soft: false, leadingWS: 0 });
+          logical = prevText + logical;
+          stitchedBack++;
+        }
+
+        const links: Array<{
+          range: { start: { x: number; y: number }; end: { x: number; y: number } };
+          text: string;
+          activate: (e: MouseEvent, text: string) => void;
+          decorations?: { underline?: boolean; pointerCursor?: boolean };
+        }> = [];
+
+        // Find the segment that contains a given offset in `logical`. Returns
+        // (rowIdx, col) where col is 0-based within that visual row.
+        function offsetToRowCol(offset: number): { row: number; col: number } {
+          for (let s = segs.length - 1; s >= 0; s--) {
+            const seg = segs[s];
+            if (offset >= seg.logicalStart) {
+              const within = offset - seg.logicalStart;
+              // Soft-wrapped segments live on a cols-wide grid: an offset
+              // larger than `cols` rolls onto the soft-wrap continuation row.
+              // Hard-newlined segments are variable width and stay on their
+              // own row; we don't roll them. For hard-newlined segs that had
+              // their leading indent trimmed, shift the col back to the
+              // original visual position.
+              if (seg.soft && within >= cols) {
+                return { row: seg.rowIdx + Math.floor(within / cols), col: within % cols };
+              }
+              return { row: seg.rowIdx, col: within + seg.leadingWS };
+            }
+          }
+          return { row: segs[0]?.rowIdx ?? 0, col: 0 };
+        }
+
+        let m: RegExpExecArray | null;
+        urlRegex.lastIndex = 0;
+        while ((m = urlRegex.exec(logical)) !== null) {
+          const matchStart = m.index;
+          const matchEnd = m.index + m[0].length - 1;
+          const a = offsetToRowCol(matchStart);
+          const b = offsetToRowCol(matchEnd);
+          // Only emit if this link visually touches the row the linkifier
+          // asked about. Clip the link's range to JUST that row — emitting a
+          // multi-row range from every row the URL spans causes xterm to
+          // register one link per row, and a click on the wrapped underline
+          // would fire activate() once per row (== open the URL N times).
+          if (lineIdx0 < a.row || lineIdx0 > b.row) continue;
+
+          const startX = lineIdx0 === a.row ? a.col + 1 : 1;
+          const endX = lineIdx0 === b.row ? b.col + 1 : term.cols;
+
+          links.push({
+            range: {
+              start: { x: startX, y: lineIdx0 + 1 },
+              end: { x: endX, y: lineIdx0 + 1 },
+            },
+            text: m[0],
+            activate(_e, uri) {
+              // Diagnostic counter (kept for ongoing repro of TASK-104/106).
+              // Increments on every fire, even ones the dedupe drops, so
+              // users can tell from DevTools whether the handler is reaching
+              // us at all.
+              try {
+                (window as unknown as { __tmaxLinkActivates?: number }).__tmaxLinkActivates =
+                  ((window as unknown as { __tmaxLinkActivates?: number }).__tmaxLinkActivates || 0) + 1;
+              } catch { /* noop */ }
+
+              // Dedupe rapid duplicate fires of the same URL. xterm's
+              // linkifier sometimes invokes our activate multiple times
+              // for what is logically one click (observed: 5 fires per
+              // click on a wrapped URL). Without dedupe, Chromium's
+              // popup-block heuristic kicks in after the first window.open
+              // and silently swallows the rest, leaving the user with
+              // "first click works, second click does nothing" because
+              // the second click is actually click N+1 of a previous burst.
+              const win = window as unknown as { __tmaxLinkLast?: { uri: string; ts: number } };
+              const now = Date.now();
+              if (win.__tmaxLinkLast && win.__tmaxLinkLast.uri === uri && now - win.__tmaxLinkLast.ts < 500) {
+                return;
+              }
+              win.__tmaxLinkLast = { uri, ts: now };
+              window.open(uri, '_blank');
+            },
+            decorations: { underline: true, pointerCursor: true },
+          });
+        }
+
+        callback(links.length ? links : undefined);
+      },
+    });
+
+    // Link provider for .md file paths (TASK-107).
+    //
+    // Walks soft-wrap continuations like the URL provider above so a path that
+    // visually spans multiple rows (e.g. a long Windows path with spaces in
+    // `OneDrive - Microsoft` after the user shrinks the pane) reconstructs to
+    // its full logical form before the regex runs. Without this walk, xterm's
+    // per-row provideLinks call sees only a head row (no `.md`, no match) or
+    // only a tail row (matches as a bare filename - which then fails to open
+    // because the drive/folders are missing).
+    //
+    // TASK-132: Also stitches across hard newlines, since Ink-based TUIs
+    // (Claude Code, Copilot CLI) wrap paths at their content width without
+    // setting `isWrapped`. Same seam check the image-path provider uses:
+    // prev row last char must be path-body, next row first non-WS char must
+    // be path-body.
+    term.registerLinkProvider({
+      provideLinks(bufferLineNumber, callback) {
+        const buf = term.buffer.active;
+        const lineIdx0 = bufferLineNumber - 1;
+        if (lineIdx0 < 0 || lineIdx0 >= buf.length) { callback(undefined); return; }
+
+        let softStart = lineIdx0;
+        while (softStart > 0) {
+          const cur = buf.getLine(softStart);
+          if (!cur?.isWrapped) break;
+          softStart--;
+        }
+        let softEnd = softStart;
+        while (softEnd + 1 < buf.length) {
+          const next = buf.getLine(softEnd + 1);
+          if (!next?.isWrapped) break;
+          softEnd++;
+        }
+
+        const cols = term.cols;
+        // Soft-wrap segs are cols-wide (no trim) except the last; hard-stitched
+        // segs are variable-width (trimmed) and may have leading whitespace
+        // we stripped to keep the seam test honest.
+        interface Seg { rowIdx: number; logicalStart: number; soft: boolean; leadingWS: number }
+        const segs: Seg[] = [];
+        let logical = '';
+        for (let i = softStart; i <= softEnd; i++) {
+          const line = buf.getLine(i);
+          if (!line) continue;
+          // Middle rows are exactly `cols`-wide content (no trim) so the
+          // reverse offset->col math stays simple modulo. The trailing row
+          // is the only one that may not be cols-wide - trim it.
+          const text = i < softEnd ? line.translateToString(false) : line.translateToString(true);
+          segs.push({ rowIdx: i, logicalStart: logical.length, soft: true, leadingWS: 0 });
+          logical += text;
+        }
+
+        // TASK-132 hard-newline stitch (TUI rewrap, no isWrapped flag). Mirrors
+        // the image-path provider's seam logic: PATH_BODY on both sides, capped
+        // at 4 rows so a screen full of path-shaped tokens can't glue together.
+        const PATH_BODY = /[A-Za-z0-9._\-+~/\\]/;
+        const MAX_HARD_NEWLINE = 4;
+        // TASK-166: TASK-132/137 always inserts a seam space when the
+        // continuation row has leading whitespace, on the assumption that the
+        // WS is a wrap-eaten space from a path with embedded spaces. But Ink
+        // also leaves leading WS as pure layout indent (no eaten space), so
+        // for a no-space path like `.../files/reddit-...md` we end up with a
+        // phantom space (`.../fi les/...`) and fileRead 404s. Track each
+        // inserted seam offset so activate() can retry without them.
+        const seamSpaceOffsets: number[] = [];
+        let stitchedFwd = 0;
+        while (stitchedFwd < MAX_HARD_NEWLINE) {
+          const lastSeg = segs[segs.length - 1];
+          if (!lastSeg) break;
+          const nextRow = lastSeg.rowIdx + 1;
+          if (nextRow >= buf.length) break;
+          const next = buf.getLine(nextRow);
+          if (!next || next.isWrapped) break;
+          if (/\s$/.test(logical)) break;
+          const lastCh = logical.charAt(logical.length - 1);
+          if (!PATH_BODY.test(lastCh)) break;
+          const nextRaw = next.translateToString(true);
+          if (!nextRaw) break;
+          const wsMatch = nextRaw.match(/^(\s*)(\S+)/);
+          if (!wsMatch) break;
+          const headCh = wsMatch[2].charAt(0);
+          if (!PATH_BODY.test(headCh)) break;
+          const trimmed = nextRaw.replace(/^\s+/, '');
+          // TASK-132: paths with literal embedded spaces (e.g. `OneDrive -
+          // Microsoft\...`) survive the wrap iff Ink kept the space on the
+          // post-wrap side as leading whitespace. Restore one seam space so
+          // the stitched path keeps the on-disk spelling. We can't tell here
+          // whether the WS is a real eaten space or just layout indent, so
+          // record the seam and let activate() try both forms.
+          const seamSpace = wsMatch[1].length > 0 ? ' ' : '';
+          if (seamSpace) seamSpaceOffsets.push(logical.length);
+          segs.push({ rowIdx: nextRow, logicalStart: logical.length + seamSpace.length, soft: false, leadingWS: wsMatch[1].length - seamSpace.length });
+          logical += seamSpace + trimmed;
+          stitchedFwd++;
+        }
+        let stitchedBack = 0;
+        while (stitchedBack < MAX_HARD_NEWLINE) {
+          const firstSeg = segs[0];
+          if (!firstSeg) break;
+          const prevRow = firstSeg.rowIdx - 1;
+          if (prevRow < 0) break;
+          const prev = buf.getLine(prevRow);
+          if (!prev) break;
+          const prevText = prev.translateToString(true);
+          if (!prevText || /\s$/.test(prevText)) break;
+          const lastCh = prevText.charAt(prevText.length - 1);
+          if (!PATH_BODY.test(lastCh)) break;
+          const wsHead = logical.match(/^\s+/);
+          const wsLen = wsHead ? wsHead[0].length : 0;
+          const headOfCur = logical.slice(wsLen).charAt(0);
+          if (!PATH_BODY.test(headOfCur)) break;
+          // TASK-137: mirror the forward-stitch seam handling. When segs[0]'s
+          // row begins with leading whitespace, that WS is the wrap-eaten
+          // seam space (Ink keeps it as leading WS on the post-wrap row).
+          // Drop it from `logical` and restore exactly one space so paths
+          // with embedded literal spaces (`OneDrive - Microsoft\...`) keep
+          // their on-disk spelling - otherwise we'd glue prev's tail to the
+          // post-wrap head and produce `OneDrive -  Microsoft\...` (double
+          // space) or `OneDrive -Microsoft\...` (no space), and fileRead
+          // 404s either way.
+          const seamSpace = wsLen > 0 ? ' ' : '';
+          if (wsLen > 0) {
+            logical = logical.slice(wsLen);
+            // segs[0]'s logical content shrunk by wsLen but the row's visible
+            // WS is unchanged - restore the offset-to-col map via leadingWS.
+            // Other segs shift left in `logical` by wsLen.
+            firstSeg.leadingWS += wsLen;
+            for (let i = 1; i < segs.length; i++) segs[i].logicalStart -= wsLen;
+            // Existing forward-stitch seam offsets shifted too.
+            for (let i = 0; i < seamSpaceOffsets.length; i++) seamSpaceOffsets[i] -= wsLen;
+          }
+          const shift = prevText.length + seamSpace.length;
+          for (const s of segs) s.logicalStart += shift;
+          for (let i = 0; i < seamSpaceOffsets.length; i++) seamSpaceOffsets[i] += shift;
+          // The newly prepended seam space (if any) sits right after prevText.
+          if (seamSpace) seamSpaceOffsets.push(prevText.length);
+          segs.unshift({ rowIdx: prevRow, logicalStart: 0, soft: false, leadingWS: 0 });
+          logical = prevText + seamSpace + logical;
+          stitchedBack++;
+        }
+
+        function offsetToRowCol(offset: number): { row: number; col: number } {
+          for (let s = segs.length - 1; s >= 0; s--) {
+            const seg = segs[s];
+            if (offset >= seg.logicalStart) {
+              const within = offset - seg.logicalStart;
+              if (seg.soft && within >= cols) {
+                return { row: seg.rowIdx + Math.floor(within / cols), col: within % cols };
+              }
+              return { row: seg.rowIdx, col: within + seg.leadingWS };
+            }
+          }
+          return { row: segs[0]?.rowIdx ?? 0, col: 0 };
+        }
+
+        const mdRegex = new RegExp(MD_PATH_PATTERN, 'gi');
+        const links: Array<{
+          range: { start: { x: number; y: number }; end: { x: number; y: number } };
+          text: string;
+          activate: (e: MouseEvent, text: string) => void;
+          tooltip: string;
+          decorations?: { underline?: boolean; pointerCursor?: boolean };
+        }> = [];
+        let match: RegExpExecArray | null;
+        while ((match = mdRegex.exec(logical)) !== null) {
+          const matchedPath = match[0];
+          const a = offsetToRowCol(match.index);
+          const b = offsetToRowCol(match.index + matchedPath.length - 1);
+          // Only emit if this link visually touches the queried row. Clip the
+          // x range to that row (matches the URL provider's per-row clipping
+          // - emitting a multi-row range causes xterm to fire activate once
+          // per row).
+          if (lineIdx0 < a.row || lineIdx0 > b.row) continue;
+          const startX = lineIdx0 === a.row ? a.col + 1 : 1;
+          const endX = lineIdx0 === b.row ? b.col + 1 : term.cols;
+
+          // TASK-166: build the seam-stripped variant for this match so
+          // activate() can fall back when the seam-space heuristic added a
+          // phantom space inside a no-space path (Ink's layout indent gets
+          // misread as a wrap-eaten space). Offsets are relative to the path.
+          const matchStart = match.index;
+          const matchEnd = match.index + matchedPath.length;
+          const seamsInPath = seamSpaceOffsets
+            .filter((o) => o >= matchStart && o < matchEnd)
+            .map((o) => o - matchStart)
+            .sort((x, y) => y - x); // descending so splices don't shift
+          let strippedPath = matchedPath;
+          for (const o of seamsInPath) {
+            strippedPath = strippedPath.slice(0, o) + strippedPath.slice(o + 1);
+          }
+
+          links.push({
+            range: {
+              start: { x: startX, y: bufferLineNumber },
+              end: { x: endX, y: bufferLineNumber },
+            },
+            text: matchedPath,
+            tooltip: `Click to preview: ${matchedPath}`,
+            activate() {
+              const termInst = useTerminalStore.getState().terminals.get(terminalId);
+              const cwd = termInst?.cwd || '';
+              const resolve = (p: string) => {
+                if (!/^[a-zA-Z]:/.test(p) && !p.startsWith('/') && !p.startsWith('~')) {
+                  const sep = cwd.includes('\\') ? '\\' : '/';
+                  return cwd + sep + p;
+                }
+                return p;
+              };
+              const primary = resolve(matchedPath);
+              const fallback = strippedPath !== matchedPath ? resolve(strippedPath) : null;
+              const tryRead = (p: string): Promise<{ path: string; content: string } | null> =>
+                (window.terminalAPI as any).fileRead(p).then((c: string | null) =>
+                  c === null ? null : { path: p, content: c },
+                );
+              tryRead(primary)
+                .then((res) => (res ? res : fallback ? tryRead(fallback) : null))
+                .then((res) => {
+                  if (!res) {
+                    // eslint-disable-next-line no-console
+                    console.warn('[md-link] fileRead returned null', { primary, fallback });
+                    return;
+                  }
+                  const fileName = res.path.split(/[/\\]/).pop() || res.path;
+                  useTerminalStore.setState({ markdownPreview: { filePath: res.path, content: res.content, fileName } });
+                })
+                .catch((err: unknown) => {
+                  // eslint-disable-next-line no-console
+                  console.error('[md-link] fileRead threw', { primary, fallback, err });
+                });
+            },
+            decorations: { underline: true, pointerCursor: true },
+          });
+        }
+        callback(links.length > 0 ? links : undefined);
+      },
+    });
+
+    // TASK-70: link provider for image paths - click opens an in-tmax
+    // preview overlay (same one the .md provider uses), not the OS default
+    // viewer. The overlay has an "open externally" button if the user wants
+    // the OS viewer. URLs ending in an image extension still flow through
+    // the URL provider above (`:` is excluded from the path char class, so
+    // `https://...` does not match here).
+    //
+    // Soft-wrap stitching: when a long path wraps across multiple buffer
+    // rows on the prompt line (e.g. inside Copilot CLI's input box), each
+    // row alone fails the regex - the lead row has no `.png`, the wrap
+    // continuation has no path-shape head. We follow the same approach as
+    // the URL provider: walk back/forward through `isWrapped` rows, build
+    // a logical string, run the regex on that, then clip per-row ranges.
+    term.registerLinkProvider({
+      provideLinks(bufferLineNumber, callback) {
+        const buf = term.buffer.active;
+        const lineIdx0 = bufferLineNumber - 1;
+        if (lineIdx0 < 0 || lineIdx0 >= buf.length) { callback(undefined); return; }
+
+        // TASK-224: this provider call recomputes the link state for this row,
+        // so drop any previously-recorded direct-click hits for it (the buffer
+        // row may have been reused for different content as scrollback shifts).
+        // Keep the map small by also evicting once it grows large.
+        imgLinkHitsRef.current.rows.delete(lineIdx0);
+        if (imgLinkHitsRef.current.rows.size > 200) imgLinkHitsRef.current.rows.clear();
+
+        let softStart = lineIdx0;
+        while (softStart > 0) {
+          const cur = buf.getLine(softStart);
+          if (!cur?.isWrapped) break;
+          softStart--;
+        }
+        let softEnd = softStart;
+        while (softEnd + 1 < buf.length) {
+          const next = buf.getLine(softEnd + 1);
+          if (!next?.isWrapped) break;
+          softEnd++;
+        }
+
+        const cols = term.cols;
+        // Soft-wrap segs are cols-wide (no trim) except the last; hard-stitched
+        // segs are variable-width (trimmed) and may have leading whitespace
+        // we stripped to avoid breaking the seam test.
+        interface Seg { rowIdx: number; logicalStart: number; soft: boolean; leadingWS: number }
+        const segs: Seg[] = [];
+        let logical = '';
+        for (let i = softStart; i <= softEnd; i++) {
+          const line = buf.getLine(i);
+          if (!line) continue;
+          const text = i < softEnd ? line.translateToString(false) : line.translateToString(true);
+          segs.push({ rowIdx: i, logicalStart: logical.length, soft: true, leadingWS: 0 });
+          logical += text;
+        }
+
+        // Hard-newline stitching for TUIs (Claude Code's input box) that
+        // re-wrap their content row-by-row without setting `isWrapped`.
+        // Conservative seam: prev row must end with a path-body char and
+        // next row's first non-whitespace token must also be path-body.
+        // Capped at 4 rows so a screen full of path-shaped tokens can't
+        // glue into one giant fake match.
+        const PATH_BODY = /[A-Za-z0-9._\-+~/\\]/;
+        const MAX_HARD_NEWLINE = 4;
+        let stitchedFwd = 0;
+        while (stitchedFwd < MAX_HARD_NEWLINE) {
+          const lastSeg = segs[segs.length - 1];
+          if (!lastSeg) break;
+          const nextRow = lastSeg.rowIdx + 1;
+          if (nextRow >= buf.length) break;
+          const next = buf.getLine(nextRow);
+          if (!next || next.isWrapped) break;
+          if (/\s$/.test(logical)) break;
+          const lastCh = logical.charAt(logical.length - 1);
+          if (!PATH_BODY.test(lastCh)) break;
+          const nextRaw = next.translateToString(true);
+          if (!nextRaw) break;
+          const wsMatch = nextRaw.match(/^(\s*)(\S+)/);
+          if (!wsMatch) break;
+          const headCh = wsMatch[2].charAt(0);
+          if (!PATH_BODY.test(headCh)) break;
+          const trimmed = nextRaw.replace(/^\s+/, '');
+          segs.push({ rowIdx: nextRow, logicalStart: logical.length, soft: false, leadingWS: wsMatch[1].length });
+          logical += trimmed;
+          stitchedFwd++;
+        }
+        let stitchedBack = 0;
+        while (stitchedBack < MAX_HARD_NEWLINE) {
+          const firstSeg = segs[0];
+          if (!firstSeg) break;
+          const prevRow = firstSeg.rowIdx - 1;
+          if (prevRow < 0) break;
+          const prev = buf.getLine(prevRow);
+          if (!prev) break;
+          const prevText = prev.translateToString(true);
+          if (!prevText || /\s$/.test(prevText)) break;
+          const lastCh = prevText.charAt(prevText.length - 1);
+          if (!PATH_BODY.test(lastCh)) break;
+          const headOfCur = logical.replace(/^\s+/, '').charAt(0);
+          if (!PATH_BODY.test(headOfCur)) break;
+          for (const s of segs) s.logicalStart += prevText.length;
+          segs.unshift({ rowIdx: prevRow, logicalStart: 0, soft: false, leadingWS: 0 });
+          logical = prevText + logical;
+          stitchedBack++;
+        }
+
+        function offsetToRowCol(offset: number): { row: number; col: number } {
+          for (let s = segs.length - 1; s >= 0; s--) {
+            const seg = segs[s];
+            if (offset >= seg.logicalStart) {
+              const within = offset - seg.logicalStart;
+              if (seg.soft && within >= cols) return { row: seg.rowIdx + Math.floor(within / cols), col: within % cols };
+              return { row: seg.rowIdx, col: within + seg.leadingWS };
+            }
+          }
+          return { row: segs[0]?.rowIdx ?? 0, col: 0 };
+        }
+
+        // Body char class also excludes `[]()` so paths wrapped in brackets
+        // by a TUI (Copilot CLI displays pasted paths as `[C:\...png]`) are
+        // matched WITHOUT the bracket - otherwise the leading `[` makes the
+        // drive-letter check fail and the path resolves cwd-relative.
+        const imgPathRegex = /(?:[a-zA-Z]:[\\/]|[\/~.])?[^\s"'`<>|:*?\[\]()]*\.(?:png|jpg|jpeg|gif|bmp|webp)\b/gi;
+        const links: Array<{ range: { start: { x: number; y: number }; end: { x: number; y: number } }; text: string; activate: () => void; tooltip: string }> = [];
+        let match: RegExpExecArray | null;
+        imgPathRegex.lastIndex = 0;
+        while ((match = imgPathRegex.exec(logical)) !== null) {
+          const matchStart = match.index;
+          const matchEnd = match.index + match[0].length - 1;
+          const a = offsetToRowCol(matchStart);
+          const b = offsetToRowCol(matchEnd);
+          // Only emit a link for the row xterm is asking about, clipped to
+          // that row. Same anti-double-fire pattern as the URL provider.
+          if (lineIdx0 < a.row || lineIdx0 > b.row) continue;
+          const startX = lineIdx0 === a.row ? a.col + 1 : 1;
+          const endX = lineIdx0 === b.row ? b.col + 1 : cols;
+          const matchedPath = match[0];
+          // Resolve + open the preview. Shared by xterm's link activate() and
+          // the direct single-click handler (TASK-224) so both paths behave
+          // identically. Marked guarded so a click xterm already handled and
+          // our own fallback don't both open the preview (see dedupe below).
+          const openPreview = () => {
+            // Dedupe: a single user click can reach here twice - once from our
+            // direct mouseup handler (capture phase, fires first) and once from
+            // xterm's own link activate() (bubble phase). Whichever fires first
+            // wins; the second within 400ms is dropped so we don't open twice.
+            const now = Date.now();
+            if (now - imgLinkHitsRef.current.lastActivateAt < 400) return;
+            imgLinkHitsRef.current.lastActivateAt = now;
+            const open = (fullPath: string) => {
+              const fileName = fullPath.split(/[/\\]/).pop() || fullPath;
+              useTerminalStore.setState({
+                markdownPreview: { filePath: fullPath, content: '', fileName, kind: 'image' },
+              });
+            };
+            const isAbsolute = /^[a-zA-Z]:/.test(matchedPath) || matchedPath.startsWith('/') || matchedPath.startsWith('~');
+            const isBareName = !matchedPath.includes('/') && !matchedPath.includes('\\');
+            const cwdRelative = (): string => {
+              const termInst = useTerminalStore.getState().terminals.get(terminalId);
+              const cwd = termInst?.cwd || '';
+              const sep = cwd.includes('\\') ? '\\' : '/';
+              return cwd + sep + matchedPath;
+            };
+            if (isAbsolute) { open(matchedPath); return; }
+            // Copilot CLI shows pasted clipboard images as `[basename.png]`
+            // (directory hidden). Probe tmax's clipboard dir for the file
+            // before falling back to cwd-relative resolution.
+            if (isBareName) {
+              const api = window.terminalAPI as unknown as { resolveClipboardImageBasename?: (b: string) => Promise<string | null> };
+              if (api.resolveClipboardImageBasename) {
+                api.resolveClipboardImageBasename(matchedPath)
+                  .then((resolved) => open(resolved || cwdRelative()))
+                  .catch(() => open(cwdRelative()));
+                return;
+              }
+            }
+            open(cwdRelative());
+          };
+
+          // Record this hit for the direct-click fallback, keyed by absolute
+          // buffer row (provideLinks' bufferLineNumber is 1-based over the
+          // whole buffer, matching what pixelToCell returns as `.row`).
+          const absRow = lineIdx0;
+          let rowHits = imgLinkHitsRef.current.rows.get(absRow);
+          if (!rowHits) { rowHits = []; imgLinkHitsRef.current.rows.set(absRow, rowHits); }
+          // Avoid unbounded growth: replace any prior hit with the same span.
+          if (!rowHits.some((h) => h.startX === startX && h.endX === endX)) {
+            rowHits.push({ startX, endX, activate: openPreview });
+          }
+
+          links.push({
+            range: {
+              start: { x: startX, y: bufferLineNumber },
+              end: { x: endX, y: bufferLineNumber },
+            },
+            text: matchedPath,
+            tooltip: `Click to preview: ${matchedPath}`,
+            activate() { openPreview(); },
+          });
+        }
+        callback(links.length > 0 ? links : undefined);
+      },
+    });
+
+    searchAddonRef.current = searchAddon;
+    registerTerminal(terminalId, term, searchAddon, (value: boolean) => {
+      cursorHideSignalsRef.current.bracketedPaste = value;
+    });
+
+    searchAddon.onDidChangeResults((e) => {
+      if (e) {
+        setSearchResult({ resultIndex: e.resultIndex, resultCount: e.resultCount });
+      } else {
+        setSearchResult(null);
+      }
+    });
+
+    // Keyboard shortcuts handled inside terminal
+    term.attachCustomKeyEventHandler((event) => {
+      if (event.type !== 'keydown') return true;
+      // Record genuine user typing (keydown only) for the focus-thrash guard.
+      lastRealKeyAtRef.current = Date.now();
+      // Ctrl+Shift+` (Cmd+Shift+` on Mac): toggle diagnostics overlay
+      if ((isMac ? event.metaKey : event.ctrlKey) && event.shiftKey && event.key === '`') {
+        setShowDiag((v) => !v);
+        return false;
+      }
+      // Ctrl+F (Cmd+F on Mac): open search
+      if ((isMac ? event.metaKey : event.ctrlKey) && !event.shiftKey && isLetterShortcut(event, 'f')) {
+        setShowSearch(true);
+        requestAnimationFrame(() => searchInputRef.current?.focus());
+        return false;
+      }
+      // Ctrl+V / Cmd+V or Ctrl+Shift+V: paste
+      if ((event.ctrlKey || event.metaKey) && isLetterShortcut(event, 'v')) {
+        event.preventDefault(); // Stop browser native paste (would cause double paste)
+        // tmax.net: the WebView clipboard is async-only outside paste events.
+        void window.terminalAPI.clipboardSnapshot().then((snapshot) => {
+          const decision = resolveClipboardPaste(snapshot);
+          if (decision.kind === 'image') {
+            window.terminalAPI.clipboardSaveImage().then((filePath) => {
+              window.terminalAPI.writePty(terminalId, filePath);
+            });
+          } else if (decision.kind === 'text') {
+            const payload = prepareClipboardPaste(decision.text, cursorHideSignalsRef.current.bracketedPaste);
+            window.terminalAPI.writePty(terminalId, payload);
+          }
+        });
+        return false;
+      }
+      // Ctrl+C (Cmd+C on Mac): copy instead of SIGINT when there's something to
+      // copy. Two sources: a native xterm selection, or - in a mouse-reporting
+      // pane (Claude Code / TUI) where drag makes no native selection - the
+      // dragged-text snapshot (TASK-261). With neither, fall through to ^C.
+      if ((isMac ? event.metaKey : event.ctrlKey) && !event.shiftKey && isLetterShortcut(event, 'c')) {
+        if (term.hasSelection()) {
+          event.preventDefault();
+          event.stopPropagation();
+          event.stopImmediatePropagation();
+          const raw = term.getSelection();
+          const text = smartUnwrapForCopy(raw, smartUnwrapRef.current);
+          copyTextFromKeydown = text;
+          window.terminalAPI.clipboardWrite(text);
+          useTerminalStore.getState().addToast('Copied to clipboard');
+          // Write again after a tick in case the browser's copy mechanism
+          // fires and overwrites our clipboard.writeText with empty/stale data.
+          const savedText = text;
+          setTimeout(() => {
+            window.terminalAPI.clipboardWrite(savedText);
+            try { term.clearSelection(); } catch {}
+          }, 10);
+          return false;
+        }
+        const snapshot = pendingTuiCopyRef.current;
+        if (snapshot) {
+          const text = smartUnwrapForCopy(snapshot, smartUnwrapRef.current);
+          pendingTuiCopyRef.current = null;
+          if (text.trim()) {
+            event.preventDefault();
+            event.stopPropagation();
+            event.stopImmediatePropagation();
+            copyTextFromKeydown = text;
+            window.terminalAPI.clipboardWrite(text);
+            useTerminalStore.getState().addToast('Copied to clipboard');
+            const savedText = text;
+            setTimeout(() => { window.terminalAPI.clipboardWrite(savedText); }, 10);
+            return false;
+          }
+        }
+        // Nothing to copy: let Ctrl+C fall through to ^C/SIGINT.
+      }
+      // Plain Enter with an active selection: copy and clear selection instead
+      // of submitting (Windows Terminal "Quick Edit" / cmd.exe convention, #71).
+      // Only plain Enter - Ctrl/Shift/Alt+Enter still pass through so apps that
+      // use modified Enter (Claude Code's Shift+Enter newline, etc.) aren't affected.
+      const isPlainEnterKey = (event.key === 'Enter' || event.code === 'Enter' || event.code === 'NumpadEnter')
+        && !event.ctrlKey && !event.shiftKey && !event.altKey && !event.metaKey;
+      if (isPlainEnterKey && term.hasSelection()) {
+        event.preventDefault(); // Stop xterm's textarea from seeing the newline and echoing CR
+        window.terminalAPI.clipboardWrite(smartUnwrapForCopy(term.getSelection(), smartUnwrapRef.current));
+        useTerminalStore.getState().addToast('Copied to clipboard');
+        setTimeout(() => { try { term.clearSelection(); } catch {} }, 0);
+        return false;
+      }
+      // Ctrl+Shift+C (Cmd+Shift+C on Mac): always copy selection. Falls back to
+      // the mouse-reporting drag snapshot (TASK-261) when there's no native
+      // xterm selection, same as plain Ctrl+C above.
+      if ((isMac ? event.metaKey : event.ctrlKey) && event.shiftKey && isLetterShortcut(event, 'c')) {
+        const sel = term.hasSelection() ? term.getSelection() : pendingTuiCopyRef.current;
+        if (sel) {
+          const text = smartUnwrapForCopy(sel, smartUnwrapRef.current);
+          pendingTuiCopyRef.current = null;
+          if (text.trim()) {
+            event.preventDefault(); // see comment in plain Ctrl+C above
+            window.terminalAPI.clipboardWrite(text);
+            useTerminalStore.getState().addToast('Copied to clipboard');
+          }
+        }
+        return false;
+      }
+      // Ctrl+Arrow: send win32-input-mode key events so CMD and other shells
+      // that don't understand VT sequences can handle word navigation (#19)
+      // Format: CSI Vk;Sc;Uc;Kd;Cs;Rc _
+      if (event.ctrlKey && !event.altKey) {
+        const arrowMap: Record<string, [number, number]> = {
+          'ArrowLeft': [37, 75], 'ArrowRight': [39, 77],
+          'ArrowUp': [38, 72], 'ArrowDown': [40, 80],
+        };
+        const arrow = arrowMap[event.key];
+        if (arrow) {
+          const cs = 8 | (event.shiftKey ? 16 : 0); // LEFT_CTRL + optional SHIFT
+          window.terminalAPI.writePty(terminalId, `\x1b[${arrow[0]};${arrow[1]};0;1;${cs};1_`);
+          return false;
+        }
+      }
+      // Shift+Enter: send ESC+CR which Claude Code's and Copilot CLI's Ink-based
+      // input parsers interpret as Meta+Enter (a.k.a. Alt+Enter) → insert newline
+      // in the multi-line input box instead of submitting (#68). Verified against
+      // Claude Code's bundled input parser, which sets `meta=true` when the raw
+      // sequence starts with ESC. This is also what VS Code's terminal sends for
+      // Shift+Enter via its `workbench.action.terminal.sendSequence` keybinding.
+      // Earlier attempts with CSI-u (\x1b[13;2u), plain LF, and win32-input-mode
+      // did not work reliably against either CLI.
+      const isShiftEnterOnly = (event.key === 'Enter' || event.code === 'Enter' || event.code === 'NumpadEnter')
+        && event.shiftKey && !event.ctrlKey && !event.altKey && !event.metaKey;
+      if (isShiftEnterOnly) {
+        event.preventDefault();
+        window.terminalAPI.writePty(terminalId, '\x1b\r');
+        return false;
+      }
+      return true;
+    });
+
+    term.open(containerRef.current);
+
+    // GH #145: recover from GPU context loss (AMD/Win11 blank-canvas glitch).
+    // When the WebGL/canvas context is lost, the terminal goes white while
+    // data keeps flowing. Detect it and force a full remount via refreshTerminal.
+    const canvasEl = containerRef.current.querySelector('canvas');
+    const handleContextLost = (e: Event) => {
+      e.preventDefault(); // allow context restore
+      console.warn('[tmax] GPU context lost for terminal', terminalId, '— scheduling repaint');
+      // Give the GPU a moment to recover, then force a full terminal refresh
+      setTimeout(() => {
+        try {
+          if (terminalRef.current) {
+            terminalRef.current.refresh(0, terminalRef.current.rows - 1);
+          }
+        } catch { /* disposed */ }
+      }, 500);
+    };
+    canvasEl?.addEventListener('webglcontextlost', handleContextLost);
+    canvasEl?.addEventListener('contextlost', handleContextLost);
+
+    // TASK-160: track scroll-away state for the floating jump-to-bottom
+    // arrow. xterm's onScroll alone proved unreliable in some build paths
+    // (scrollbar drag didn't fire it on this user's machine), so we also
+    // hook a DOM scroll listener on .xterm-viewport and a slow rAF poll.
+    // React's setState bails when the value doesn't change, so multiple
+    // signals don't cause extra renders.
+    const computeScrolledAway = () => {
+      try {
+        const buf = term.buffer.active;
+        // Alt-screen has no scrollback — you can't be "scrolled away" from a
+        // live prompt that doesn't exist, so hide the jump-to-bottom arrow.
+        if (buf.type !== 'normal') return false;
+        if (buf.viewportY < buf.baseY) return true;
+        const vp = containerRef.current?.querySelector('.xterm-viewport') as HTMLElement | null;
+        if (vp && vp.scrollHeight - vp.clientHeight - vp.scrollTop > 2) return true;
+        return false;
+      } catch { return false; }
+    };
+    const updateScrolledAway = () => setIsScrolledAway(computeScrolledAway());
+    const scrollDisposable = term.onScroll(updateScrolledAway);
+    const viewportScrollEl = containerRef.current?.querySelector('.xterm-viewport') as HTMLElement | null;
+    viewportScrollEl?.addEventListener('scroll', updateScrolledAway, { passive: true });
+    // Slow poll catches anything the two listeners missed (e.g. programmatic
+    // scrolls from other handlers in this file that don't re-trigger events).
+    const scrollPollTimer = setInterval(updateScrolledAway, 750);
+
+    // TASK-180: make dragging the scrollbar actually scroll the buffer.
+    // Wheel is intercepted directly via scrollLines() (see the custom wheel
+    // handler below), but scrollbar drag relies on xterm's internal
+    // Viewport scroll->buffer sync, which proved unreliable here - wheel
+    // scrolls while the scrollbar thumb is dead. We map the scrolled
+    // scrollTop back to a buffer line and move xterm's ydisp to match.
+    //
+    // This runs on every scroll event, but it's a no-op for programmatic /
+    // streaming scrolls: after any buffer scroll xterm sets
+    // scrollTop = viewportY * cellHeight, so targetLine === viewportY and we
+    // skip the scrollToLine call. (An earlier attempt gated this on a
+    // mousedown in the scrollbar gutter, but native scrollbar clicks don't
+    // fire mousedown on the element in Chromium, so the sync never ran.)
+    const syncBufferToScrollbar = () => {
+      try {
+        const vp = viewportScrollEl;
+        if (!vp) return;
+        // Alt-screen apps own the viewport and have no scrollback; mapping
+        // DOM scrollTop back to a buffer line would fight the app's own UI.
+        if (!isNormalBuffer(term)) return;
+        const cellHeight =
+          (term as unknown as { _core?: { _renderService?: { dimensions?: { css?: { cell?: { height?: number } } } } } })
+            ._core?._renderService?.dimensions?.css?.cell?.height || 0;
+        if (cellHeight <= 0) return;
+        const buf = term.buffer.active;
+        const targetLine = Math.max(0, Math.min(buf.baseY, Math.round(vp.scrollTop / cellHeight)));
+        if (targetLine !== buf.viewportY) term.scrollToLine(targetLine);
+      } catch { /* term disposed or viewport not ready */ }
+    };
+    viewportScrollEl?.addEventListener('scroll', syncBufferToScrollbar, { passive: true });
+
+    // Hide xterm's helper textarea from UI Automation as strongly as we can
+    // without breaking keyboard input. Windows Voice Access and other UIA-based
+    // dictation tools discover the textarea, treat it as a real text field,
+    // and split a single utterance across multiple IME compositions whose
+    // chunks reach the PTY out of order (see TASK-53: dictating
+    // "I'm testing this again" + "Testing speech." produced the spliced
+    // string "I'm teTesting speech.ing this again."). The data-corruption
+    // ordering is decided by Voice Access *before* xterm sees it, so no
+    // amount of textarea-state reset on our side fixes it - the only reliable
+    // mitigation is to convince Voice Access to ignore the field entirely.
+    // Windows Terminal achieves this by not exposing a UIA text field at all;
+    // we layer every standard-DOM hide we have so Voice Access skips us and
+    // dictation falls back to OS keystroke injection (or the user uses Win+H,
+    // which routes through TSF and types straight into the prompt).
+    try {
+      const helperTextarea = containerRef.current.querySelector('textarea') as HTMLTextAreaElement | null;
+      if (helperTextarea) {
+        helperTextarea.setAttribute('aria-hidden', 'true');
+        helperTextarea.setAttribute('role', 'presentation');
+        // tabindex=-1 keeps programmatic focus working (xterm calls
+        // textarea.focus()) but removes the textarea from sequential focus
+        // navigation, which is one of the cues UIA-based dictation tools use
+        // to decide a control is a "real" input target.
+        helperTextarea.setAttribute('tabindex', '-1');
+        // Override xterm's aria-label ("Terminal input"). A blank label plus
+        // role=presentation makes the field look like a styling helper
+        // rather than a labelled input.
+        helperTextarea.setAttribute('aria-label', '');
+        // aria-readonly=true tells UIA TextPattern this field doesn't accept
+        // text input via the Insert pattern. Voice Access uses this to skip
+        // read-only fields. Real keyboard typing is unaffected (browsers don't
+        // honour aria-readonly for actual input gating).
+        helperTextarea.setAttribute('aria-readonly', 'true');
+      }
+      // Also hide the parent xterm-helpers container - some accessibility
+      // walkers stop at an aria-hidden ancestor.
+      const helperContainer = containerRef.current.querySelector('.xterm-helpers');
+      if (helperContainer) {
+        helperContainer.setAttribute('aria-hidden', 'true');
+      }
+    } catch { /* xterm internals changed; non-fatal */ }
+
+    // Diagnostic logging for STT/dictation drift (TASK-53). Captures every
+    // input/composition event that reaches the helper textarea so we can
+    // see exactly what Voice Access (or any other dictation engine) feeds
+    // us. Gated by the existing diag logger; logs are line-rate-limited
+    // per terminal, so dictating a sentence won't flood the file.
+    try {
+      const hta = containerRef.current.querySelector('textarea') as HTMLTextAreaElement | null;
+      if (hta) {
+        const snap = (label: string, ev?: Event) => {
+          const e = ev as InputEvent | CompositionEvent | undefined;
+          window.terminalAPI.diagLog(`renderer:textarea:${label}`, {
+            terminalId,
+            valueLen: hta.value.length,
+            valueTail: hta.value.slice(-32),
+            selStart: hta.selectionStart,
+            selEnd: hta.selectionEnd,
+            inputType: (e as InputEvent)?.inputType,
+            data: (e as InputEvent | CompositionEvent)?.data,
+            isComposing: (e as InputEvent)?.isComposing,
+          });
+        };
+        const onComposStart = (ev: Event) => snap('compositionstart', ev);
+        const onComposUpdate = (ev: Event) => snap('compositionupdate', ev);
+        const onComposEnd = (ev: Event) => snap('compositionend', ev);
+        const onBeforeInput = (ev: Event) => snap('beforeinput', ev);
+        const onInput = (ev: Event) => snap('input', ev);
+        hta.addEventListener('compositionstart', onComposStart, true);
+        hta.addEventListener('compositionupdate', onComposUpdate, true);
+        hta.addEventListener('compositionend', onComposEnd, true);
+        hta.addEventListener('beforeinput', onBeforeInput, true);
+        hta.addEventListener('input', onInput, true);
+        textareaDiagCleanupRef.current = () => {
+          hta.removeEventListener('compositionstart', onComposStart, true);
+          hta.removeEventListener('compositionupdate', onComposUpdate, true);
+          hta.removeEventListener('compositionend', onComposEnd, true);
+          hta.removeEventListener('beforeinput', onBeforeInput, true);
+          hta.removeEventListener('input', onInput, true);
+        };
+      }
+    } catch { /* non-fatal */ }
+
+    terminalRef.current = term;
+    fitAddonRef.current = fitAddon;
+    serializeAddonRef.current = serializeAddon;
+
+    // Restore buffer from a previous mount (e.g. after float↔dock move or
+    // grid rebuild). Write the serialized content before fitting so the
+    // buffer is populated at its original dimensions first.
+    const savedBuffer = popTerminalBuffer(terminalId);
+    if (savedBuffer) {
+      try {
+        term.resize(savedBuffer.cols, savedBuffer.rows);
+      } catch { /* container may constrain size */ }
+      term.write(savedBuffer.serialized);
+    }
+
+    // Initial fit
+    requestAnimationFrame(() => {
+      try {
+        fitAddon.fit();
+        syncViewportScrollArea(term);
+      } catch {
+        // Container may not be sized yet
+      }
+    });
+
+    // Pre-sync for "wheel-down stops short of the live prompt during a
+    // running session" (TASK-62). Two distinct failure modes feed the same
+    // symptom; this handler covers both:
+    //
+    // 1. Cache lag during streaming. xterm 5.5's Viewport caches buffer
+    //    length on a rAF-debounced refresh, so during continuous PTY
+    //    output `.xterm-viewport` scrollHeight lags the real buffer by a
+    //    frame. The browser clamps `scrollTop += deltaY` against the
+    //    stale scrollHeight. `syncViewportScrollArea` invalidates the
+    //    cache so xterm rebuilds the height before the wheel lands.
+    //
+    // 2. cellHeight mismatch at fractional DPR (the actually-reported
+    //    repro: bufLen and cachedBufLen agreed but ~10 rows of buffer
+    //    were still hidden below max scroll). xterm computes
+    //    `_scrollArea.style.height = round(rowHeight * bufLen) +
+    //    (viewportHeight - css.canvas.height)` in `_innerRefresh`, but
+    //    the canvas-vs-viewport offset can shave enough pixels off the
+    //    scroll area that the browser-clamped scrollTop max maps to a
+    //    ydisp short of `bufLen - rows`. xterm's `_handleScroll` uses
+    //    `_currentRowHeight` for the scrollTop→ydisp conversion, so we
+    //    align the scrollArea height to `bufLen * _currentRowHeight`
+    //    directly — same row height for both directions of the math
+    //    means max-scroll always lands at the live prompt.
+    const wheelPreSyncHandler = (e: WheelEvent) => {
+      if (e.deltaY === 0 || e.shiftKey) return;
+      // Alt-screen apps own their scroll; resyncing the (nonexistent)
+      // scrollback area just fights the app's own scrollbar.
+      if (!isNormalBuffer(term)) return;
+      try {
+        const v: any = (term as any)?._core?.viewport;
+        if (!v) return;
+        const bufLen = term.buffer.active.length;
+        // Cache-lag path: streaming PTY data grew the buffer past the
+        // recorded length. Triggering xterm's own resync rebuilds caches.
+        if (bufLen > v._lastRecordedBufferLength) {
+          syncViewportScrollArea(term);
+        }
+        // cellHeight-mismatch path: align scrollArea height to xterm's
+        // own `_currentRowHeight`. Only ENLARGE — never shrink — so we
+        // don't fight xterm's own bookkeeping when caches are healthy.
+        const rowH: number = v._currentRowHeight;
+        const scrollArea = v._scrollArea;
+        if (rowH > 0 && scrollArea && bufLen > 0) {
+          const targetH = Math.round(rowH * bufLen);
+          const currentH = parseFloat(scrollArea.style.height) || v._lastRecordedBufferHeight || 0;
+          if (targetH > currentH) {
+            scrollArea.style.height = targetH + 'px';
+            v._lastRecordedBufferHeight = targetH;
+          }
+        }
+      } catch { /* viewport may not be ready */ }
+    };
+    // Auto-recovery for the "wheel does nothing" failure mode. xterm's
+    // viewport scrollArea occasionally desyncs from the buffer (after pane
+    // moves, focus-mode toggles, etc.) so wheel events fire but the
+    // viewport's scrollTop never moves. Catch that here and re-sync; the
+    // next wheel will work.
+    const wheelRecoveryHandler = (e: WheelEvent) => {
+      // Only recover when there's a real direction the wheel SHOULD scroll
+      // but didn't — otherwise we'd thrash sync calls at scroll boundaries
+      // and on shift/horizontal wheels.
+      if (e.deltaY === 0 || e.shiftKey) return;
+      // In alt-screen there's no scrollback to recover into; a wheel that
+      // "does nothing" is the expected behavior, so don't resync.
+      if (!isNormalBuffer(term)) return;
+      const viewport = containerRef.current?.querySelector('.xterm-viewport') as HTMLElement | null;
+      if (!viewport) return;
+      const before = viewport.scrollTop;
+      const canScrollUp = before > 0;
+      const canScrollDown = before + viewport.clientHeight < viewport.scrollHeight;
+      const wantUp = e.deltaY < 0;
+      if ((wantUp && !canScrollUp) || (!wantUp && !canScrollDown)) return;
+      requestAnimationFrame(() => {
+        if (viewport.scrollTop === before) {
+          syncViewportScrollArea(term);
+        }
+      });
+    };
+    // Manual escape hatch: double-click the right edge (where the scrollbar
+    // would be) forces a sync. Useful when the auto-recovery hasn't yet
+    // kicked in - the user can manually refresh the scroll area.
+    const manualSyncHandler = (e: MouseEvent) => {
+      // No scrollback area to refresh while an alt-screen app is up.
+      if (!isNormalBuffer(term)) return;
+      const rect = containerRef.current?.getBoundingClientRect();
+      if (!rect) return;
+      // Only fire if the dblclick was within ~16px of the right edge.
+      if (e.clientX < rect.right - 18) return;
+      try { syncViewportScrollArea(term); } catch { /* ignore */ }
+    };
+    // TASK-161: wheel-down clamp to the live prompt. Even after wheelPreSync
+    // aligns scrollArea to bufLen * rowH, browser scrollTop clamping can
+    // leave ydisp a row or two short of baseY when the canvas-vs-viewport
+    // offset is non-zero. If a wheel-down lands the viewport at the
+    // physical bottom (scrollTop saturated) but the buffer ydisp is still
+    // behind baseY, call term.scrollToBottom() to force ydisp = baseY.
+    // Only runs on downward wheels and only when at the saturation edge,
+    // so it doesn't interfere with mid-scrolling.
+    const wheelClampHandler = (e: WheelEvent) => {
+      if (e.deltaY <= 0 || e.shiftKey) return;
+      // Never snap an alt-screen app to "bottom" — it has no scrollback and
+      // scrollToBottom() would yank the full-screen TUI's own view.
+      if (!isNormalBuffer(term)) return;
+      const viewport = containerRef.current?.querySelector('.xterm-viewport') as HTMLElement | null;
+      if (!viewport) return;
+      requestAnimationFrame(() => {
+        try {
+          const atPhysicalBottom = viewport.scrollTop + viewport.clientHeight >= viewport.scrollHeight - 1;
+          if (!atPhysicalBottom) return;
+          const buf = term.buffer.active;
+          if (buf.viewportY < buf.baseY) {
+            term.scrollToBottom();
+          }
+        } catch { /* ignore */ }
+      });
+    };
+    const wheelRecoveryEl = containerRef.current;
+    // Capture phase so the sync runs BEFORE xterm's wheel handler computes
+    // the new scrollTop against the (possibly stale) scrollHeight.
+    wheelRecoveryEl?.addEventListener('wheel', wheelPreSyncHandler, { passive: true, capture: true });
+    wheelRecoveryEl?.addEventListener('wheel', wheelRecoveryHandler, { passive: true });
+    wheelRecoveryEl?.addEventListener('wheel', wheelClampHandler, { passive: true });
+    wheelRecoveryEl?.addEventListener('dblclick', manualSyncHandler);
+
+    // GH #117 + TASK-179: when a TUI (Copilot CLI, Claude Code, fzf inline)
+    // enables xterm mouse tracking, xterm normally encodes wheel events as
+    // mouse-button reports and forwards them to the PTY child instead of
+    // scrolling the buffer. Two failure modes used to surface here:
+    //   1. TUIs that enable mouse tracking but ignore wheel reports - the
+    //      wheel looked dead because xterm sent reports nobody read.
+    //   2. Ink-based TUIs (Claude Code, Copilot CLI) that DO handle wheel
+    //      reports for their internal scroller - the previous universal
+    //      suppression blocked wheel events from ever reaching them.
+    // Resolution: route via xterm's public scrollLines() in the normal
+    // case (so the .xterm-viewport scrollbar tracks and we match the
+    // drag-select code path), but for the Ink case - mouse tracking on
+    // AND xterm has no scrollback (baseY === 0, content redrawn in place) -
+    // return true so xterm forwards the wheel as a mouse-button report.
+    // The TUI's own scroller takes it from there. Shift+wheel always
+    // falls through to xterm so a TUI that legitimately wants raw wheel
+    // input can opt back in. term.modes.mouseTrackingMode is the public
+    // xterm 5.x API; an earlier _core.coreMouseService probe returned
+    // undefined through the TS facade and made the heuristic unreliable.
+    let lastWheelDiagAt = 0;
+    // ── Bulletproof wheel handler ──────────────────────────────────────
+    // Fractional-pixel accumulator for trackpad (macOS smooth scroll sends
+    // tiny deltaY values that individually round to 0 lines). Shared across
+    // all wheel events for this terminal instance.
+    let wheelAccumulator = 0;
+
+    term.attachCustomWheelEventHandler((e: WheelEvent): boolean => {
+      if (e.shiftKey) return true;
+
+      const tracking = term.modes.mouseTrackingMode;
+      const buf = term.buffer.active;
+
+      // Diagnostic (throttled to 1/s)
+      const logWheel = (path: string) => {
+        const now = Date.now();
+        if (now - lastWheelDiagAt < 1000) return;
+        lastWheelDiagAt = now;
+        const inst = useTerminalStore.getState().terminals.get(terminalId);
+        window.terminalAPI.diagLog('renderer:wheel', {
+          terminalId,
+          path,
+          tracking,
+          bufferType: buf.type,
+          baseY: buf.baseY,
+          viewportY: buf.viewportY,
+          rows: term.rows,
+          deltaDir: e.deltaY === 0 ? 0 : (e.deltaY > 0 ? 1 : -1),
+          deltaMode: e.deltaMode,
+          aiPane: !!(inst?.aiSessionId || inst?.aiProcessKind),
+        });
+      };
+
+      // ── Compute cell dimensions from DOM (most reliable source) ──
+      const screen = containerRef.current?.querySelector('.xterm-screen') as HTMLElement | null;
+      const cellW = screen ? screen.clientWidth / term.cols : (
+        (term as any)._core?._renderService?.dimensions?.css?.cell?.width || 8
+      );
+      const cellH = screen ? screen.clientHeight / term.rows : (
+        (term as any)._core?._renderService?.dimensions?.css?.cell?.height || 16
+      );
+
+      // ── Normalize deltaY to pixel amount regardless of deltaMode ──
+      let pixelDelta: number;
+      if (e.deltaMode === WheelEvent.DOM_DELTA_LINE) {
+        pixelDelta = e.deltaY * cellH;
+      } else if (e.deltaMode === WheelEvent.DOM_DELTA_PAGE) {
+        pixelDelta = e.deltaY * cellH * term.rows;
+      } else {
+        // DOM_DELTA_PIXEL (most common: trackpad, smooth scroll)
+        pixelDelta = e.deltaY;
+      }
+
+      // ── Accumulate fractional pixels → whole lines ──
+      wheelAccumulator += pixelDelta;
+      const lines = Math.trunc(wheelAccumulator / cellH);
+      if (lines === 0) {
+        // Not enough accumulated for a full line yet (trackpad micro-scroll)
+        // Still log if this is a new direction (prevents "scroll feels dead")
+        return false;
+      }
+      // Remove consumed pixels, keep the fractional remainder
+      wheelAccumulator -= lines * cellH;
+
+      // Cap to prevent huge bursts (e.g. fast trackpad fling sending 200 lines)
+      const cappedLines = Math.sign(lines) * Math.min(Math.abs(lines), term.rows);
+
+      // ── PATH A: TUI with mouse tracking (Copilot CLI, Claude Code) ──
+      // Send mouse wheel reports directly to PTY, bypassing xterm's broken
+      // getLinesScrolled() path which fails when _currentRowHeight is stale.
+      if (tracking !== 'none' && (buf.baseY === 0 || buf.type === 'alternate')) {
+        logWheel('forward-to-pty');
+
+        // Detect encoding from xterm's core mouse service
+        const coreMouseService = (term as any)._core?.coreMouseService;
+        const encoding: string = coreMouseService?.activeEncoding || 'SGR';
+
+        // Mouse position: use event offset mapped to grid coordinates.
+        // Clamp to valid range (1-based, within terminal dimensions).
+        const col = Math.min(term.cols, Math.max(1, Math.round((e.offsetX || cellW) / cellW)));
+        const row = Math.min(term.rows, Math.max(1, Math.round((e.offsetY || cellH) / cellH)));
+
+        // Build report based on active encoding
+        let report: string;
+        const btn = lines < 0 ? 64 : 65; // 64=scroll-up, 65=scroll-down
+        if (encoding === 'SGR' || encoding === 'SGR_PIXELS') {
+          report = `\x1b[<${btn};${col};${row}M`;
+        } else {
+          // DEFAULT (X10): \x1b[M + (btn+32) + (col+32) + (row+32)
+          // Coords are clamped to 223 (byte limit - 32)
+          const safeCol = Math.min(col, 223);
+          const safeRow = Math.min(row, 223);
+          report = `\x1b[M${String.fromCharCode(btn + 32)}${String.fromCharCode(safeCol + 32)}${String.fromCharCode(safeRow + 32)}`;
+        }
+
+        // Send one report per line (capped to prevent flooding)
+        const count = Math.min(Math.abs(cappedLines), 15);
+        window.terminalAPI.writePty(terminalId, report.repeat(count));
+        return false;
+      }
+
+      // ── PATH B: Alternate buffer WITHOUT mouse tracking (less, vim, etc.) ──
+      // These apps use the alternate screen but handle scroll via Up/Down keys.
+      // xterm has no scrollback here, so scrollLines() is useless.
+      if (buf.type === 'alternate') {
+        logWheel('alt-arrow-keys');
+        // Send Up/Down arrow keys (DECCKM-aware: application mode = \x1bOA/B,
+        // normal mode = \x1b[A/B)
+        const appMode = term.modes.applicationCursorKeysMode;
+        const up = appMode ? '\x1bOA' : '\x1b[A';
+        const down = appMode ? '\x1bOB' : '\x1b[B';
+        const arrow = lines < 0 ? up : down;
+        const count = Math.min(Math.abs(cappedLines), 15);
+        window.terminalAPI.writePty(terminalId, arrow.repeat(count));
+        return false;
+      }
+
+      // ── PATH C: Normal buffer with scrollback (plain shell) ──
+      // Use xterm's scrollLines() for buffer navigation. This is the safest
+      // path — scrollLines is a public API that moves viewportY directly.
+      logWheel('scrollLines');
+      try { term.scrollLines(cappedLines); } catch { /* term disposed */ }
+      return false;
+    });
+
+    // TASK-171: AI process-tree scan scheduler. Shared between the burst
+    // trigger (in onPtyData below) and the Enter-keystroke trigger (in
+    // term.onData below). Single in-flight check + throttle keeps the
+    // cost bounded; scan cap is the hard stop after which we give up.
+    const SCAN_THROTTLE_MS = 2000;
+    const SCAN_MAX_ATTEMPTS = 10;
+    const SCAN_DELAY_MS = 800;
+    const tryScheduleAiProcessScan = () => {
+      if (aiProcessGiveUpRef.current || aiProcessScanInFlightRef.current) return;
+      const tInst = useTerminalStore.getState().terminals.get(terminalId);
+      if (!tInst || tInst.aiSessionId) return;
+      const hasUserRename = !!(tInst.customTitle && !tInst.firstCommandTitle);
+      if (hasUserRename) return;
+      const sinceLast = Date.now() - aiProcessLastScanAtRef.current;
+      if (sinceLast < SCAN_THROTTLE_MS) return;
+      if (aiProcessScanCountRef.current >= SCAN_MAX_ATTEMPTS) {
+        aiProcessGiveUpRef.current = true;
+        return;
+      }
+      aiProcessScanInFlightRef.current = true;
+      aiProcessScanCountRef.current += 1;
+      aiProcessLastScanAtRef.current = Date.now();
+      setTimeout(async () => {
+        try {
+          const names = await (window.terminalAPI as any).getPtyChildProcesses?.(terminalId) as string[] | undefined;
+          if (!names || names.length === 0) return;
+          const match = detectAiInChildren(names);
+          if (!match) return;
+          const after = useTerminalStore.getState().terminals.get(terminalId);
+          if (!after || after.aiSessionId) return;
+          const stillBlockable = !!(after.customTitle && !after.firstCommandTitle);
+          if (stillBlockable) return;
+          window.terminalAPI.diagLog('renderer:ai-process-detected', { terminalId, kind: match.kind, title: match.title, names });
+          useTerminalStore.getState().renameTerminal(
+            terminalId,
+            match.title,
+            true,
+            { firstCommand: true },
+          );
+          // TASK-171/172 bridge: stamp the pane so the auto-link path can
+          // attach a fresh AI session to this pane even if cwd doesn't
+          // match (wrapper changed dir, or shell doesn't emit OSC 7 / 9;9).
+          // Functional setState so concurrent updateTerminalTitleFromSession
+          // calls can't clobber the stamp via stale-read of the terminals
+          // map. Before this fix the stamp vanished within milliseconds,
+          // leaving the bridge with stampedPanes=0 immediately after a
+          // successful process detection.
+          useTerminalStore.setState((s) => {
+            const cur = s.terminals.get(terminalId);
+            if (!cur) return {};
+            const next = new Map(s.terminals);
+            next.set(terminalId, { ...cur, aiProcessKind: match.kind, aiProcessDetectedAt: Date.now() });
+            return { terminals: next };
+          });
+          aiProcessGiveUpRef.current = true;
+        } catch (err) {
+          window.terminalAPI.diagLog('renderer:ai-process-scan-error', { terminalId, err: String(err) });
+        } finally {
+          aiProcessScanInFlightRef.current = false;
+          if (aiProcessScanCountRef.current >= SCAN_MAX_ATTEMPTS) {
+            aiProcessGiveUpRef.current = true;
+          }
+        }
+      }, SCAN_DELAY_MS);
+    };
+
+    // Write data to PTY when user types. When broadcast mode is on, the same
+    // bytes are sent to every tiled pane (tmux synchronize-panes style).
+    const dataDisposable = term.onData((data) => {
+      diagRef.current.keystrokeCount++;
+      diagRef.current.lastKeystrokeTime = Date.now();
+      window.terminalAPI.diagLog('renderer:keystroke', { terminalId, bytes: data.length });
+
+      // Watch for the user's first complete command (anything before the
+      // first Enter) so we can rename the pane from a generic "cmd.exe"
+      // to something meaningful like "npx vibe-kanban". Only matters for
+      // non-AI panes; AI sessions get their title from the session summary.
+      if (!firstCmdSavedRef.current) {
+        const inst = useTerminalStore.getState().terminals.get(terminalId);
+        if (inst && !inst.aiSessionId && !inst.customTitle) {
+          for (let i = 0; i < data.length; i++) {
+            const ch = data[i];
+            const code = data.charCodeAt(i);
+            if (ch === '\r' || ch === '\n') {
+              const cmd = firstCmdBufferRef.current.trim();
+              firstCmdBufferRef.current = '';
+              if (cmd.length >= 2 && cmd.length <= 80) {
+                firstCmdSavedRef.current = true;
+                useTerminalStore.getState().renameTerminal(terminalId, cmd, true, { firstCommand: true });
+                break;
+              }
+            } else if (ch === '\t') {
+              // Tab triggered shell autocomplete - what we have in the buffer
+              // is just the prefix the user typed, not what got executed.
+              // Abandon firstCmd capture; process detection / banner will
+              // name the pane based on what actually ran.
+              firstCmdSavedRef.current = true;
+              firstCmdBufferRef.current = '';
+              break;
+            } else if (code === 0x7f || code === 0x08) {
+              firstCmdBufferRef.current = firstCmdBufferRef.current.slice(0, -1);
+            } else if (code === 0x03) {
+              firstCmdBufferRef.current = '';
+            } else if (code === 0x1b) {
+              // Arrow keys / history recall / etc. - whatever the user
+              // picked from history isn't in our buffer, so trusting the
+              // buffer at the next Enter would mis-title the pane. Bail
+              // out same as the Tab path.
+              firstCmdSavedRef.current = true;
+              firstCmdBufferRef.current = '';
+              break;
+            } else if (code >= 0x20 && code < 0x80) {
+              firstCmdBufferRef.current += ch;
+            }
+          }
+        } else {
+          // Pane already has an aiSessionId or a custom title - don't keep watching.
+          firstCmdSavedRef.current = true;
+        }
+      }
+
+      // TASK-171: every Enter keystroke is the user's signal that they
+      // just ran a command. Schedule an AI process-tree scan so we catch
+      // "user just typed `copilot`" quickly. tryScheduleAiProcessScan
+      // self-throttles so this can't spam.
+      if (data.includes('\r') || data.includes('\n')) {
+        tryScheduleAiProcessScan();
+      }
+
+      const state = useTerminalStore.getState();
+      if (state.broadcastMode) {
+        for (const [id, t] of state.terminals) {
+          if (t.mode === 'tiled') window.terminalAPI.writePty(id, data);
+        }
+      } else {
+        window.terminalAPI.writePty(terminalId, data);
+      }
+    });
+
+    // Receive data from PTY — batch writes via rAF to avoid saturating the
+    // renderer event loop during output bursts (e.g. after system resume).
+    let pendingData = '';
+    let rafScheduled = false;
+    let cursorSyncDirty = false;
+
+    // Prompt-line highlight (TASK-48 + TASK-53). Visually distinguish lines
+    // that look like CLI-agent user prompts (Copilot CLI / Claude Code
+    // render submitted prompts as `>`/`›`/`❯` history entries). We scan
+    // newly-written buffer lines and attach an xterm decoration as a
+    // left-border accent bar. Heuristic only.
+    //   `>` — Claude Code, generic
+    //   `›` (U+203A) — Copilot CLI
+    //   `❯` (U+276F) — Starship/oh-my-zsh + some agents
+    const promptDecorations = new Set<{ dispose: () => void; isDisposed?: boolean }>();
+    const decoratedLineKeys = new Set<string>();
+    let lastScannedAbsY = -1;
+    const PROMPT_RE = /^[>\u203A\u276F]\s/;
+    const scanForPromptLines = () => {
+      try {
+        const buffer = term.buffer.active;
+        // Only scan the normal buffer — alt-screen TUIs (vim, less, htop)
+        // overwrite the screen and decoration markers there are noise.
+        if (buffer.type !== 'normal') return;
+        const cursorAbsY = buffer.baseY + buffer.cursorY;
+        const startY = Math.max(0, lastScannedAbsY + 1);
+        const endY = cursorAbsY;
+        for (let y = startY; y <= endY; y++) {
+          const line = buffer.getLine(y);
+          if (!line) continue;
+          const text = line.translateToString(true);
+          if (!PROMPT_RE.test(text)) continue;
+          // Dedupe: a line might be re-rendered while still being typed.
+          const key = `${y}:${text.slice(0, 32)}`;
+          if (decoratedLineKeys.has(key)) continue;
+          decoratedLineKeys.add(key);
+          const marker = term.registerMarker(y - cursorAbsY);
+          if (!marker) continue;
+          const dec = term.registerDecoration({
+            marker,
+            x: 0,
+            width: 1,
+            height: 1,
+            // Use the theme's focus-border accent so the bar sits in the
+            // existing palette instead of clashing as bright green.
+            backgroundColor: themeConfig?.cursor ?? '#89B4FA',
+            layer: 'top',
+          });
+          if (dec) promptDecorations.add(dec);
+        }
+        // Don't lock in the cursor line — it may still be receiving content.
+        lastScannedAbsY = Math.max(lastScannedAbsY, endY - 1);
+      } catch { /* defensive: xterm internals may shift */ }
+    };
+
+    const flushPendingData = () => {
+      rafScheduled = false;
+      if (pendingData) {
+        term.write(pendingData, () => scanForPromptLines());
+        pendingData = '';
+      }
+      // Apply our cursor override AFTER the PTY data is written. In xterm,
+      // DECTCEM (cursor visibility) is per-buffer, so if the data switched
+      // to alt-screen, writing ?25l before it had no effect on the alt
+      // buffer's cursor state. Writing it here hits whichever buffer is
+      // active post-data.
+      if (cursorSyncDirty) {
+        cursorSyncDirty = false;
+        const sig = cursorHideSignalsRef.current;
+        // GH #128: only force-hide when the app itself hasn't shown the cursor.
+        // Copilot CLI relies on the terminal cursor (sends ?25h); respecting
+        // that keeps its input cursor visible instead of blanking it.
+        const shouldHide = (sig.bracketedPaste || sig.altScreen) && !sig.appCursorShown;
+        term.write(shouldHide ? '\x1b[?25l' : '\x1b[?25h');
+      }
+      flushMouseModeReset();
+    };
+
+    // #67: Ink-based CLIs (Claude Code, Copilot CLI) enable bracketed paste
+    // but don't send DECTCEM (\x1b[?25l) to hide the terminal's hardware
+    // cursor before painting their own cursor indicator. Result: two cursors
+    // render side-by-side.
+    //
+    // We track two signals - bracketed paste (?2004) and alt-screen (?1049) -
+    // and keep xterm's cursor hidden whenever EITHER is on. Using only
+    // bracketed paste wasn't enough: some TUIs toggle ?2004l mid-session
+    // while still drawing their own cursor in alt-screen, and that flipped
+    // xterm's cursor back on. The per-terminal state refs persist across
+    // data chunks; the actual cursor write happens in flushPendingData so
+    // it runs AFTER any alt-screen switch in the same data chunk.
+    // Track whether any mouse-tracking mode is currently active. Set when a
+    // TUI enables it; checked when we see alt-screen exit (TASK: drag-select
+    // stops working after Ctrl+C kills a TUI). The TUI never gets to send
+    // the matching ?1000l/?1006l reset on abrupt death, so we force them
+    // off ourselves when the app signals it's leaving alt-screen.
+    let mouseTrackingOn = false;
+    let mouseResetPending = false;
+
+    const syncCursorVisibility = (chunk: string) => {
+      for (let i = 0; i < chunk.length; i++) {
+        if (chunk.charCodeAt(i) !== 0x1b) continue;
+        if (chunk.startsWith('\x1b[?2004h', i)) { cursorHideSignalsRef.current.bracketedPaste = true; cursorSyncDirty = true; }
+        else if (chunk.startsWith('\x1b[?2004l', i)) { cursorHideSignalsRef.current.bracketedPaste = false; cursorSyncDirty = true; }
+        else if (chunk.startsWith('\x1b[?1049h', i) || chunk.startsWith('\x1b[?1047h', i)) {
+          cursorHideSignalsRef.current.altScreen = true; cursorSyncDirty = true;
+        }
+        else if (chunk.startsWith('\x1b[?1049l', i) || chunk.startsWith('\x1b[?1047l', i)) {
+          cursorHideSignalsRef.current.altScreen = false; cursorSyncDirty = true;
+          // Alt-screen exit + any mouse tracking still on = leftover from a
+          // TUI that died without resetting. Queue a forced reset so xterm
+          // stops forwarding mouse events to the (now-dead) child process
+          // and drag-select starts working again.
+          if (mouseTrackingOn) mouseResetPending = true;
+          // TASK-275: AI CLI exit detection via PTY output instead of wmic
+          // polling. When an AI TUI leaves alt-screen, the CLI has exited.
+          // Clear the process stamp and reset the scan counters so a fresh
+          // round of bounded scans can detect a new agent if the user
+          // launches one in the same pane.
+          const tForAltExit = useTerminalStore.getState().terminals.get(terminalId);
+          if (tForAltExit?.aiProcessKind) {
+            window.terminalAPI.diagLog?.('renderer:ai-exit-alt-screen', {
+              terminalId, kind: tForAltExit.aiProcessKind,
+            });
+            useTerminalStore.setState((s) => {
+              const cur = s.terminals.get(terminalId);
+              if (!cur?.aiProcessKind) return {};
+              const next = new Map(s.terminals);
+              next.set(terminalId, {
+                ...cur,
+                aiProcessKind: undefined,
+                aiProcessDetectedAt: undefined,
+              });
+              return { terminals: next };
+            });
+            // Reset scan counters so the pane can detect a new AI agent
+            aiProcessGiveUpRef.current = false;
+            aiProcessScanCountRef.current = 0;
+          }
+        }
+        // Mouse tracking mode toggles - any of ?1000/?1002/?1003/?1006/?1015
+        // (X10, button-event, any-event, SGR, urxvt). Track on/off so the
+        // alt-screen-exit handler above knows whether to force-reset.
+        else if (
+          chunk.startsWith('\x1b[?1000h', i) || chunk.startsWith('\x1b[?1002h', i) ||
+          chunk.startsWith('\x1b[?1003h', i) || chunk.startsWith('\x1b[?1006h', i) ||
+          chunk.startsWith('\x1b[?1015h', i)
+        ) {
+          mouseTrackingOn = true;
+        }
+        else if (
+          chunk.startsWith('\x1b[?1000l', i) || chunk.startsWith('\x1b[?1002l', i) ||
+          chunk.startsWith('\x1b[?1003l', i) || chunk.startsWith('\x1b[?1006l', i) ||
+          chunk.startsWith('\x1b[?1015l', i)
+        ) {
+          mouseTrackingOn = false;
+        }
+        // GH #128: track the app's own cursor request and respect it. Copilot
+        // CLI shows the terminal cursor in its input field via ?25h; the old
+        // behavior force-re-hid it, leaving Copilot with no cursor at all.
+        // We now only force-hide when the app itself has hidden it (?25l).
+        else if (chunk.startsWith('\x1b[?25h', i)) {
+          cursorHideSignalsRef.current.appCursorShown = true; cursorSyncDirty = true;
+        }
+        else if (chunk.startsWith('\x1b[?25l', i)) {
+          cursorHideSignalsRef.current.appCursorShown = false; cursorSyncDirty = true;
+        }
+      }
+    };
+
+    // Flush any pending mouse-mode reset after the chunk has been written.
+    // Ordering matters: write reset sequences AFTER the alt-screen exit
+    // sequence has been processed by xterm so the modes are reset on the
+    // normal-screen state, not the about-to-be-dropped alt buffer.
+    const flushMouseModeReset = () => {
+      if (!mouseResetPending) return;
+      mouseResetPending = false;
+      mouseTrackingOn = false;
+      term.write('\x1b[?1000l\x1b[?1002l\x1b[?1003l\x1b[?1006l\x1b[?1015l');
+    };
+
+    const unsubscribePtyData = window.terminalAPI.onPtyData(
+      (id: string, data: string) => {
+        if (id === terminalId) {
+          diagRef.current.outputEventCount++;
+          diagRef.current.lastOutputTime = Date.now();
+          diagRef.current.outputBytes += data.length;
+          // Only mark as active for substantial output (>50 bytes), not cursor/prompt redraws
+          if (data.length > 50 && processStatusRef.current !== 'active') {
+            processStatusRef.current = 'active';
+            setProcessStatus('active');
+          }
+          syncCursorVisibility(data);
+          pendingData += data;
+          if (!rafScheduled) {
+            rafScheduled = true;
+            requestAnimationFrame(flushPendingData);
+          }
+          // ── AI process detection (TASK-171 / GH #99) ───────────────
+          // A substantial output burst triggers a child-process query
+          // ~800 ms later. We allow up to a few scans per pane to handle
+          // the typical sequence "shell prompt -> cd -> copilot": the
+          // first burst is the shell, the later burst is the AI. The
+          // Enter-keystroke path (in term.onData below) also schedules
+          // a scan, since pressing Enter is the user's signal that they
+          // just ran a command. Each scan is one wmic/pgrep call; the
+          // throttle + cap keeps total cost bounded.
+          if (
+            !aiProcessGiveUpRef.current &&
+            !aiProcessScanInFlightRef.current &&
+            data.length > 80
+          ) {
+            tryScheduleAiProcessScan();
+          }
+          // ── CWD detection ──────────────────────────────────────────
+          // Resolve the working directory from this chunk of output. The
+          // detection picks the LAST directory in the chunk (OSC 7 / OSC 9;9 /
+          // prompt-regex fallback) so batched output containing several prompt
+          // lines doesn't latch the pane onto a stale folder. See cwd-detect.ts.
+          const termInst = useTerminalStore.getState().terminals.get(terminalId);
+          const isWsl = termInst?.wsl === true;
+          const detectedDir = detectCwdFromChunk(data, isWsl);
+
+          if (detectedDir) {
+            // TASK-275: shell prompt appeared while mouse tracking is still
+            // on — the AI TUI was killed (Ctrl+C) without leaving alt-screen
+            // or sending ?1000l. Force a mouse-mode reset so the plain shell
+            // gets working scroll/select back. This is the safety net for
+            // abrupt TUI deaths that our alt-screen exit detection can't
+            // catch (because ?1049l was never sent).
+            if (mouseTrackingOn) {
+              mouseTrackingOn = false;
+              term.write('\x1b[?1000l\x1b[?1002l\x1b[?1003l\x1b[?1006l\x1b[?1015l');
+              window.terminalAPI.diagLog?.('renderer:mouse-reset-on-prompt', { terminalId });
+              // Also clear the AI process stamp
+              useTerminalStore.setState((s) => {
+                const cur = s.terminals.get(terminalId);
+                if (!cur?.aiProcessKind) return {};
+                const next = new Map(s.terminals);
+                next.set(terminalId, { ...cur, aiProcessKind: undefined, aiProcessDetectedAt: undefined });
+                return { terminals: next };
+              });
+              aiProcessGiveUpRef.current = false;
+              aiProcessScanCountRef.current = 0;
+            }
+            const store = useTerminalStore.getState();
+            const terminal = store.terminals.get(terminalId);
+            if (terminal && terminal.cwd !== detectedDir) {
+              const newTerminals = new Map(store.terminals);
+              newTerminals.set(terminalId, { ...terminal, cwd: detectedDir });
+              useTerminalStore.setState({ terminals: newTerminals });
+              // For WSL terminals, translate Linux path to UNC for the Dirs panel
+              if (terminal.wslDistro && detectedDir.startsWith('/')) {
+                store.addRecentDir(`\\\\wsl.localhost\\${terminal.wslDistro}${detectedDir.replace(/\//g, '\\')}`);
+              } else {
+                store.addRecentDir(detectedDir);
+              }
+            }
+            // Shell prompt appeared after AI session exited — pre-fill resume command
+            if (aiSessionStartedRef.current && aiResumeCommandRef.current) {
+              aiSessionStartedRef.current = false;
+              const resumeCmd = aiResumeCommandRef.current;
+              setTimeout(() => {
+                window.terminalAPI.writePty(terminalId, resumeCmd);
+              }, 200);
+            }
+          }
+        }
+      }
+    );
+
+    // Handle PTY exit — auto-close after brief delay
+    const unsubscribePtyExit = window.terminalAPI.onPtyExit(
+      (id: string, exitCode: number | undefined) => {
+        if (id === terminalId) {
+          window.terminalAPI.diagLog('renderer:pty-exit-received', { terminalId, exitCode });
+          setProcessStatus(exitCode && exitCode !== 0 ? 'exited-error' : 'exited-ok');
+          term.write('\r\n\x1b[90m[Process exited]\x1b[0m\r\n');
+          setTimeout(() => {
+            window.terminalAPI.diagLog('renderer:close-terminal-start', { terminalId });
+            useTerminalStore.getState().closeTerminal(terminalId);
+          }, 500);
+        }
+      }
+    );
+
+    // Send startup command if set (for layout restore)
+    const termInstance = useTerminalStore.getState().terminals.get(terminalId);
+    if (termInstance?.startupCommand && !termInstance.startupCommandSent) {
+      const cmd = termInstance.startupCommand;
+      if (termInstance.wsl) {
+        // WSL: wait for the shell prompt before sending the command
+        wslPromptCleanupRef.current = sendCommandOnWslPrompt(terminalId, cmd, (sentCmd) => {
+          if (termInstance.aiSessionId) {
+            aiResumeCommandRef.current = sentCmd;
+            aiSessionStartedRef.current = true;
+          }
+        });
+      } else {
+        setTimeout(() => {
+          window.terminalAPI.writePty(terminalId, cmd + '\r');
+          // Arm the re-send mechanism for native AI sessions only.
+          if (termInstance.aiSessionId) {
+            aiResumeCommandRef.current = cmd;
+            aiSessionStartedRef.current = true;
+          }
+        }, 1500);
+      }
+      // Mark as sent so it doesn't re-run on hot reload, but keep the value for session save
+      const store = useTerminalStore.getState();
+      const newTerminals = new Map(store.terminals);
+      const t = newTerminals.get(terminalId);
+      if (t) {
+        newTerminals.set(terminalId, { ...t, startupCommandSent: true });
+        useTerminalStore.setState({ terminals: newTerminals });
+      }
+    }
+
+    // Auto-rename tab when shell sends title via OSC sequence (skip custom titles)
+    const titleDisposable = term.onTitleChange((rawTitle) => {
+      const store = useTerminalStore.getState();
+      const terminal = store.terminals.get(terminalId);
+
+      // Track last process name and cwd
+      if (terminal && rawTitle) {
+        let processName = rawTitle;
+        const sep = processName.includes('\\') ? '\\' : '/';
+        processName = (processName.split(sep).pop() || processName).replace(/\.(exe|cmd|bat|com)$/i, '');
+        const updates: Partial<typeof terminal> = { lastProcess: processName };
+        // If the title looks like a directory path, update cwd and track in recents
+        // Strip ANSI escape sequences and only accept clean paths
+        const trimmed = rawTitle.replace(/\x1b\[[0-9;]*[A-Za-z]/g, '').trim();
+        const looksLikePath = /^[A-Z]:\\/i.test(trimmed) || trimmed.startsWith('/');
+        const hasFileExtension = /\.\w{1,5}$/i.test(trimmed);
+        if (looksLikePath && !hasFileExtension) {
+          updates.cwd = trimmed;
+          if (terminal.wslDistro && trimmed.startsWith('/')) {
+            store.addRecentDir(`\\\\wsl.localhost\\${terminal.wslDistro}${trimmed.replace(/\//g, '\\')}`);
+          } else {
+            store.addRecentDir(trimmed);
+          }
+        }
+        const newTerminals = new Map(store.terminals);
+        newTerminals.set(terminalId, { ...terminal, ...updates });
+        useTerminalStore.setState({ terminals: newTerminals });
+      }
+
+      if (terminal && rawTitle && !terminal.customTitle && store.renamingTerminalId !== terminalId) {
+        // Extract short name: last path segment, strip .exe
+        let name = rawTitle;
+        // Handle Windows paths (C:\foo\bar.exe) and unix paths (/usr/bin/bash)
+        const sep = name.includes('\\') ? '\\' : '/';
+        const lastSeg = name.split(sep).pop() || name;
+        // Strip common extensions
+        name = lastSeg.replace(/\.(exe|cmd|bat|com)$/i, '');
+        // If it's just a path like "C:\Users\foo", show last folder
+        // If title contains " - " (e.g. "vim - file.txt"), keep it
+        if (rawTitle.includes(' - ')) {
+          name = rawTitle.split(' - ').pop()?.trim() || name;
+        }
+        store.renameTerminal(terminalId, name || rawTitle);
+      }
+    });
+
+    // Focus tracking via textarea focus/blur
+    const textareaEl = containerRef.current.querySelector('textarea');
+    const handleBlur = () => {
+      window.terminalAPI.diagLog('renderer:focus-lost', { terminalId });
+      requestAnimationFrame(() => {
+        if (useTerminalStore.getState().focusedTerminalId !== terminalId) return;
+        const active = document.activeElement;
+        const somethingElseTookFocus = active && active !== document.body && !containerRef.current?.contains(active);
+        const hasFocus = document.hasFocus();
+        // Identify the focus thief so the freeze pattern is diagnosable from
+        // diag logs alone. tag/id/class is enough to fingerprint most
+        // offenders (settings panel, command palette, dir picker, AI sidebar)
+        // without leaking content.
+        window.terminalAPI.diagLog('renderer:focus-refocus-check', {
+          terminalId,
+          hasFocus,
+          visible: document.visibilityState === 'visible',
+          thief: somethingElseTookFocus && active ? {
+            tag: active.tagName,
+            id: active.id || null,
+            cls: (typeof active.className === 'string' ? active.className : '').slice(0, 80) || null,
+          } : null,
+        });
+        // GH #126/#70 focus-thrash fix. Do NOT fight for focus when the window
+        // isn't OS-focused (another app, a notification, or a second tmax
+        // instance has it). Refocusing the textarea can't make the window
+        // OS-active, so it blurs again -> refocus -> a loop that fires DEC
+        // focus escapes (\x1b[I/\x1b[O) and shreds real keystrokes, leaving
+        // the pane "frozen". Exception: over RDP, document.hasFocus() reads
+        // false even while the user is actively typing through the relay - so
+        // still recover if a genuine key press landed in this pane very
+        // recently. (term.onData can't be used for this: it also fires for the
+        // focus escapes themselves, which would defeat the guard.)
+        const RDP_TYPING_GRACE_MS = 3000;
+        const recentlyTyped = Date.now() - lastRealKeyAtRef.current < RDP_TYPING_GRACE_MS;
+        if (!hasFocus && !recentlyTyped) return;
+        if (!somethingElseTookFocus) {
+          try { terminalRef.current?.focus(); } catch { /* disposed */ }
+        }
+      });
+    };
+    if (textareaEl) {
+      textareaEl.addEventListener('focus', handleFocus);
+      textareaEl.addEventListener('blur', handleBlur);
+    }
+
+    // ResizeObserver for fit — debounced to avoid rapid resize races
+    let resizeTimer: ReturnType<typeof setTimeout> | null = null;
+    const resizeObserver = new ResizeObserver(() => {
+      if (resizeTimer) clearTimeout(resizeTimer);
+      resizeTimer = setTimeout(() => {
+        try {
+          fitAddon.fit();
+          syncViewportScrollArea(term);
+          const { cols, rows } = term;
+          window.terminalAPI.resizePty(terminalId, cols, rows);
+        } catch {
+          // Ignore resize errors during teardown
+        }
+      }, 30);
+    });
+    resizeObserver.observe(containerRef.current);
+
+    // Suppress right-button mousedown/mouseup in capture phase so xterm.js
+    // doesn't forward SGR mouse events to the pty. Otherwise TUI apps with
+    // mouse reporting enabled (e.g. Claude Code) receive the right-click on
+    // top of our own paste, causing a visible double-paste.
+    //
+    // We also snapshot any active xterm selection on right-button mousedown.
+    // Selections made via double-click (word) or triple-click (line) don't
+    // go through our left-mouse drag logic, so they never get into
+    // pendingTuiCopyText. Worse, the right-click mousedown can clear the
+    // selection before contextmenu fires - by which point both
+    // hasSelection() and pendingTuiCopyText are empty and we'd fall through
+    // to paste. Capturing on mousedown(button=2) closes that gap.
+    const handleRightMouseButton = (e: MouseEvent) => {
+      if (e.button === 2) {
+        if (e.type === 'mousedown') {
+          rightClickInFlight = true;
+          if (term.hasSelection()) {
+            const sel = term.getSelection().replace(/\s+$/u, '');
+            if (sel) {
+              pendingTuiCopyRef.current = sel;
+              if (pendingTuiCopyClearTimer) clearTimeout(pendingTuiCopyClearTimer);
+              pendingTuiCopyClearTimer = setTimeout(clearPendingTuiCopy, 10000);
+            }
+          }
+        }
+        e.preventDefault();
+        e.stopPropagation();
+      }
+    };
+    containerRef.current.addEventListener('mousedown', handleRightMouseButton, true);
+    containerRef.current.addEventListener('mouseup', handleRightMouseButton, true);
+
+    // Track left-button drag attempts. When mouse reporting is on, xterm
+    // forwards the drag to the pty instead of creating a selection - so
+    // term.hasSelection() is false even though the user dragged across
+    // visible text. We capture the buffer text at the drag rectangle on
+    // mouseup so right-click can copy it (TASK-120). Without this, the
+    // right-click handler has nothing to copy and the previous clipboard
+    // contents leak into the next paste.
+    // pendingTuiCopyText now lives on pendingTuiCopyRef (component scope) so the
+    // keyboard handler can consult it too; the clear timer stays effect-local.
+    let pendingTuiCopyClearTimer: ReturnType<typeof setTimeout> | null = null;
+    let dragStartPos: { x: number; y: number } | null = null;
+    // Set true on right-button mousedown so the onSelectionChange listener
+    // doesn't wipe our snapshot when xterm clears its native selection in
+    // response to the right-click - which is exactly the case we're trying
+    // to defend against for double-click + right-click.
+    let rightClickInFlight = false;
+    let copyTextFromKeydown: string | null = null; // text saved when Ctrl+C keydown handled copy
+    const DRAG_THRESHOLD = 5; // pixels to count as a drag vs. a click
+
+    const clearPendingTuiCopy = () => {
+      pendingTuiCopyRef.current = null;
+      if (pendingTuiCopyClearTimer) {
+        clearTimeout(pendingTuiCopyClearTimer);
+        pendingTuiCopyClearTimer = null;
+      }
+    };
+
+    // Convert a clientX/clientY pair to (col, row) in the visible viewport,
+    // then offset by viewportY to get an absolute buffer row. Returns null
+    // if cell dimensions aren't available yet (very early after mount).
+    const pixelToCell = (clientX: number, clientY: number): { col: number; row: number } | null => {
+      const screen = containerRef.current?.querySelector('.xterm-screen') as HTMLElement | null;
+      if (!screen) return null;
+      const rect = screen.getBoundingClientRect();
+      const dim = (term as unknown as { _core?: { _renderService?: { dimensions?: { css?: { cell?: { width: number; height: number } }; actualCellWidth?: number; actualCellHeight?: number } } } })._core?._renderService?.dimensions;
+      const cellW = dim?.css?.cell?.width ?? dim?.actualCellWidth ?? 0;
+      const cellH = dim?.css?.cell?.height ?? dim?.actualCellHeight ?? 0;
+      if (!cellW || !cellH) return null;
+      const viewportCol = Math.max(0, Math.min(term.cols - 1, Math.floor((clientX - rect.left) / cellW)));
+      const viewportRow = Math.max(0, Math.min(term.rows - 1, Math.floor((clientY - rect.top) / cellH)));
+      return { col: viewportCol, row: viewportRow + term.buffer.active.viewportY };
+    };
+
+    const readBufferRange = (start: { col: number; row: number }, end: { col: number; row: number }): string => {
+      let s = start;
+      let e = end;
+      if (s.row > e.row || (s.row === e.row && s.col > e.col)) {
+        const tmp = s; s = e; e = tmp;
+      }
+      const buf = term.buffer.active;
+      if (s.row === e.row) {
+        return buf.getLine(s.row)?.translateToString(true, s.col, e.col) ?? '';
+      }
+      const parts: string[] = [];
+      parts.push(buf.getLine(s.row)?.translateToString(true, s.col) ?? '');
+      for (let r = s.row + 1; r < e.row; r++) {
+        parts.push(buf.getLine(r)?.translateToString(true) ?? '');
+      }
+      parts.push(buf.getLine(e.row)?.translateToString(true, 0, e.col) ?? '');
+      return parts.join('\n');
+    };
+
+    const handleLeftMouseDown = (e: MouseEvent) => {
+      if (e.button === 0) {
+        dragStartPos = { x: e.clientX, y: e.clientY };
+      }
+    };
+    const handleLeftMouseUp = (e: MouseEvent) => {
+      if (e.button === 0 && dragStartPos) {
+        const dx = e.clientX - dragStartPos.x;
+        const dy = e.clientY - dragStartPos.y;
+        const wasDrag = Math.sqrt(dx * dx + dy * dy) > DRAG_THRESHOLD;
+
+        // TASK-224: reliable single-click open for image-path links. xterm's
+        // own link activation is hover-state dependent and misfires in AI CLI
+        // panes (mouse tracking forwards the click to the pty; the linkifier's
+        // _currentLink can be stale when the pane redraws under a stationary
+        // cursor), so the user had to click several times. We instead activate
+        // directly from the link ranges the provider already computed. Only on
+        // a genuine click (no drag) with no modifier that means "select", and
+        // dedupe against xterm's own activate() which may have just fired for
+        // the same click.
+        if (!wasDrag && !e.shiftKey && imgLinkHitsRef.current.rows.size > 0) {
+          const cell = pixelToCell(e.clientX, e.clientY);
+          if (cell) {
+            // pixelToCell returns 0-based col; provider ranges are 1-based
+            // inclusive. Convert to compare.
+            const col1 = cell.col + 1;
+            const rowHits = imgLinkHitsRef.current.rows.get(cell.row);
+            const hit = rowHits?.find((h) => col1 >= h.startX && col1 <= h.endX);
+            if (hit) {
+              // openPreview() self-dedupes, so if xterm already activated this
+              // same click this call is a no-op. Otherwise it opens the preview.
+              hit.activate();
+              dragStartPos = null;
+              return;
+            }
+          }
+        }
+        // Native xterm selections (drag, double/triple-click) are captured
+        // via onSelectionChange below. The path that needs explicit mouseup
+        // handling is a drag while a TUI has mouse reporting on - xterm
+        // forwards the drag to the app instead of selecting, so it has no
+        // native selection. We gate on !hasSelection() (xterm made none)
+        // rather than our own mouseTrackingOn flag: after a detach/reattach
+        // the flag can be out of sync with xterm's real mouse mode, but
+        // "drag with no resulting selection" is the true signal either way.
+        if (wasDrag) {
+          // Diagnostic (no PII): records the inputs that decide whether a drag
+          // produces a selection - nativeSelection (did xterm make one),
+          // aiPane, buffer type, mouse tracking. No coordinates or text, so we
+          // can pin down "selection doesn't work" without leaking content.
+          const dInst = useTerminalStore.getState().terminals.get(terminalId);
+          window.terminalAPI.diagLog('renderer:drag-select', {
+            terminalId,
+            nativeSelection: term.hasSelection(),
+            aiPane: !!(dInst?.aiSessionId || dInst?.aiProcessKind),
+            bufferType: term.buffer.active.type,
+            tracking: term.modes.mouseTrackingMode,
+          });
+        }
+        if (wasDrag && !term.hasSelection()) {
+          const startCell = pixelToCell(dragStartPos.x, dragStartPos.y);
+          const endCell = pixelToCell(e.clientX, e.clientY);
+          if (startCell && endCell) {
+            // Order start-before-end so multi-row math is positive.
+            let s = startCell;
+            let en = endCell;
+            if (s.row > en.row || (s.row === en.row && s.col > en.col)) {
+              const tmp = s; s = en; en = tmp;
+            }
+            // TASK-164: in an AI CLI pane (copilot / claude), a plain
+            // left-drag should produce a real, visible selection - like
+            // Windows Terminal - instead of being swallowed by the app's
+            // mouse reporting. We gate on "is this a detected AI CLI pane"
+            // (store aiSessionId / aiProcessKind), NOT on buffer type:
+            // copilot runs on the ALTERNATE screen with mouse tracking on
+            // (verified via diag), so a normal-buffer check wrongly excluded
+            // it. Real full-screen apps (vim/htop/lazygit) have no AI session,
+            // so they keep their mouse. Plain shells on the normal buffer also
+            // qualify (they select natively anyway when mouse mode is off).
+            // Copilot's mouse tracking is sticky / not reliably clearable
+            // (copilot-cli#2332), so selecting locally is the robust fix.
+            const aiInst = useTerminalStore.getState().terminals.get(terminalId);
+            const isAiPane = !!(aiInst?.aiSessionId || aiInst?.aiProcessKind);
+            if (term.buffer.active.type === 'normal' || isAiPane) {
+              const length = (en.row - s.row) * term.cols + (en.col - s.col);
+              if (length > 0) {
+                // Defer past this event cycle: our listener runs in the
+                // capture phase, but xterm's own mouse-reporting mouseup
+                // handler runs afterward (bubble) and resets the selection.
+                // Applying it on the next tick lands the selection last.
+                const selCol = s.col, selRow = s.row, selLen = length;
+                setTimeout(() => {
+                  try { term.select(selCol, selRow, selLen); } catch { /* selection service shifted */ }
+                }, 0);
+              }
+            }
+            // Keep the raw buffer snapshot as a right-click copy fallback
+            // (covers whitespace-trimmed copy and the alt-screen case where
+            // we deliberately did not create a visible selection).
+            const snapshot = readBufferRange(s, en).replace(/\s+$/u, '');
+            if (snapshot) {
+              pendingTuiCopyRef.current = snapshot;
+              if (pendingTuiCopyClearTimer) clearTimeout(pendingTuiCopyClearTimer);
+              pendingTuiCopyClearTimer = setTimeout(clearPendingTuiCopy, 10000);
+            }
+          }
+        }
+        dragStartPos = null;
+      }
+    };
+    containerRef.current.addEventListener('mousedown', handleLeftMouseDown, true);
+    containerRef.current.addEventListener('mouseup', handleLeftMouseUp, true);
+
+    // Right-click: copy if selection, paste if no selection.
+    // When mouse reporting is on (Copilot CLI, Claude Code) drag-select is
+    // consumed by the pty so xterm has no native selection. We capture the
+    // dragged text from the buffer at mouseup time (TASK-120), so right-click
+    // here copies that text - matching the natural Windows Terminal flow and
+    // closing the gap left by the TASK-66/#84 fix.
+    let lastCopyAt = 0;
+    const POST_COPY_PASTE_GUARD_MS = 600;
+    const handleContextMenu = async (e: MouseEvent) => {
+      e.preventDefault();
+      e.stopPropagation();
+      e.stopImmediatePropagation();
+      // Always release the in-flight flag once contextmenu fires, so the
+      // next user-driven empty-selection event clears the snapshot normally.
+      rightClickInFlight = false;
+
+      // Snapshot the selection text NOW before the async menu call — the TUI
+      // may redraw and clear the xterm selection while the menu is open.
+      let snapshotText = '';
+      if (term.hasSelection()) {
+        snapshotText = term.getSelection();
+      } else if (pendingTuiCopyRef.current) {
+        snapshotText = pendingTuiCopyRef.current;
+      }
+
+      const action = await window.terminalAPI.showTerminalContextMenu();
+      if (action === 'cut') {
+        const text = smartUnwrapForCopy(snapshotText, smartUnwrapRef.current);
+        try { term.clearSelection(); } catch {}
+        clearPendingTuiCopy();
+        if (text.trim()) {
+          window.terminalAPI.clipboardWrite(text);
+          useTerminalStore.getState().addToast('Cut to clipboard');
+          lastCopyAt = Date.now();
+        }
+      } else if (action === 'copy') {
+        const text = smartUnwrapForCopy(snapshotText, smartUnwrapRef.current);
+        try { term.clearSelection(); } catch {}
+        clearPendingTuiCopy();
+        if (text.trim()) {
+          window.terminalAPI.clipboardWrite(text);
+          useTerminalStore.getState().addToast('Copied to clipboard');
+          lastCopyAt = Date.now();
+        }
+      } else if (action === 'paste') {
+        if (Date.now() - lastCopyAt < POST_COPY_PASTE_GUARD_MS) return;
+        // tmax.net: the WebView clipboard is async-only outside paste events.
+        const { hasImage, html, plainText } = await window.terminalAPI.clipboardSnapshot();
+        if (hasImage && !plainText && !html) return;
+        const decision = resolveClipboardPaste({ hasImage, html, plainText });
+        if (decision.kind === 'image') {
+          window.terminalAPI.clipboardSaveImage().then((filePath) => {
+            window.terminalAPI.writePty(terminalId, filePath);
+          });
+        } else if (decision.kind === 'text') {
+          const payload = prepareClipboardPaste(decision.text, cursorHideSignalsRef.current.bracketedPaste);
+          window.terminalAPI.writePty(terminalId, payload);
+        }
+      }
+      // action === null means menu was dismissed without picking
+    };
+    // Use capture phase to intercept before any other handler
+    containerRef.current.addEventListener('contextmenu', handleContextMenu, true);
+
+    // TASK-172: drag-and-drop a file onto the pane to type its path - same
+    // affordance Windows Terminal has. dragover with a Files payload turns
+    // the pane into a drop zone; the actual drop writes space-separated
+    // (and quoted, if needed) paths into the PTY without auto-submitting.
+    const handleDragOver = (e: DragEvent) => {
+      // Only react when files are being dragged in - lets internal element
+      // drags (like a tab from the workspace bar) pass through untouched.
+      if (!e.dataTransfer?.types?.includes?.('Files')) return;
+      e.preventDefault();
+      e.dataTransfer.dropEffect = 'copy';
+    };
+    const handleFileDrop = (e: DragEvent) => {
+      const files = e.dataTransfer?.files;
+      if (!files || files.length === 0) return;
+      e.preventDefault();
+      e.stopPropagation();
+      const paths: string[] = [];
+      for (let i = 0; i < files.length; i++) {
+        const f = files[i] as File & { path?: string };
+        if (f.path) paths.push(f.path);
+      }
+      if (paths.length === 0) return;
+      const inst = useTerminalStore.getState().terminals.get(terminalId);
+      const out = paths
+        .map((p) => formatPathForPty(p, !!inst?.wsl, inst?.wslDistro))
+        .join(' ');
+      window.terminalAPI.writePty(terminalId, out);
+    };
+    containerRef.current.addEventListener('dragover', handleDragOver);
+    containerRef.current.addEventListener('drop', handleFileDrop);
+
+    // Intercept the document-level `copy` event for this pane so that the
+    // browser's default copy (which would write the raw DOM-selected text
+    // with hard newlines) gets rewritten through smartUnwrapForCopy. This
+    // catches OS-level Ctrl+C paths the keydown handler can miss (e.g. when
+    // focus shifts away from the xterm helper textarea after a mouse-drag
+    // selection).
+    const handleCopyEvent = (e: ClipboardEvent) => {
+      // If our keydown handler already handled copy, write the saved text
+      // to clipboardData so the browser puts it in the system clipboard.
+      // We MUST set clipboardData before calling preventDefault — otherwise
+      // the browser writes empty to clipboard (overwriting our writeText).
+      if (copyTextFromKeydown) {
+        const text = copyTextFromKeydown;
+        copyTextFromKeydown = null;
+        e.clipboardData?.setData('text/plain', text);
+        e.preventDefault();
+        e.stopImmediatePropagation();
+        return;
+      }
+      try {
+        const sel = term.hasSelection() ? term.getSelection() : '';
+        if (!sel) {
+          e.preventDefault();
+          e.stopImmediatePropagation();
+          return;
+        }
+        const out = smartUnwrapForCopy(sel, smartUnwrapRef.current);
+        e.clipboardData?.setData('text/plain', out);
+        e.preventDefault();
+        e.stopImmediatePropagation();
+      } catch { /* defensive */ }
+    };
+    containerRef.current.addEventListener('copy', handleCopyEvent, true);
+
+    // Mirror every xterm selection into pendingTuiCopyText. This is the most
+    // reliable capture point: it covers drag, double-click word selection,
+    // triple-click line selection, and term.select() API calls - all in a
+    // single hook fired by xterm itself the moment the selection changes.
+    // The right-click handler then has authoritative text even if a
+    // subsequent mousedown(2) clears the visible selection before contextmenu
+    // fires. When the selection becomes empty (user clicked elsewhere), we
+    // drop the cache so a follow-up right-click on empty space pastes as
+    // expected. (Our own copy-and-clear path in handleContextMenu calls
+    // clearPendingTuiCopy first, so this path is a no-op for that case.)
+    const selectionDisposable = term.onSelectionChange(() => {
+      if (term.hasSelection()) {
+        const sel = term.getSelection().replace(/\s+$/u, '');
+        if (sel) {
+          pendingTuiCopyRef.current = sel;
+          if (pendingTuiCopyClearTimer) clearTimeout(pendingTuiCopyClearTimer);
+          pendingTuiCopyClearTimer = setTimeout(clearPendingTuiCopy, 10000);
+        }
+      } else if (pendingTuiCopyRef.current && !rightClickInFlight) {
+        // When mouse tracking is on (TUI pane like Copilot CLI), the app
+        // redraws constantly which clears xterm's selection — don't nuke
+        // the snapshot immediately; let the 3-second timer handle expiry.
+        if (term.modes.mouseTrackingMode !== 'none') return;
+        clearPendingTuiCopy();
+      }
+    });
+
+    const containerEl = containerRef.current;
+
+    return () => {
+      resizeObserver.disconnect();
+      dataDisposable.dispose();
+      scrollDisposable.dispose();
+      viewportScrollEl?.removeEventListener('scroll', updateScrolledAway);
+      viewportScrollEl?.removeEventListener('scroll', syncBufferToScrollbar);
+      clearInterval(scrollPollTimer);
+      unsubscribePtyData();
+      unsubscribePtyExit();
+      wslPromptCleanupRef.current?.();
+      textareaDiagCleanupRef.current?.();
+      textareaDiagCleanupRef.current = null;
+      if (textareaEl) {
+        textareaEl.removeEventListener('focus', handleFocus);
+        textareaEl.removeEventListener('blur', handleBlur);
+      }
+      containerEl.removeEventListener('contextmenu', handleContextMenu, true);
+      containerEl.removeEventListener('dragover', handleDragOver);
+      containerEl.removeEventListener('drop', handleFileDrop);
+      containerEl.removeEventListener('copy', handleCopyEvent, true);
+      canvasEl?.removeEventListener('webglcontextlost', handleContextLost);
+      canvasEl?.removeEventListener('contextlost', handleContextLost);
+      selectionDisposable.dispose();
+      containerEl.removeEventListener('mousedown', handleRightMouseButton, true);
+      containerEl.removeEventListener('mouseup', handleRightMouseButton, true);
+      containerEl.removeEventListener('mousedown', handleLeftMouseDown, true);
+      containerEl.removeEventListener('mouseup', handleLeftMouseUp, true);
+      wheelRecoveryEl?.removeEventListener('wheel', wheelPreSyncHandler, true);
+      wheelRecoveryEl?.removeEventListener('wheel', wheelRecoveryHandler);
+      wheelRecoveryEl?.removeEventListener('wheel', wheelClampHandler);
+      wheelRecoveryEl?.removeEventListener('dblclick', manualSyncHandler);
+      titleDisposable.dispose();
+      // Flush any pending PTY data so serialize captures the latest content
+      if (pendingData) {
+        term.write(pendingData);
+        pendingData = '';
+      }
+      // Dispose prompt-line decorations before tearing down the terminal.
+      for (const dec of promptDecorations) {
+        try { dec.dispose(); } catch { /* ignore */ }
+      }
+      promptDecorations.clear();
+      decoratedLineKeys.clear();
+      // Save buffer before dispose so a remount can restore it
+      try {
+        const serialized = serializeAddon.serialize();
+        saveTerminalBuffer(terminalId, serialized, term.cols, term.rows);
+      } catch (e) {
+        console.warn('[tmax] Failed to serialize terminal buffer:', terminalId, e);
+      }
+      unregisterTerminal(terminalId);
+      term.dispose();
+      terminalRef.current = null;
+      fitAddonRef.current = null;
+      searchAddonRef.current = null;
+      serializeAddonRef.current = null;
+    };
+  }, [terminalId, handleFocus]); // eslint-disable-line react-hooks/exhaustive-deps
+
+  // TASK-52: keep smart-unwrap toggle in sync with the live config so the
+  // copy handlers (which capture config at terminal-init time) read the
+  // current value.
+  useEffect(() => {
+    smartUnwrapRef.current = config?.terminal?.smartUnwrapCopy ?? true;
+  }, [config?.terminal?.smartUnwrapCopy]);
+
+  // React to fontSize and fontFamily changes
+  const configFontFamily = config?.terminal?.fontFamily;
+  useEffect(() => {
+    try {
+      if (terminalRef.current && fitAddonRef.current) {
+        terminalRef.current.options.fontSize = fontSize;
+        if (configFontFamily) {
+          terminalRef.current.options.fontFamily = configFontFamily;
+        }
+        fitAddonRef.current.fit();
+        syncViewportScrollArea(terminalRef.current);
+        const { cols, rows } = terminalRef.current;
+        window.terminalAPI.resizePty(terminalId, cols, rows);
+      }
+    } catch { /* terminal may be disposed */ }
+  }, [fontSize, configFontFamily, terminalId]);
+
+  // Keep ref in sync for use in closure
+  useEffect(() => { processStatusRef.current = processStatus; }, [processStatus]);
+
+  // Ctrl+Shift+R targets the focused pane's title bar inline-rename instead
+  // of (or in addition to) the tab bar. Mirror the global renamingTerminalId
+  // flag onto local isRenamingPane when it matches us, then clear the global
+  // flag so the tab bar / floating overlay don't ALSO render an input for
+  // the same terminal at the same time.
+  const renamingTerminalId = useTerminalStore((s) => s.renamingTerminalId);
+  useEffect(() => {
+    if (renamingTerminalId !== terminalId) return;
+    setRenameValue(getTerminalDisplayTitle(useTerminalStore.getState().terminals.get(terminalId)));
+    setIsRenamingPane(true);
+    useTerminalStore.getState().startRenaming(null);
+  }, [renamingTerminalId, terminalId]);
+
+  // Process status: detect idle after 3s of no substantial output
+  useEffect(() => {
+    let lastBytes = 0;
+    const id = setInterval(() => {
+      setProcessStatus((prev) => {
+        if (prev.startsWith('exited')) return prev;
+        const now = Date.now();
+        const elapsed = now - diagRef.current.lastOutputTime;
+        const bytesDelta = diagRef.current.outputBytes - lastBytes;
+        lastBytes = diagRef.current.outputBytes;
+        // Active only if recent output AND substantial volume
+        if (elapsed < 3000 && bytesDelta > 50) return 'active';
+        return 'idle';
+      });
+    }, 1000);
+    return () => clearInterval(id);
+  }, []);
+
+  // Refit all terminals when view mode changes (focus↔grid↔split).
+  // The ResizeObserver may fire before the DOM has fully settled, leaving
+  // xterm's viewport scrollbar stale. A delayed refit + a follow-up
+  // rAF sync catches the case where the first refresh happens before the
+  // browser has finished re-laying out the new flex/grid cells (TASK-49).
+  const viewMode = useTerminalStore((s) => s.viewMode);
+  useEffect(() => {
+    if (!fitAddonRef.current || !terminalRef.current) return;
+    const doFitAndSync = () => {
+      try {
+        fitAddonRef.current?.fit();
+        if (terminalRef.current) {
+          syncViewportScrollArea(terminalRef.current);
+          const { cols, rows } = terminalRef.current;
+          window.terminalAPI.resizePty(terminalId, cols, rows);
+        }
+      } catch { /* terminal may be disposed */ }
+    };
+    const timer = setTimeout(() => {
+      doFitAndSync();
+      // Second pass after layout settles — fixes TASK-49 grid scrollback.
+      requestAnimationFrame(() => {
+        if (terminalRef.current) syncViewportScrollArea(terminalRef.current);
+      });
+    }, 50);
+    return () => clearTimeout(timer);
+  }, [viewMode, terminalId]);
+
+  // Programmatic focus when this terminal becomes focused in the store,
+  // or when overlays close (to restore DEC focus reporting for Copilot CLI)
+  useEffect(() => {
+    try {
+      if (isFocused && !anyOverlayOpen && terminalRef.current) {
+        // Skip redundant focus() when xterm's textarea already has DOM focus —
+        // handleFocus() already called term.focus() synchronously on click.
+        // A second focus() in the same frame leaves xterm's cursor-blink state
+        // machine inconsistent and paints a stale cursor (#41).
+        const textarea = containerRef.current?.querySelector('textarea');
+        const alreadyFocused = textarea && document.activeElement === textarea;
+        if (!alreadyFocused) {
+          terminalRef.current.focus();
+          // Force a cursor-row redraw so any stale cursor glyph from the
+          // previous frame is cleared (#41).
+          const cursorY = terminalRef.current.buffer.active.cursorY;
+          try { terminalRef.current.refresh(cursorY, cursorY); } catch { /* ignore */ }
+        }
+        // Immediately refit in case the container size changed (e.g. focus
+        // mode shows this pane at full size while it was previously hidden at
+        // its split-ratio size).  Using rAF so the DOM layout has settled.
+        if (fitAddonRef.current) {
+          requestAnimationFrame(() => {
+            try {
+              fitAddonRef.current?.fit();
+              if (terminalRef.current) {
+                syncViewportScrollArea(terminalRef.current);
+                const { cols, rows } = terminalRef.current;
+                window.terminalAPI.resizePty(terminalId, cols, rows);
+              }
+            } catch { /* terminal may be disposed */ }
+          });
+        }
+      }
+    } catch { /* terminal may be disposed */ }
+  }, [isFocused, anyOverlayOpen, terminalId]);
+
+  // Re-focus xterm when the OS window regains focus (alt-tab back)
+  useEffect(() => {
+    if (!isFocused) return;
+    const handleWindowFocus = () => {
+      try {
+        if (terminalRef.current) {
+          terminalRef.current.focus();
+          // Also resize to wake ConPTY in case it stalled during inactivity
+          // (GH #147). Without this, the pane appears focused but input is
+          // silently dropped until the user manually resizes.
+          if (fitAddonRef.current) {
+            fitAddonRef.current.fit();
+            const { cols, rows } = terminalRef.current;
+            window.terminalAPI.resizePty(terminalId, cols, rows);
+          }
+        }
+      } catch { /* terminal may be disposed */ }
+    };
+    window.addEventListener('focus', handleWindowFocus);
+    return () => window.removeEventListener('focus', handleWindowFocus);
+  }, [isFocused, terminalId]);
+
+  // Re-fit terminals and re-focus when returning from sleep/lock/idle
+  // This wakes up stalled ConPTY processes via the resize signal
+  useEffect(() => {
+    // Drop any lingering selection when the window is minimized or loses OS
+    // focus (TASK-247). A native/synthesized xterm selection persists in the
+    // model until the user clicks/types in the pane; on restore, the fit()
+    // and tab-tint refresh() below re-render it, so a selection the user was
+    // "done with" visually resurrects. Explicit copy (Ctrl+C / right-click)
+    // already cleared its own selection by this point, so anything still live
+    // here is uncopied-via-clearing-path and safe to drop.
+    const clearStaleSelection = () => {
+      try { terminalRef.current?.clearSelection(); } catch { /* disposed */ }
+    };
+    const handleVisibilityChange = () => {
+      if (document.hidden) {
+        clearStaleSelection();
+        return;
+      }
+      // Always fit+resize on return from hidden — this wakes ConPTY which
+      // can stall after prolonged inactivity (GH #147). The resize signal
+      // is what unblocks the stalled pipe, not focus alone.
+      try {
+        if (fitAddonRef.current && terminalRef.current) {
+          fitAddonRef.current.fit();
+          syncViewportScrollArea(terminalRef.current);
+          const { cols, rows } = terminalRef.current;
+          window.terminalAPI.resizePty(terminalId, cols, rows);
+          // Force a full repaint to recover from any stale canvas state
+          terminalRef.current.refresh(0, terminalRef.current.rows - 1);
+        }
+        if (isFocused && terminalRef.current) {
+          terminalRef.current.focus();
+        }
+      } catch { /* terminal may be disposed */ }
+    };
+    document.addEventListener('visibilitychange', handleVisibilityChange);
+    window.addEventListener('blur', clearStaleSelection);
+    return () => {
+      document.removeEventListener('visibilitychange', handleVisibilityChange);
+      window.removeEventListener('blur', clearStaleSelection);
+    };
+  }, [isFocused, terminalId]);
+
+  // Poll main-process PTY stats when diagnostics overlay is open
+  useEffect(() => {
+    if (!showDiag) return;
+    if (!logPathRef.current) {
+      window.terminalAPI.getDiagLogPath().then((p) => { logPathRef.current = p; });
+    }
+    const refresh = () => {
+      window.terminalAPI.getPtyDiag(terminalId).then((stats) => {
+        mainDiagRef.current = stats;
+        tickDiag();
+      });
+    };
+    refresh();
+    const id = setInterval(refresh, 500);
+    return () => clearInterval(id);
+  }, [showDiag, terminalId]);
+
+  // Apply tab color or default color as terminal background tint. (TASK-170)
+  // The tint hex feeds three surfaces:
+  //   1) pane title bar background (rgba over the chrome)
+  //   2) xterm theme.background blended down (so #000 at intensity 100
+  //      paints the actual terminal body solid black, not just an overlay)
+  //   3) xterm foreground/cursor (flipped to dark when bg luminance is
+  //      high enough that the default pale-on-dark text would wash out)
+  const title = useTerminalStore((s) => getTerminalDisplayTitle(s.terminals.get(terminalId)));
+  const tabColor = useTerminalStore((s) => s.terminals.get(terminalId)?.tabColor);
+  const groupId = useTerminalStore((s) => s.terminals.get(terminalId)?.groupId);
+  const groupColor = useTerminalStore((s) => groupId ? s.tabGroups.get(groupId)?.color : undefined);
+  const defaultTabColor = useTerminalStore((s) => s.config?.defaultTabColor);
+  const tabColorIntensity = useTerminalStore((s) => s.config?.tabColorIntensity ?? 40);
+  // Workspace tint: only applies when in workspaces mode (TASK-40). Falls
+  // through tab/group color so per-tab overrides still win.
+  const workspaceColor = useTerminalStore((s) => {
+    if (s.config?.tabMode !== 'workspaces') return undefined;
+    const wsId = s.terminals.get(terminalId)?.workspaceId ?? s.activeWorkspaceId;
+    return s.workspaces.get(wsId)?.color;
+  });
+  const bgTint = groupColor || workspaceColor || tabColor || defaultTabColor;
+  const themeBgHex = (config?.theme?.background ?? '#1e1e2e').replace(/^(#[0-9a-f]{6})[0-9a-f]{2}$/i, '$1');
+  // computeTabTint returns null-safe defaults when bgTint is missing - we
+  // just skip when there's no tint and let xterm/title bar fall through to
+  // the theme defaults.
+  const tint = bgTint
+    ? computeTabTint(bgTint, themeBgHex, tabColorIntensity, isFocused)
+    : null;
+
+  // Push the tint into the live xterm instance's theme so the pane body
+  // actually paints the blended color (not just an overlay). We also flip
+  // foreground/cursor to a dark tone on light blended backgrounds so text
+  // stays readable on white/lime panes. When the tint is cleared, restore
+  // the user's configured theme colors so the pane goes back to default.
+  useEffect(() => {
+    const term = terminalRef.current;
+    if (!term) return;
+    try {
+      const themeCfg = config?.theme;
+      const rawBg = themeCfg?.background ?? '#1e1e2e';
+      const materialActive = config?.backgroundMaterial && config.backgroundMaterial !== 'none';
+      const bgOpacity = materialActive ? (config?.backgroundOpacity ?? 0.8) : 1;
+      const defaultBg = bgOpacity < 1 ? hexToTerminalRgba(rawBg, bgOpacity) : rawBg;
+      const nextTheme = {
+        ...term.options.theme,
+        background: tint?.terminalBg
+          ? (bgOpacity < 1 ? hexToTerminalRgba(tint.terminalBg, bgOpacity) : tint.terminalBg)
+          : defaultBg,
+        foreground: tint?.terminalFg ?? themeCfg?.foreground ?? '#cdd6f4',
+        cursor: tint?.terminalCursor ?? themeCfg?.cursor ?? '#f5e0dc',
+      };
+      term.options.theme = nextTheme;
+      term.refresh(0, term.rows - 1);
+    } catch { /* terminal may be disposed */ }
+  }, [tint?.terminalBg, tint?.terminalFg, tint?.terminalCursor, config?.theme, config?.backgroundMaterial, config?.backgroundOpacity]);
+
+  // Latest prompt from the AI session (if any) linked to this pane. Surfaces
+  // the most recent user message so you don't have to scroll up through a
+  // long agent run to remember what was asked.
+  const aiSessionId = useTerminalStore((s) => s.terminals.get(terminalId)?.aiSessionId);
+  const paneMode = useTerminalStore((s) => s.terminals.get(terminalId)?.mode);
+  const paneCwd = useTerminalStore((s) => s.terminals.get(terminalId)?.cwd);
+  // TASK-78: workspaces list for the "Move to workspace" submenu in the
+  // overflow menu. paneWorkspaceId is the pane's CURRENT workspace (the one
+  // we omit from the destination list so users can't no-op-move into the same
+  // workspace). Falls back to active workspace for legacy panes that predate
+  // the workspaces feature.
+  const workspacesMap = useTerminalStore((s) => s.workspaces);
+  const activeWorkspaceIdState = useTerminalStore((s) => s.activeWorkspaceId);
+  const paneWorkspaceId = useTerminalStore(
+    (s) => s.terminals.get(terminalId)?.workspaceId ?? s.activeWorkspaceId,
+  );
+  const latestPrompt = useTerminalStore((s) => {
+    if (!aiSessionId) return undefined;
+    return findSessionById(s.copilotSessions, s.claudeCodeSessions, aiSessionId)?.latestPrompt;
+  });
+  const latestPromptTime = useTerminalStore((s) => {
+    if (!aiSessionId) return undefined;
+    return findSessionById(s.copilotSessions, s.claudeCodeSessions, aiSessionId)?.latestPromptTime;
+  });
+  const sessionStatus = useTerminalStore((s) => {
+    if (!aiSessionId) return undefined;
+    return findSessionById(s.copilotSessions, s.claudeCodeSessions, aiSessionId)?.status;
+  });
+  const aiProvider = useTerminalStore((s): 'copilot' | 'claude-code' | undefined =>
+    getSessionProvider(s.copilotSessions, s.claudeCodeSessions, aiSessionId),
+  );
+  // Native tooltip on the pane title bar - mirrors the Session Summary
+  // popup's layout in plain text (header / workspace / activity / opener
+  // / latest). See utils/session-tooltip.ts for the formatter.
+  const aiSessionSummary = useTerminalStore((s) => {
+    if (!aiSessionId) return null;
+    return buildSessionHoverText(findSessionById(s.copilotSessions, s.claudeCodeSessions, aiSessionId));
+  });
+  // Force a re-render every 30s so the relative time stays fresh even when
+  // nothing else in the session changes.
+  const [, tickForClock] = useReducer((n: number) => n + 1, 0);
+  useEffect(() => {
+    if (!latestPromptTime) return;
+    const id = setInterval(() => tickForClock(), 30_000);
+    return () => clearInterval(id);
+  }, [latestPromptTime]);
+
+  // TASK-275: AI exit detection and mouse-mode reset are now handled inline
+  // in the PTY data stream (alt-screen exit detection in syncCursorVisibility
+  // above), eliminating the need for wmic/pgrep polling. When the AI TUI
+  // leaves alt-screen (?1049l/?1047l), the handler clears aiProcessKind,
+  // resets mouse tracking if needed, and resets the scan counters so a new
+  // agent can be detected via the bounded initial scan (Enter/output burst).
+  // Agent-switch detection (user exits copilot, starts claude in same pane)
+  // also works via the reset scan path — no polling required.
+
+  const handleSearch = useCallback((query: string, backward?: boolean) => {
+    if (!searchAddonRef.current || !query) return;
+    const opts = { decorations: { matchOverviewRuler: '#888', activeMatchColorOverviewRuler: '#fff', matchBackground: '#585b70', activeMatchBackground: '#89b4fa' } };
+    if (backward) {
+      searchAddonRef.current.findPrevious(query, opts);
+    } else {
+      searchAddonRef.current.findNext(query, opts);
+    }
+  }, []);
+
+  const handleCloseSearch = useCallback(() => {
+    setShowSearch(false);
+    setSearchQuery('');
+    setSearchResult(null);
+    searchAddonRef.current?.clearDecorations();
+    terminalRef.current?.focus();
+  }, []);
+
+  const jumpToLatestPrompt = useCallback(() => {
+    const text = (latestPrompt || '').trim();
+    const search = searchAddonRef.current;
+    const term = terminalRef.current;
+    if (!search || !term || !text) return;
+    const found = runJumpToPromptSearch(search, term, text);
+    // On alternate buffer (TUI panes), old prompts have been overwritten by
+    // redraws and won't be found in the terminal buffer. Fall back to opening
+    // the session's prompt history dialog so the user can still see it.
+    if (!found && aiSessionId) {
+      useTerminalStore.getState().showPromptsForSession(aiSessionId);
+    }
+  }, [latestPrompt, aiSessionId]);
+
+  // TASK-140: per-pane shimmer when this pane's AI session is waiting for
+  // the user (awaitingApproval / waitingForUser) AND the user isn't
+  // already looking at this pane. Suppress only when tmax is focused AND
+  // this is the focused pane - in any other case (window unfocused, or a
+  // sibling pane focused) the shimmer should call attention. Reuses
+  // sessionStatus / aiSessionId / isFocused derived above.
+  const aiShimmerEnabled = useTerminalStore((s) => (s.config as any)?.aiShimmerEnabled);
+  const windowFocused = useTerminalStore((s) => s.windowFocused);
+  const sessionAcknowledged = useTerminalStore((s) =>
+    aiSessionId ? !!s.acknowledgedWaitingSessions[aiSessionId] : false,
+  );
+  const userIsHere = windowFocused && isFocused;
+  const isWaitingState =
+    sessionStatus === 'awaitingApproval' || sessionStatus === 'waitingForUser';
+  // Once the user lands on a waiting pane, mark the session as acknowledged
+  // so leaving for another pane (or another window) doesn't re-trigger the
+  // shimmer for the same waiting episode. The ack is cleared in the store
+  // when the session leaves the waiting state, so the next "needs attention"
+  // moment fires a fresh shimmer.
+  useEffect(() => {
+    if (userIsHere && isWaitingState && aiSessionId && !sessionAcknowledged) {
+      useTerminalStore.getState().acknowledgeWaitingSession(aiSessionId);
+    }
+  }, [userIsHere, isWaitingState, aiSessionId, sessionAcknowledged]);
+  const paneShimmer =
+    aiShimmerEnabled !== false &&
+    !userIsHere &&
+    !sessionAcknowledged &&
+    isWaitingState;
+
+  const className = `terminal-panel${isFocused ? ' focused' : ''}${isMultiSelected ? ' multi-selected' : ''}${paneShimmer ? ' shimmer-pane' : ''}`;
+
+  return (
+    <div
+      className={className}
+      data-terminal-id={terminalId}
+      onMouseDownCapture={(e) => {
+        // TASK-72: Ctrl/Cmd+click on the title bar is the multi-select
+        // gesture. Skip the focus shift in that case so the user can pick
+        // panes for "Show selected" without losing whichever pane they're
+        // working in. We narrow this to the title bar - clicks elsewhere
+        // (the xterm body) still focus normally because the user clearly
+        // wants to work in that pane.
+        const target = e.target as HTMLElement;
+        const isTitleBarClick = !!target.closest('.terminal-pane-title');
+        if (isTitleBarClick && e.button === 0 && (isMac ? e.metaKey : e.ctrlKey)) {
+          return;
+        }
+        if (!isFocused) {
+          // Only suppress mouse events targeting the xterm canvas — this prevents
+          // mouse-reporting apps (Claude CLI) from shifting focus, while still
+          // letting mousedown reach the viewport element for scroll targeting (#48).
+          if (target.tagName === 'CANVAS' || target.classList.contains('xterm-cursor-layer')) {
+            e.stopPropagation();
+            window.terminalAPI.diagLog('renderer:pane-switch-click-suppressed', { terminalId });
+          }
+        }
+        handleFocus();
+      }}
+    >
+      {showSearch && (
+        <div className="terminal-search-bar">
+          <input
+            ref={searchInputRef}
+            type="text"
+            className="terminal-search-input"
+            placeholder="Find..."
+            value={searchQuery}
+            onChange={(e) => {
+              setSearchQuery(e.target.value);
+              handleSearch(e.target.value);
+            }}
+            onKeyDown={(e) => {
+              e.stopPropagation();
+              if (e.key === 'Enter') {
+                handleSearch(searchQuery, e.shiftKey);
+              }
+              if (e.key === 'Escape') {
+                handleCloseSearch();
+              }
+            }}
+          />
+          {searchQuery && searchResult && (
+            <span className="terminal-search-count">
+              {searchResult.resultCount > 0
+                ? `${searchResult.resultIndex + 1}/${searchResult.resultCount}`
+                : 'No results'}
+            </span>
+          )}
+          <button className="terminal-search-btn" onClick={() => handleSearch(searchQuery, true)} title="Previous">&#9650;</button>
+          <button className="terminal-search-btn" onClick={() => handleSearch(searchQuery)} title="Next">&#9660;</button>
+          <button className="terminal-search-btn" onClick={handleCloseSearch} title="Close">&#10005;</button>
+        </div>
+      )}
+      {title && (
+        <div
+          className={`terminal-pane-title${floatTitleBar ? ' float-titlebar' : ''}${isMultiSelected ? ' multi-selected' : ''}`}
+          style={tint ? { background: tint.titleBg, ['--pane-accent' as string]: tint.titleAccent } : undefined}
+          onMouseDown={(e) => {
+            // TASK-107: Middle-click on the title bar closes the pane,
+            // mirroring the tab middle-click-close UX in TabBar. Bail when
+            // the click lands on an interactive child (button, rename input,
+            // status-dot/X icon) so those keep their existing behavior.
+            // preventDefault suppresses Windows' middle-button auto-scroll.
+            if (e.button === 1) {
+              const t = e.target as HTMLElement;
+              if (t.closest('button') || t.closest('input') || t.closest('.status-dot-container')) {
+                return;
+              }
+              e.preventDefault();
+              e.stopPropagation();
+              useTerminalStore.getState().closeTerminal(terminalId);
+              return;
+            }
+            // TASK-72: Ctrl/Cmd+click on the title bar toggles this pane in
+            // the multi-selection set. Bound to the title bar (not the
+            // xterm canvas area) so terminal text selection / focus stays
+            // untouched. Suppress the float-window drag in this case so the
+            // selection click doesn't accidentally pick up and move a
+            // floating pane.
+            if (e.button === 0 && (isMac ? e.metaKey : e.ctrlKey)) {
+              e.preventDefault();
+              e.stopPropagation();
+              useTerminalStore.getState().toggleSelectTerminal(terminalId);
+              return;
+            }
+            floatTitleBar?.onMouseDown(e);
+          }}
+          onDoubleClick={floatTitleBar?.onDoubleClick}
+        >
+          <div
+            className="status-dot-container"
+            onMouseDown={(e) => {
+              // The pane root has an onMouseDownCapture that re-focuses
+              // xterm; that fires *before* this handler in the capture
+              // phase, blurring the rename input which flips
+              // isRenamingPane=false synchronously. So the React state we
+              // see here is already stale. Use DOM presence of the rename
+              // input as the source of truth instead.
+              const parent = e.currentTarget.parentElement as HTMLElement | null;
+              const renameInput = parent?.querySelector('.pane-rename-input');
+              statusDotMouseDownDuringRename.current = !!renameInput;
+              // Also stop the parent's mousedown chain so the input doesn't
+              // lose focus to the xterm textarea: keeps the user in rename
+              // mode after the accidental click.
+              if (renameInput) {
+                e.stopPropagation();
+                e.preventDefault();
+              }
+            }}
+            onClick={(e) => {
+              e.stopPropagation();
+              if (statusDotMouseDownDuringRename.current) {
+                statusDotMouseDownDuringRename.current = false;
+                return;
+              }
+              useTerminalStore.getState().closeTerminal(terminalId);
+            }}
+          >
+            <span
+              className={`terminal-status-dot ${processStatus}`}
+              title={processStatus === 'active' ? 'Active' : processStatus === 'exited-error' ? 'Exited with error' : processStatus === 'idle' ? 'Idle' : 'Exited'}
+            />
+            <span className="pane-close-x" title={`Close pane (${formatKeyForPlatform('Ctrl+Shift+W')})`}>✕</span>
+          </div>
+          {paneMode === 'floating' && (
+            <span
+              className="terminal-pane-float-pill"
+              title="This pane is floating"
+              aria-label="Floating pane"
+            >FLOAT</span>
+          )}
+          {isRenamingPane ? (
+            <input
+              className="pane-rename-input"
+              value={renameValue}
+              onChange={(e) => setRenameValue(e.target.value)}
+              onMouseDown={(e) => e.stopPropagation()}
+              onClick={(e) => e.stopPropagation()}
+              onKeyDown={(e) => {
+                e.stopPropagation();
+                if (e.key === 'Enter') {
+                  const trimmed = renameValue.trim();
+                  if (trimmed) useTerminalStore.getState().renameTerminal(terminalId, trimmed, true);
+                  setIsRenamingPane(false);
+                } else if (e.key === 'Escape') {
+                  setIsRenamingPane(false);
+                }
+              }}
+              onBlur={() => {
+                // Commit on blur, but only when the focus actually went to
+                // something outside this input. Clicking inside the input to
+                // position the cursor used to bubble a parent mousedown that
+                // re-focused the xterm textarea; the e.stopPropagation() on
+                // mousedown above prevents that, so blur now genuinely means
+                // 'user clicked elsewhere or pressed Tab'.
+                const trimmed = renameValue.trim();
+                if (trimmed) useTerminalStore.getState().renameTerminal(terminalId, trimmed, true);
+                setIsRenamingPane(false);
+              }}
+              autoFocus
+              onFocus={(e) => e.target.select()}
+            />
+          ) : (
+            <span
+              className="terminal-pane-title-text"
+              title={aiSessionSummary || undefined}
+              onDoubleClick={(e) => {
+                // In float mode the parent has its own dblclick handler
+                // (maximize-toggle); we don't want both rename AND maximize
+                // on a single dblclick.
+                e.stopPropagation();
+                setRenameValue(title || '');
+                setIsRenamingPane(true);
+              }}
+            >{title}</span>
+          )}
+          {(() => {
+            // TASK-139: Float / Restore button next to the ⋯ menu. Tooltip
+            // surfaces the toggleFloat shortcut so users learn the keyboard
+            // path. Pull the live binding from config so customized shortcuts
+            // render correctly.
+            const cfgBindings = (config as unknown as { keybindings?: { action: string; key: string }[] } | undefined)?.keybindings;
+            const floatKey = (Array.isArray(cfgBindings) && cfgBindings.find((b) => b.action === 'toggleFloat')?.key) || 'Ctrl+Shift+U';
+            const floatShortcut = formatKeyForPlatform(floatKey);
+            const isFloating = paneMode === 'floating';
+            return (
+              <button
+                className="terminal-pane-float-btn"
+                title={`${isFloating ? 'Restore to grid' : 'Float pane'} (${floatShortcut})`}
+                aria-label={isFloating ? 'Restore pane to grid' : 'Float pane'}
+                onClick={(e) => {
+                  e.stopPropagation();
+                  const store = useTerminalStore.getState();
+                  if (isFloating) {
+                    store.moveToTiling(terminalId);
+                  } else {
+                    store.moveToFloat(terminalId);
+                  }
+                }}
+              >
+                {isFloating ? (
+                  // Restore: diagonal arrows pointing inward toward the center.
+                  <svg width="13" height="13" viewBox="0 0 14 14" fill="none" stroke="currentColor" strokeWidth="1.5" strokeLinecap="round" strokeLinejoin="round">
+                    <polyline points="13,5 9,5 9,1" />
+                    <line x1="13" y1="1" x2="9" y2="5" />
+                    <polyline points="1,9 5,9 5,13" />
+                    <line x1="1" y1="13" x2="5" y2="9" />
+                  </svg>
+                ) : (
+                  // Float: diagonal arrows pointing outward to the corners.
+                  <svg width="13" height="13" viewBox="0 0 14 14" fill="none" stroke="currentColor" strokeWidth="1.5" strokeLinecap="round" strokeLinejoin="round">
+                    <polyline points="9,1 13,1 13,5" />
+                    <line x1="13" y1="1" x2="9" y2="5" />
+                    <polyline points="5,13 1,13 1,9" />
+                    <line x1="1" y1="13" x2="5" y2="9" />
+                  </svg>
+                )}
+              </button>
+            );
+          })()}
+          <button
+            className="terminal-pane-menu-btn"
+            title="Pane actions"
+            aria-label="Pane actions"
+            onClick={(e) => {
+              e.stopPropagation();
+              const r = (e.currentTarget as HTMLElement).getBoundingClientRect();
+              setPaneMenuPos({ x: r.right, y: r.bottom });
+            }}
+          >&#x22EF;</button>
+        </div>
+      )}
+      {paneMenuPos && ReactDOM.createPortal(
+        // Portal to body so the menu's `position: fixed` is resolved against
+        // the viewport rather than the panel. `.terminal-panel` has
+        // `contain: layout style` (it scopes layout/paint for terminal
+        // updates), which makes it a containing block for fixed descendants
+        // - so without the portal the menu lands at panel-relative coords
+        // and can end up off-screen in multi-pane layouts.
+        <>
+          <div
+            className="pane-menu-backdrop"
+            onClick={() => { setPaneMenuPos(null); setMoveToWsSubmenuPos(null); }}
+            onContextMenu={(e) => { e.preventDefault(); setPaneMenuPos(null); setMoveToWsSubmenuPos(null); }}
+          />
+          <div
+            className="context-menu"
+            style={{
+              position: 'fixed',
+              right: Math.max(4, window.innerWidth - paneMenuPos.x),
+              top: paneMenuPos.y + 4,
+              zIndex: 1000,
+            }}
+            onClick={(e) => e.stopPropagation()}
+            onMouseDown={(e) => e.stopPropagation()}
+          >
+            {showPaneColorPicker ? (
+              // TASK-170: inline swatch grid - same pattern as TabContextMenu
+              // and WorkspaceTabBar. Picking applies the per-pane color and
+              // closes the menu; ✕ clears it.
+              <div className="context-menu-colors">
+                <div className="context-menu-label">Pane Color</div>
+                <div className="color-picker-grid">
+                  {TAB_COLORS.map((c) => (
+                    <button
+                      key={c.value}
+                      className="color-swatch"
+                      style={{ background: c.value }}
+                      title={c.name}
+                      onClick={() => {
+                        useTerminalStore.getState().setTabColor(terminalId, c.value);
+                        setPaneMenuPos(null);
+                      }}
+                    />
+                  ))}
+                  <button
+                    className="color-swatch clear"
+                    title="Clear color"
+                    onClick={() => {
+                      useTerminalStore.getState().setTabColor(terminalId, undefined);
+                      setPaneMenuPos(null);
+                    }}
+                  >
+                    &#10005;
+                  </button>
+                </div>
+              </div>
+            ) : (
+            <>
+            <button className="context-menu-item" onClick={() => {
+              setPaneMenuPos(null);
+              useTerminalStore.getState().openDiffReview(terminalId);
+            }}>🔀 Diff review</button>
+            <button className="context-menu-item" onClick={() => {
+              setPaneMenuPos(null);
+              setRenameValue(title || '');
+              setIsRenamingPane(true);
+            }}>✏️ Rename pane <span className="context-menu-shortcut">{formatKeyForPlatform('Ctrl+Shift+R')}</span></button>
+            <button className="context-menu-item" onClick={() => {
+              setPaneMenuPos(null);
+              useTerminalStore.getState().refreshTerminal(terminalId);
+            }}>🔄 Refresh pane <span className="context-menu-shortcut">{formatKeyForPlatform('Ctrl+Alt+R')}</span></button>
+            <button className="context-menu-item" onClick={() => {
+              setPaneMenuPos(null);
+              useTerminalStore.getState().replaceTerminal(terminalId);
+            }}>♻️ New terminal in place <span className="context-menu-shortcut">{formatKeyForPlatform('Ctrl+Alt+N')}</span></button>
+            {aiSessionId && (
+              <button className="context-menu-item" onClick={() => {
+                setPaneMenuPos(null);
+                useTerminalStore.getState().showPromptsForTerminal(terminalId);
+              }}>💬 Show prompts <span className="context-menu-shortcut">{formatKeyForPlatform('Ctrl+Shift+K')}</span></button>
+            )}
+            <button className="context-menu-item" onClick={() => {
+              setPaneMenuPos(null);
+              useTerminalStore.getState().openPromptComposer(terminalId);
+            }}>📝 Prompt Editor <span className="context-menu-shortcut">{formatKeyForPlatform('Ctrl+Alt+E')}</span></button>
+            {aiSessionId && (
+              <button className="context-menu-item" onClick={() => {
+                setPaneMenuPos(null);
+                useTerminalStore.getState().showSessionSummary(aiSessionId);
+              }}>📖 Session summary</button>
+            )}
+            {aiSessionId && (
+              <button className="context-menu-item" onClick={() => {
+                setPaneMenuPos(null);
+                useTerminalStore.getState().showAiSessionsForPane(terminalId);
+              }}>✨ Show in AI sessions</button>
+            )}
+            {aiSessionId && (
+              <button
+                className="context-menu-item"
+                onClick={() => {
+                  setPaneMenuPos(null);
+                  window.terminalAPI.clipboardWrite(aiSessionId);
+                }}
+                title={aiSessionId}
+              >📋 Copy session ID</button>
+            )}
+            <div className="context-menu-separator" />
+            <button className="context-menu-item" onClick={() => {
+              setPaneMenuPos(null);
+              const store = useTerminalStore.getState();
+              if (paneMode === 'floating') {
+                store.moveToTiling(terminalId);
+              } else {
+                store.moveToFloat(terminalId);
+              }
+            }}>
+              {paneMode === 'floating' ? '↩️ Restore to grid' : '🪟 Float pane'}
+              <span className="context-menu-shortcut">{formatKeyForPlatform('Ctrl+Shift+U')}</span>
+            </button>
+            {/* Detach-to-window removed: detaching left panes with broken
+                scroll/selection (alt-buffer + mouse-tracking state did not
+                survive the remount). The subsystem is intact (existing
+                detached windows can still reattach); only the entry point is
+                gone. */}
+            {/* TASK-78: Move to workspace submenu. Hidden when there's only
+                one workspace (every destination would be the pane's current
+                workspace, so the menu would be empty). */}
+            {workspacesMap.size > 1 && (
+              <button
+                className="context-menu-item"
+                onClick={(e) => {
+                  // Anchor submenu alongside the parent menu. Default is
+                  // right of the trigger row; if that would overflow the
+                  // viewport (parent menu is right-aligned), flip to the
+                  // left side instead. When flipping, anchor the submenu's
+                  // RIGHT edge against the trigger's left edge so it stays
+                  // adjacent to 'Move to workspace' regardless of its width
+                  // (a fixed left offset guessed from an estimated width made
+                  // it land detached, far to the left of the menu).
+                  const r = (e.currentTarget as HTMLElement).getBoundingClientRect();
+                  const SUBMENU_W = 240;
+                  if (r.right + 4 + SUBMENU_W > window.innerWidth) {
+                    setMoveToWsSubmenuPos({ x: r.left - 4, y: r.top, anchorRight: true });
+                  } else {
+                    setMoveToWsSubmenuPos({ x: r.right + 4, y: r.top });
+                  }
+                }}
+                title="Move this pane into a different workspace"
+              >
+                🗂 Move to workspace
+                <span className="context-menu-shortcut">▸</span>
+              </button>
+            )}
+            {paneCwd && (
+              <button className="context-menu-item" onClick={() => {
+                setPaneMenuPos(null);
+                window.terminalAPI.openPath(paneCwd);
+              }} title={paneCwd}>📂 Open folder in explorer</button>
+            )}
+            {/* TASK-170: Change pane color - expands the swatch grid in
+                place. ✕ on the right clears any per-pane color so the
+                pane falls back to group / workspace / default tint. */}
+            <div className="context-menu-item" style={{ display: 'flex', alignItems: 'center', padding: 0 }}>
+              <button
+                className="context-menu-item"
+                style={{ flex: 1, border: 'none', background: 'transparent' }}
+                onClick={() => setShowPaneColorPicker(true)}
+              >
+                🎨 Change pane color
+                {tabColor && <span className="color-dot" style={{ background: tabColor }} />}
+              </button>
+              {tabColor && (
+                <button
+                  className="color-clear-btn"
+                  onClick={(e) => {
+                    e.stopPropagation();
+                    useTerminalStore.getState().setTabColor(terminalId, undefined);
+                    setPaneMenuPos(null);
+                  }}
+                  title="Clear color"
+                >
+                  &#10005;
+                </button>
+              )}
+            </div>
+            <button className="context-menu-item" onClick={() => {
+              setPaneMenuPos(null);
+              useTerminalStore.getState().moveToDormant(terminalId);
+            }}>👁 Hide pane <span className="context-menu-shortcut">{formatKeyForPlatform('Ctrl+Shift+H')}</span></button>
+            {isWorkspacesModeForMenu && (
+              <>
+                <div className="context-menu-separator" />
+                <button
+                  className="context-menu-item"
+                  onClick={() => {
+                    setPaneMenuPos(null);
+                    useTerminalStore.getState().toggleSelectTerminal(terminalId);
+                  }}
+                  title="Add or remove this pane from the multi-selection used by 'Show Selected'"
+                >
+                  {isMultiSelected ? '☐ Deselect pane' : '☑ Select pane'}
+                  <span className="context-menu-shortcut">{isMac ? '⌘' : 'Ctrl'}+Click title</span>
+                </button>
+                {isShowSelectedActiveForMenu ? (
+                  <button className="context-menu-item" onClick={() => {
+                    setPaneMenuPos(null);
+                    useTerminalStore.getState().showAllPanes();
+                  }}>
+                    👁 Show all panes
+                  </button>
+                ) : (
+                  selectionCountForMenu >= 2 && (
+                    <button className="context-menu-item" onClick={() => {
+                      setPaneMenuPos(null);
+                      useTerminalStore.getState().showSelectedPanes();
+                    }}>
+                      🔎 Show selected ({selectionCountForMenu})
+                    </button>
+                  )
+                )}
+                {selectionCountForMenu > 0 && !isShowSelectedActiveForMenu && (
+                  <button className="context-menu-item" onClick={() => {
+                    setPaneMenuPos(null);
+                    useTerminalStore.getState().clearSelection();
+                  }}>
+                    ✕ Clear pane selection
+                  </button>
+                )}
+              </>
+            )}
+            <div className="context-menu-separator" />
+            <button className="context-menu-item danger" onClick={() => {
+              setPaneMenuPos(null);
+              useTerminalStore.getState().closeTerminal(terminalId);
+            }}>🗑 Close pane <span className="context-menu-shortcut">{formatKeyForPlatform('Ctrl+Shift+W')}</span></button>
+            </>
+            )}
+          </div>
+          {/* TASK-78: Move-to-workspace submenu. Same overlay layer as the
+              parent menu, anchored to the right of the trigger row. Lists
+              every workspace except the pane's current one. */}
+          {moveToWsSubmenuPos && (
+            <div
+              className="context-menu"
+              style={{
+                position: 'fixed',
+                ...(moveToWsSubmenuPos.anchorRight
+                  ? { right: Math.max(4, window.innerWidth - moveToWsSubmenuPos.x) }
+                  : { left: moveToWsSubmenuPos.x }),
+                top: moveToWsSubmenuPos.y,
+                zIndex: 1001,
+              }}
+              onClick={(e) => e.stopPropagation()}
+              onMouseDown={(e) => e.stopPropagation()}
+            >
+              {[...workspacesMap.values()]
+                .filter((ws) => ws.id !== paneWorkspaceId)
+                .map((ws) => (
+                  <button
+                    key={ws.id}
+                    className="context-menu-item"
+                    onClick={() => {
+                      setPaneMenuPos(null);
+                      setMoveToWsSubmenuPos(null);
+                      useTerminalStore.getState().movePaneToWorkspace(terminalId, ws.id);
+                    }}
+                    title={`Move pane to "${ws.name}"`}
+                  >
+                    {ws.color && (
+                      <span
+                        style={{
+                          display: 'inline-block',
+                          width: 8,
+                          height: 8,
+                          borderRadius: 2,
+                          background: ws.color,
+                          marginRight: 6,
+                        }}
+                      />
+                    )}
+                    {ws.id === activeWorkspaceIdState ? `${ws.name} (active)` : ws.name}
+                  </button>
+                ))}
+            </div>
+          )}
+        </>,
+        document.body,
+      )}
+      {showDiag && <DiagnosticsOverlay terminalId={terminalId} diagRef={diagRef} mainDiag={mainDiagRef.current} logPath={logPathRef.current} onClose={() => setShowDiag(false)} />}
+      <div ref={containerRef} className="xterm-container" />
+      {/* TASK-170: the per-pane tint used to live in a fixed-opacity
+          .terminal-color-overlay div above the xterm canvas. Replaced by
+          a real blend into xterm's theme.background so the slider can
+          reach a true-solid color (#000000 at intensity 100 → solid
+          black pane) without ever painting on top of terminal text. */}
+      {isScrolledAway && (
+        <button
+          className="terminal-jump-to-bottom"
+          title="Jump to bottom"
+          aria-label="Jump to bottom"
+          onClick={(e) => {
+            e.stopPropagation();
+            const term = terminalRef.current;
+            if (!term) return;
+            term.scrollToBottom();
+            term.focus();
+          }}
+        >
+          &#8595;
+        </button>
+      )}
+      {latestPrompt && (
+        <div className="terminal-pane-latest-prompt" title={`${latestPrompt}\n\nClick to jump to this prompt in the buffer`}>
+          {aiSessionId && (
+            <button
+              className={`terminal-pane-status-dot terminal-pane-status-${sessionStatus || 'idle'}`}
+              title="Show session status"
+              aria-label="Show session status"
+              onClick={(e) => {
+                e.stopPropagation();
+                useTerminalStore.getState().showSessionSummary(aiSessionId);
+              }}
+            />
+          )}
+          <span className="terminal-pane-latest-prompt-label">last prompt:</span>
+          <span
+            className="terminal-pane-latest-prompt-text terminal-pane-latest-prompt-jump"
+            onClick={(e) => {
+              e.stopPropagation();
+              jumpToLatestPrompt();
+            }}
+          >{latestPrompt}</span>
+          {latestPromptTime && (
+            <span className="terminal-pane-latest-prompt-time">{relativeTime(latestPromptTime)}</span>
+          )}
+          {aiSessionId && (
+            <button
+              className="terminal-pane-latest-prompt-btn"
+              title="Ping - ask the session where it's at, auto-sent"
+              onClick={(e) => {
+                e.stopPropagation();
+                // Drop keyboard focus off this button and hand it back to the
+                // terminal synchronously, so the user's next Enter goes to the
+                // terminal input instead of re-activating this button (which
+                // would re-send the prompt). Must run before any setTimeout.
+                (e.currentTarget as HTMLButtonElement).blur();
+                useTerminalStore.getState().setFocus?.(terminalId);
+                getTerminalEntry(terminalId)?.terminal?.focus();
+                // TASK-172 guard: char-by-char path made things worse
+                // (Copilot dropped the text entirely). Reverting to
+                // bracketed-paste single-write that at least shows text
+                // in the prompt; longer Enter delay for Copilot since
+                // its Ink seems to need more settle time before it
+                // recognizes Enter as submit. Double-fire guard prevents
+                // the toast-fires-twice case under React dev double-
+                // invoke or accidental double-clicks.
+                if (pingInFlightRef.current) return;
+                pingInFlightRef.current = true;
+                setTimeout(() => { pingInFlightRef.current = false; }, 1200);
+                const prompt = pickRandomPingPrompt();
+                const isBracketed = cursorHideSignalsRef.current.bracketedPaste;
+                const payload = prepareClipboardPaste(prompt, isBracketed);
+                window.terminalAPI.writePty(terminalId, payload);
+                // Enter sequence: settle window + try \r then \n with a
+                // small gap between. xterm/Ink combinations vary on which
+                // byte triggers submit; sending both back-to-back at the
+                // same delay covers either case. The brief gap between
+                // them lets Copilot's input handler process the first
+                // before the second arrives.
+                setTimeout(() => {
+                  window.terminalAPI.writePty(terminalId, '\r');
+                }, 500);
+                setTimeout(() => {
+                  window.terminalAPI.writePty(terminalId, '\n');
+                }, 600);
+                useTerminalStore.getState().addToast('Status request sent');
+              }}
+            >🔔</button>
+          )}
+          {aiSessionId && (
+            <button
+              className="terminal-pane-latest-prompt-btn"
+              title="Update Backlog - ask this agent to update its task statuses, ACs, and summaries"
+              aria-label="Ask agent to update Backlog tasks"
+              onClick={(e) => {
+                e.stopPropagation();
+                // Blur this button and return focus to the terminal so a
+                // following Enter submits in the terminal rather than re-firing
+                // this button (which would re-send the request). Synchronous,
+                // before any early return or setTimeout.
+                (e.currentTarget as HTMLButtonElement).blur();
+                useTerminalStore.getState().setFocus?.(terminalId);
+                getTerminalEntry(terminalId)?.terminal?.focus();
+                if (backlogPingInFlightRef.current) return;
+                // Don't ask the agent to update a backlog that doesn't exist:
+                // only send when this pane's cwd sits inside a project that's on
+                // the Backlog board. Otherwise the agent wastes a turn hunting
+                // for a backlog that isn't there.
+                const st = useTerminalStore.getState();
+                const cwd = (st.terminals.get(terminalId)?.cwd || '').replace(/\\/g, '/').toLowerCase();
+                const projects = (st.config?.backlogProjects as { path: string }[] | undefined) ?? [];
+                const inBacklogProject = !!cwd && projects.some((p) => {
+                  const pp = (p.path || '').replace(/\\/g, '/').toLowerCase().replace(/\/+$/, '');
+                  return pp && (cwd === pp || cwd.startsWith(pp + '/'));
+                });
+                if (!inBacklogProject) {
+                  st.addToast("This pane isn't in a Backlog project - add it to the Backlog board first");
+                  return;
+                }
+                backlogPingInFlightRef.current = true;
+                setTimeout(() => { backlogPingInFlightRef.current = false; }, 1200);
+                const prompt = pickRandomBacklogPrompt();
+                const isBracketed = cursorHideSignalsRef.current.bracketedPaste;
+                const payload = prepareClipboardPaste(prompt, isBracketed);
+                window.terminalAPI.writePty(terminalId, payload);
+                // Same dual Enter (\r then \n) as the status ping - xterm/Ink
+                // vary on which byte submits.
+                setTimeout(() => { window.terminalAPI.writePty(terminalId, '\r'); }, 500);
+                setTimeout(() => { window.terminalAPI.writePty(terminalId, '\n'); }, 600);
+                useTerminalStore.getState().addToast('Backlog update requested');
+              }}
+            >&#128203;</button>
+          )}
+          {aiSessionId && (
+            <button
+              className="terminal-pane-latest-prompt-btn"
+              title={formatKeyForPlatform("Transcript - chat history with timestamps (Ctrl+Alt+T)")}
+              aria-label="Session transcript"
+              onClick={(e) => {
+                e.stopPropagation();
+                const s = useTerminalStore.getState();
+                if (s.transcriptOpen) {
+                  useTerminalStore.setState({ transcriptOpen: false, transcriptSessionId: null });
+                } else {
+                  s.setFocus?.(terminalId);
+                  // Clear any pinned session so the panel follows this pane.
+                  useTerminalStore.setState({ transcriptOpen: true, transcriptSessionId: null });
+                }
+              }}
+            >💬</button>
+          )}
+          <button
+            className="terminal-pane-latest-prompt-btn"
+            title={`Show all prompts (${formatKeyForPlatform('Ctrl+Shift+K')})`}
+            onClick={(e) => {
+              e.stopPropagation();
+              useTerminalStore.getState().showPromptsForTerminal(terminalId);
+            }}
+          >⋯</button>
+        </div>
+      )}
+    </div>
+  );
+};
+
+export default TerminalPanel;

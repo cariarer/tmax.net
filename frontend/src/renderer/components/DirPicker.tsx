@@ -1,0 +1,234 @@
+import React, { useState, useEffect, useRef, useCallback, useMemo } from 'react';
+import { useTerminalStore } from '../state/terminal-store';
+import { tokenizeAnd, matchesAllTokens } from '../../shared/and-filter';
+
+interface DirContextMenu {
+  x: number;
+  y: number;
+  dir: string;
+  isFav: boolean;
+}
+
+const DirPicker: React.FC = () => {
+  const show = useTerminalStore((s) => s.showDirPicker);
+  const favoriteDirs = useTerminalStore((s) => s.favoriteDirs);
+  const recentDirs = useTerminalStore((s) => s.recentDirs);
+  const [query, setQuery] = useState('');
+  const [selectedIndex, setSelectedIndex] = useState(0);
+  const [addingFav, setAddingFav] = useState(false);
+  const [ctxMenu, setCtxMenu] = useState<DirContextMenu | null>(null);
+  const inputRef = useRef<HTMLInputElement>(null);
+  const listRef = useRef<HTMLDivElement>(null);
+  const favInputRef = useRef<HTMLInputElement>(null);
+  const ctxRef = useRef<HTMLDivElement>(null);
+  const [favValue, setFavValue] = useState('');
+
+  const allDirs = useMemo(() => {
+    const favSet = new Set(favoriteDirs);
+    const items: { dir: string; isFav: boolean }[] = [
+      ...favoriteDirs.map((dir) => ({ dir, isFav: true })),
+      ...recentDirs.filter((d) => !favSet.has(d)).map((dir) => ({ dir, isFav: false })),
+    ];
+    const tokens = tokenizeAnd(query);
+    if (tokens.length === 0) return items;
+    return items.filter((item) => matchesAllTokens(item.dir.toLowerCase(), tokens));
+  }, [favoriteDirs, recentDirs, query]);
+
+  useEffect(() => {
+    if (show) {
+      setQuery('');
+      setSelectedIndex(0);
+      setAddingFav(false);
+      setCtxMenu(null);
+      requestAnimationFrame(() => inputRef.current?.focus());
+    }
+  }, [show]);
+
+  useEffect(() => {
+    if (selectedIndex >= allDirs.length) setSelectedIndex(Math.max(0, allDirs.length - 1));
+  }, [allDirs.length, selectedIndex]);
+
+  useEffect(() => {
+    if (listRef.current) {
+      const item = listRef.current.children[selectedIndex] as HTMLElement | undefined;
+      item?.scrollIntoView({ block: 'nearest' });
+    }
+  }, [selectedIndex]);
+
+  useEffect(() => {
+    if (addingFav) requestAnimationFrame(() => favInputRef.current?.focus());
+  }, [addingFav]);
+
+  // Close context menu on outside click
+  useEffect(() => {
+    if (!ctxMenu) return;
+    const handler = (e: MouseEvent) => {
+      if (ctxRef.current && !ctxRef.current.contains(e.target as Node)) setCtxMenu(null);
+    };
+    document.addEventListener('mousedown', handler);
+    return () => document.removeEventListener('mousedown', handler);
+  }, [ctxMenu]);
+
+  const close = useCallback(() => {
+    useTerminalStore.getState().toggleDirPicker();
+  }, []);
+
+  const selectDir = useCallback((dir: string) => {
+    useTerminalStore.getState().cdToDir(dir);
+    close();
+  }, [close]);
+
+  const handleKeyDown = useCallback((e: React.KeyboardEvent) => {
+    if (ctxMenu) { if (e.key === 'Escape') setCtxMenu(null); e.stopPropagation(); return; }
+    switch (e.key) {
+      case 'ArrowDown': e.preventDefault(); setSelectedIndex((i) => Math.min(i + 1, allDirs.length - 1)); break;
+      case 'ArrowUp': e.preventDefault(); setSelectedIndex((i) => Math.max(i - 1, 0)); break;
+      case 'Delete':
+        e.preventDefault();
+        if (allDirs[selectedIndex]) {
+          const item = allDirs[selectedIndex];
+          if (item.isFav) useTerminalStore.getState().removeFavoriteDir(item.dir);
+          else useTerminalStore.getState().removeRecentDir(item.dir);
+        }
+        break;
+      case 'Enter':
+        e.preventDefault();
+        if (query && allDirs.length === 0) { useTerminalStore.getState().cdToDir(query); close(); }
+        else if (allDirs[selectedIndex]) selectDir(allDirs[selectedIndex].dir);
+        break;
+      case 'Escape': e.preventDefault(); close(); break;
+    }
+    e.stopPropagation();
+  }, [allDirs, selectedIndex, query, selectDir, close, ctxMenu]);
+
+  const handleContextMenu = useCallback((e: React.MouseEvent, dir: string, isFav: boolean) => {
+    e.preventDefault();
+    e.stopPropagation();
+    setCtxMenu({ x: e.clientX, y: e.clientY, dir, isFav });
+  }, []);
+
+  const handleAddFav = useCallback(() => {
+    if (favValue.trim()) {
+      useTerminalStore.getState().addFavoriteDir(favValue.trim());
+      setFavValue('');
+      setAddingFav(false);
+    }
+  }, [favValue]);
+
+  if (!show) return null;
+
+  return (
+    <div className="palette-backdrop" onClick={close}>
+      <div className="palette" onClick={(e) => e.stopPropagation()}>
+        <input
+          ref={inputRef}
+          className="palette-input"
+          type="text"
+          placeholder="Search dirs or type a path..."
+          value={query}
+          onChange={(e) => { setQuery(e.target.value); setSelectedIndex(0); }}
+          onKeyDown={handleKeyDown}
+        />
+        <div className="palette-list" ref={listRef}>
+          {favoriteDirs.length > 0 && !query && (
+            <div className="dir-section-label">Favorites</div>
+          )}
+          {allDirs.map((item, index) => (
+            <React.Fragment key={item.dir}>
+              {!query && index === favoriteDirs.length && recentDirs.some((d) => !new Set(favoriteDirs).has(d)) && (
+                <div className="dir-section-label">Recent</div>
+              )}
+              <div
+                className={`palette-item${index === selectedIndex ? ' selected' : ''}`}
+                onClick={() => selectDir(item.dir)}
+                onMouseEnter={() => setSelectedIndex(index)}
+                onContextMenu={(e) => handleContextMenu(e, item.dir, item.isFav)}
+              >
+                <span className="dir-star" onClick={(e) => { e.stopPropagation(); useTerminalStore.getState()[item.isFav ? 'removeFavoriteDir' : 'addFavoriteDir'](item.dir); }}>
+                  {item.isFav ? '\u2605' : '\u2606'}
+                </span>
+                <span className="palette-label">{item.dir}</span>
+                <button
+                  className="dir-remove-btn"
+                  onClick={(e) => {
+                    e.stopPropagation();
+                    if (item.isFav) useTerminalStore.getState().removeFavoriteDir(item.dir);
+                    else useTerminalStore.getState().removeRecentDir(item.dir);
+                  }}
+                  title="Remove"
+                >
+                  &#10005;
+                </button>
+              </div>
+            </React.Fragment>
+          ))}
+          {allDirs.length === 0 && !query && (
+            <div className="palette-empty">No favorite or recent directories</div>
+          )}
+          {allDirs.length === 0 && query && (
+            <div className="palette-empty">Press Enter to cd to "{query}"</div>
+          )}
+        </div>
+        <div className="dir-footer">
+          <div className="dir-hint">Right-click for options | Delete key to remove | Click star to favorite</div>
+          <div className="dir-footer-buttons">
+            <button className="dir-add-fav-btn" onClick={() => {
+              const s = useTerminalStore.getState();
+              const t = s.focusedTerminalId ? s.terminals.get(s.focusedTerminalId) : null;
+              if (t?.cwd) { s.addRecentDir(t.cwd); s.addFavoriteDir(t.cwd); }
+            }}>
+              + Save Current Dir
+            </button>
+            {addingFav ? (
+              <div className="dir-add-row">
+                <input ref={favInputRef} className="settings-input" type="text" placeholder="Path to favorite..." value={favValue}
+                  onChange={(e) => setFavValue(e.target.value)}
+                  onKeyDown={(e) => { e.stopPropagation(); if (e.key === 'Enter') handleAddFav(); if (e.key === 'Escape') setAddingFav(false); }} />
+                <button className="dir-add-btn" onClick={handleAddFav}>Add</button>
+              </div>
+            ) : (
+              <button className="dir-add-fav-btn" onClick={() => setAddingFav(true)}>+ Add Custom Path</button>
+            )}
+          </div>
+        </div>
+      </div>
+
+      {/* Context menu */}
+      {ctxMenu && (
+        <div ref={ctxRef} className="context-menu" style={{ left: ctxMenu.x, top: ctxMenu.y }}>
+          <button className="context-menu-item" onClick={() => { selectDir(ctxMenu.dir); setCtxMenu(null); }}>
+            cd to this directory
+          </button>
+          <button className="context-menu-item" onClick={() => { window.terminalAPI.openPath(ctxMenu.dir); setCtxMenu(null); }}>
+            Open in file explorer
+          </button>
+          <button className="context-menu-item" onClick={() => {
+            navigator.clipboard.writeText(ctxMenu.dir);
+            useTerminalStore.getState().addToast('Path copied to clipboard');
+            setCtxMenu(null);
+          }}>
+            Copy path
+          </button>
+          <div className="context-menu-separator" />
+          <button className="context-menu-item" onClick={() => {
+            const s = useTerminalStore.getState();
+            if (ctxMenu.isFav) s.removeFavoriteDir(ctxMenu.dir); else s.addFavoriteDir(ctxMenu.dir);
+            setCtxMenu(null);
+          }}>
+            {ctxMenu.isFav ? 'Remove from favorites' : 'Add to favorites'}
+          </button>
+          <button className="context-menu-item danger" onClick={() => {
+            const s = useTerminalStore.getState();
+            if (ctxMenu.isFav) s.removeFavoriteDir(ctxMenu.dir);
+            else s.removeRecentDir(ctxMenu.dir);
+            setCtxMenu(null);
+          }}>
+            Remove
+          </button>
+        </div>
+      )}
+    </div>
+  );
+};
+
+export default DirPicker;

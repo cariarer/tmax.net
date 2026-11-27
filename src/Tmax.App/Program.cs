@@ -5,6 +5,7 @@ using Microsoft.AspNetCore.Hosting.Server;
 using Microsoft.AspNetCore.Hosting.Server.Features;
 using Photino.NET;
 using Tmax.App.Rpc;
+using Tmax.Core.Config;
 using Tmax.Core.Pty;
 
 namespace Tmax.App;
@@ -60,13 +61,20 @@ public static class Program
         // Loopback only, OS-assigned port: nothing outside this machine can reach the terminals.
         builder.WebHost.UseUrls("http://127.0.0.1:0");
         builder.Services.AddSingleton<RpcServer>();
-        builder.Services.AddSingleton(_ => new PtyManager());
+        builder.Services.AddSingleton(_ => new ConfigStore());
+        builder.Services.AddSingleton(_ => new SessionStore());
+        // Spawning is limited to the shells in the config, read fresh on every spawn.
+        builder.Services.AddSingleton(sp => new PtyManager(() => sp.GetRequiredService<ConfigStore>().Shells));
 
         var app = builder.Build();
         var rpc = app.Services.GetRequiredService<RpcServer>();
         var pty = app.Services.GetRequiredService<PtyManager>();
+        var config = app.Services.GetRequiredService<ConfigStore>();
         PtyChannels.Register(rpc, pty);
         PlatformChannels.Register(rpc, pty);
+        AppChannels.Register(rpc, config, app.Services.GetRequiredService<SessionStore>(),
+            app.Services.GetRequiredService<ILoggerFactory>().CreateLogger("tmax"));
+        PendingChannels.Register(rpc);
 
         app.UseWebSockets();
         app.Map("/ws", async (HttpContext ctx) =>
@@ -104,7 +112,7 @@ public static class Program
     private static void RunWindow(string url, bool devTools)
     {
         var window = new PhotinoWindow()
-            .SetTitle("tmax.net")
+            .SetTitle("tmax")
             .SetUseOsDefaultSize(false)
             .SetSize(1280, 800)
             .Center()

@@ -1,0 +1,114 @@
+export const IPC = {
+  PTY_CREATE: 'pty:create',
+  PTY_DATA: 'pty:data',
+  PTY_WRITE: 'pty:write',
+  PTY_RESIZE: 'pty:resize',
+  PTY_KILL: 'pty:kill',
+  PTY_EXIT: 'pty:exit',
+  // main -> renderer: title written to the pane's TMAX_TITLE_FILE ('' clears it).
+  PTY_EXTERNAL_TITLE: 'pty:externalTitle',
+  PTY_GET_EXTERNAL_TITLE: 'pty:getExternalTitle',
+  PTY_DISABLE_EXTERNAL_TITLE: 'pty:disableExternalTitle',
+  CONFIG_GET: 'config:get',
+  CONFIG_SET: 'config:set',
+  SESSION_SAVE: 'session:save',
+  SESSION_LOAD: 'session:load',
+  // TASK-71: renderer -> main sync of user-set pane title overrides so OS
+  // notifications can show the same display name the user sees in the pane
+  // title. The map is `Record<string, string>` (sessionId -> displayName).
+  SESSION_NAME_OVERRIDES_SYNC: 'session:nameOverridesSync',
+  // TASK-163: main -> renderer broadcast when tmax-session.json changes on
+  // disk (because another tmax window wrote to it). Carries no payload; the
+  // renderer responds by re-reading the file via SESSION_LOAD and merging
+  // just the cross-window-syncable maps (sessionNameOverrides,
+  // sessionLifecycleOverrides, sessionPinned) into its in-memory state.
+  SESSION_FILE_CHANGED: 'session:fileChanged',
+  CONFIG_OPEN: 'config:open',
+  OPEN_PATH: 'shell:openPath',
+  DETACH_CREATE: 'detach:create',
+  DETACH_CLOSE: 'detach:close',
+  DETACH_CLOSED: 'detach:closed',
+  DETACH_FOCUS: 'detach:focus',
+  BACKLOG_WINDOW_OPEN: 'backlogWindow:open',
+  BACKLOG_WINDOW_CLOSE: 'backlogWindow:close',
+  BACKLOG_WINDOW_CLOSED: 'backlogWindow:closed',
+  COPILOT_LIST_SESSIONS: 'copilot:listSessions',
+  COPILOT_GET_SESSION: 'copilot:getSession',
+  COPILOT_SEARCH_SESSIONS: 'copilot:searchSessions',
+  COPILOT_SESSION_UPDATED: 'copilot:sessionUpdated',
+  COPILOT_SESSION_ADDED: 'copilot:sessionAdded',
+  COPILOT_SESSION_REMOVED: 'copilot:sessionRemoved',
+  COPILOT_START_WATCHING: 'copilot:startWatching',
+  COPILOT_STOP_WATCHING: 'copilot:stopWatching',
+  COPILOT_GET_PROMPTS: 'copilot:getPrompts',
+  COPILOT_SEARCH_PROMPTS: 'copilot:searchPrompts',
+  COPILOT_GET_RECENT_PROMPTS: 'copilot:getRecentPrompts',
+  AI_INVALIDATE_CACHES: 'ai:invalidateCaches',
+  CLAUDE_CODE_LIST_SESSIONS: 'claude-code:listSessions',
+  CLAUDE_CODE_GET_SESSION: 'claude-code:getSession',
+  CLAUDE_CODE_SEARCH_SESSIONS: 'claude-code:searchSessions',
+  CLAUDE_CODE_SESSION_UPDATED: 'claude-code:sessionUpdated',
+  CLAUDE_CODE_SESSION_ADDED: 'claude-code:sessionAdded',
+  CLAUDE_CODE_SESSION_REMOVED: 'claude-code:sessionRemoved',
+  CLAUDE_CODE_START_WATCHING: 'claude-code:startWatching',
+  CLAUDE_CODE_STOP_WATCHING: 'claude-code:stopWatching',
+  CLAUDE_CODE_GET_PROMPTS: 'claude-code:getPrompts',
+  AI_GET_SESSION_TIMELINE: 'ai:getSessionTimeline',
+  VERSION_UPDATE_STATUS: 'version:updateStatus',
+  VERSION_GET_UPDATE: 'version:getUpdate',
+  VERSION_CHECK_NOW: 'version:checkNow',
+  VERSION_GET_APP_VERSION: 'version:getAppVersion',
+  VERSION_RESTART_AND_UPDATE: 'version:restartAndUpdate',
+  VERSION_GET_CHANGELOG: 'version:getChangelog',
+  CLIPBOARD_SAVE_IMAGE: 'clipboard:saveImage',
+  IMAGE_READ_DATA_URL: 'image:readDataUrl',
+  RESOLVE_CLIPBOARD_BASENAME: 'image:resolveClipboardBasename',
+  PTY_GET_DIAG: 'pty:getDiag',
+  // TASK-171: list descendant process names of a PTY's shell pid so the
+  // renderer can detect AI CLIs (copilot/claude/cc) running inside a pane
+  // without text-pattern scanning. One-shot query, not polled.
+  PTY_GET_CHILD_PROCESSES: 'pty:getChildProcesses',
+  DIAG_LOG: 'diag:log',
+  DIAG_GET_LOG_PATH: 'diag:getLogPath',
+  DIAG_READ_TAIL: 'diag:readTail',
+  GET_SYSTEM_FONTS: 'system:getFonts',
+  // ── Transparency ────────────────────────────────────────────────────
+  SET_BACKGROUND_MATERIAL: 'transparency:setMaterial',
+  GET_PLATFORM_SUPPORTS_MATERIAL: 'transparency:platformSupports',
+  // ── Diff editor ────────────────────────────────────────────────────
+  DIFF_RESOLVE_GIT_ROOT: 'diff:resolveGitRoot',
+  DIFF_GET_CODE_CHANGES: 'diff:getCodeChanges',
+  DIFF_GET_DIFF: 'diff:getDiff',
+  DIFF_GET_ANNOTATED_FILE: 'diff:getAnnotatedFile',
+  // ── File explorer ──────────────────────────────────────────────────
+  FILE_LIST: 'file:list',
+  FILE_READ: 'file:read',
+  FILE_REVEAL: 'file:reveal',
+  FILE_RENAME: 'file:rename',
+  FILE_DELETE: 'file:delete',
+  // ── Git worktree ────────────────────────────────────────────────────
+  GIT_LIST_WORKTREES: 'git:listWorktrees',
+  GIT_CREATE_WORKTREE: 'git:createWorktree',
+  GIT_DELETE_WORKTREE: 'git:deleteWorktree',
+  GIT_GET_BRANCHES: 'git:getBranches',
+  // ── Backlog board (TASK-167) ───────────────────────────────────────
+  BACKLOG_LIST_TASKS: 'backlog:listTasks',
+  BACKLOG_GET_TASK: 'backlog:getTask',
+  BACKLOG_EDIT_TASK: 'backlog:editTask',
+  BACKLOG_CREATE_TASK: 'backlog:createTask',
+  BACKLOG_ARCHIVE_TASK: 'backlog:archiveTask',
+  BACKLOG_DELETE_TASK: 'backlog:deleteTask',
+  BACKLOG_VALIDATE_PROJECT: 'backlog:validateProject',
+  BACKLOG_INIT_PROJECT: 'backlog:initProject',
+  BACKLOG_PICK_FOLDER: 'backlog:pickFolder',
+  BACKLOG_SAVE_IMAGE: 'backlog:saveImage',
+  // ── Keybindings file (TASK-39) ─────────────────────────────────────
+  KEYBINDINGS_GET: 'keybindings:get',
+  KEYBINDINGS_OPEN_FILE: 'keybindings:openFile',
+  KEYBINDINGS_RESET: 'keybindings:reset',
+  KEYBINDINGS_CHANGED: 'keybindings:changed',
+  // ── Terminal context menu ────────────────────────────────────────────
+  TERMINAL_CONTEXT_MENU: 'terminal:contextMenu',
+} as const;
+
+export type IpcChannel = (typeof IPC)[keyof typeof IPC];

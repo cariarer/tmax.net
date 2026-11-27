@@ -12,6 +12,7 @@ public sealed record PtyCreateOptions
     /// <summary>Shell executable. Empty means "use the platform default shell".</summary>
     public string? ShellPath { get; init; }
 
+    /// <summary>Ignored: arguments always come from the matching shell profile.</summary>
     public IReadOnlyList<string>? Args { get; init; }
 
     public string? Cwd { get; init; }

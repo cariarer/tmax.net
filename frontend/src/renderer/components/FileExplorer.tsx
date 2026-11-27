@@ -1,0 +1,547 @@
+import React, { useState, useEffect, useCallback, useRef } from 'react';
+import ReactDOM from 'react-dom';
+import { useTerminalStore } from '../state/terminal-store';
+import { tokenizeAnd, matchesAllTokens } from '../../shared/and-filter';
+import MarkdownPreview from './MarkdownPreview';
+import ZoomControls from './ZoomControls';
+import { useZoom } from '../hooks/useZoom';
+import { confirmDialog, alertDialog } from './AppDialog';
+
+interface FileEntry {
+  name: string;
+  isDirectory: boolean;
+  path: string;
+}
+
+const MIN_WIDTH = 180;
+const MAX_WIDTH = 600;
+const DEFAULT_WIDTH = 240;
+const TEXT_EXTENSIONS = new Set(['ts', 'tsx', 'js', 'jsx', 'json', 'md', 'txt', 'css', 'html', 'yml', 'yaml', 'toml', 'sh', 'bash', 'py', 'rs', 'go', 'java', 'c', 'cpp', 'h', 'hpp', 'cs', 'xml', 'svg', 'env', 'gitignore', 'dockerfile', 'makefile', 'cfg', 'ini', 'conf', 'log', 'sql', 'graphql', 'proto', 'lock']);
+
+const FileExplorer: React.FC = () => {
+  const show = useTerminalStore((s) => s.showFileExplorer);
+  const focusedId = useTerminalStore((s) => s.focusedTerminalId);
+  const terminals = useTerminalStore((s) => s.terminals);
+  const focused = focusedId ? terminals.get(focusedId) : null;
+  const terminalCwd = focused?.cwd || '';
+  const wslDistro = focused?.wslDistro;
+
+  const [browsePath, setBrowsePath] = useState('');
+  const [files, setFiles] = useState<FileEntry[]>([]);
+  const [expanded, setExpanded] = useState<Record<string, boolean>>({});
+  const [children, setChildren] = useState<Record<string, FileEntry[]>>({});
+  const [filter, setFilter] = useState('');
+  const [showHidden, setShowHidden] = useState(false);
+  const [editingPath, setEditingPath] = useState(false);
+  const [pathInputValue, setPathInputValue] = useState('');
+  const [ctxMenu, setCtxMenu] = useState<{ x: number; y: number; entry: FileEntry } | null>(null);
+  const [renamingPath, setRenamingPath] = useState<string | null>(null);
+  const [renameValue, setRenameValue] = useState('');
+  const renameInputRef = useRef<HTMLInputElement>(null);
+  const ctxRef = useRef<HTMLDivElement>(null);
+  const [preview, setPreview] = useState<{ name: string; path: string; content: string } | null>(null);
+  const [previewWidth, setPreviewWidth] = useState(50); // percentage
+  const [previewSide, setPreviewSide] = useState<'right' | 'left'>('right');
+  const previewOverlayRef = useRef<HTMLDivElement>(null);
+  const { zoomPercent: previewZoom, zoomIn: previewZoomIn, zoomOut: previewZoomOut, zoomReset: previewZoomReset, fontSize: previewFontSize } = useZoom({ containerRef: previewOverlayRef });
+  const [width, setWidth] = useState(DEFAULT_WIDTH);
+  const [resizing, setResizing] = useState(false);
+  const filterRef = useRef<HTMLInputElement>(null);
+  const pathInputRef = useRef<HTMLInputElement>(null);
+
+  const currentPath = browsePath || terminalCwd;
+
+  // Auto-focus the non-md preview panel when it opens
+  useEffect(() => {
+    if (preview && previewOverlayRef.current) {
+      previewOverlayRef.current.focus();
+    }
+  }, [preview]);
+
+  // Sync browsePath when terminal CWD changes
+  useEffect(() => {
+    if (terminalCwd) setBrowsePath(terminalCwd);
+  }, [terminalCwd]);
+
+  // Consume an external target path (e.g. from Worktree Panel "open in explorer")
+  const targetPath = useTerminalStore((s) => s.fileExplorerTargetPath);
+  useEffect(() => {
+    if (!targetPath) return;
+    setBrowsePath(targetPath);
+    setExpanded({});
+    setChildren({});
+    setFilter('');
+    useTerminalStore.setState({ fileExplorerTargetPath: null });
+  }, [targetPath]);
+
+  const navigateTo = useCallback((dir: string) => {
+    setBrowsePath(dir);
+    setExpanded({});
+    setChildren({});
+    setFilter('');
+  }, []);
+
+  const navigateUp = useCallback(() => {
+    if (!currentPath) return;
+    const parent = currentPath.replace(/[/\\][^/\\]+[/\\]?$/, '') || currentPath.slice(0, 3);
+    navigateTo(parent);
+  }, [currentPath, navigateTo]);
+
+  // Load root directory
+  useEffect(() => {
+    if (!show || !currentPath) return;
+    (window.terminalAPI as any).fileList(currentPath, wslDistro).then((entries: FileEntry[]) => {
+      setFiles(showHidden ? entries : entries.filter((e: FileEntry) => !e.name.startsWith('.')));
+    });
+  }, [currentPath, show, showHidden, wslDistro]);
+
+  const toggleDir = useCallback((dirPath: string) => {
+    setExpanded((prev) => {
+      const next = { ...prev, [dirPath]: !prev[dirPath] };
+      if (next[dirPath] && !children[dirPath]) {
+        (window.terminalAPI as any).fileList(dirPath, wslDistro).then((entries: FileEntry[]) => {
+          setChildren((c) => ({ ...c, [dirPath]: showHidden ? entries : entries.filter((e: FileEntry) => !e.name.startsWith('.')) }));
+        });
+      }
+      return next;
+    });
+  }, [children, wslDistro]);
+
+  // Re-fetch a directory's children, used after rename/delete to keep the
+  // tree in sync without a full reload.
+  const reloadDir = useCallback((dirPath: string) => {
+    return (window.terminalAPI as any).fileList(dirPath, wslDistro).then((entries: FileEntry[]) => {
+      const filtered = showHidden ? entries : entries.filter((e: FileEntry) => !e.name.startsWith('.'));
+      if (dirPath === currentPath) {
+        setFiles(filtered);
+      } else {
+        setChildren((c) => ({ ...c, [dirPath]: filtered }));
+      }
+    });
+  }, [wslDistro, showHidden, currentPath]);
+
+  const parentDirOf = useCallback((p: string): string => {
+    if (wslDistro && p.startsWith('/')) {
+      const i = p.lastIndexOf('/');
+      return i <= 0 ? '/' : p.slice(0, i);
+    }
+    // Windows
+    const m = p.match(/^(.*)[\\/][^\\/]+$/);
+    return m ? m[1] : p;
+  }, [wslDistro]);
+
+  const beginRename = useCallback((entry: FileEntry) => {
+    setRenamingPath(entry.path);
+    setRenameValue(entry.name);
+    setCtxMenu(null);
+    requestAnimationFrame(() => {
+      const el = renameInputRef.current;
+      if (el) {
+        el.focus();
+        // Select the basename without the extension to make typing easier
+        const dot = entry.name.lastIndexOf('.');
+        if (!entry.isDirectory && dot > 0) el.setSelectionRange(0, dot);
+        else el.select();
+      }
+    });
+  }, []);
+
+  const commitRename = useCallback(async (entry: FileEntry) => {
+    const newName = renameValue.trim();
+    setRenamingPath(null);
+    if (!newName || newName === entry.name) return;
+    const res = await (window.terminalAPI as any).fileRename(entry.path, newName, wslDistro);
+    if (!res?.ok) {
+      await alertDialog({
+        title: 'Rename failed',
+        message: res?.error || 'unknown error',
+      });
+      return;
+    }
+    await reloadDir(parentDirOf(entry.path));
+  }, [renameValue, wslDistro, reloadDir, parentDirOf]);
+
+  const deleteEntry = useCallback(async (entry: FileEntry) => {
+    const what = entry.isDirectory ? 'folder' : 'file';
+    const ok = await confirmDialog({
+      title: `Delete ${what}?`,
+      message: `Move ${what} "${entry.name}" to the Recycle Bin?`,
+      confirmText: 'Delete',
+      danger: true,
+    });
+    if (!ok) return;
+    const res = await (window.terminalAPI as any).fileDelete(entry.path, wslDistro);
+    if (!res?.ok) {
+      await alertDialog({
+        title: 'Delete failed',
+        message: res?.error || 'unknown error',
+      });
+      return;
+    }
+    await reloadDir(parentDirOf(entry.path));
+    // If we just deleted the previewed file, close the preview.
+    if (preview && preview.path === entry.path) setPreview(null);
+  }, [wslDistro, reloadDir, parentDirOf, preview]);
+
+  const revealEntry = useCallback((entry: FileEntry) => {
+    (window.terminalAPI as any).fileReveal(entry.path, wslDistro);
+  }, [wslDistro]);
+
+  const openFileExternally = useCallback((filePath: string) => {
+    if (wslDistro && filePath.startsWith('/')) {
+      const uncPath = `\\\\wsl.localhost\\${wslDistro}${filePath.replace(/\//g, '\\')}`;
+      (window.terminalAPI as any).openPath(uncPath);
+    } else {
+      (window.terminalAPI as any).openPath(filePath);
+    }
+  }, [wslDistro]);
+
+  // Re-read the previewed file from disk and refresh the pane in place.
+  // Mirrors the reload affordance in MarkdownPreviewOverlay so .md files
+  // opened from the file tree get the same button.
+  const handlePreviewReload = useCallback(() => {
+    if (!preview) return;
+    const { path: reloadPath } = preview;
+    (window.terminalAPI as any).fileRead(reloadPath, wslDistro).then((content: string | null) => {
+      if (typeof content !== 'string') return;
+      // Don't clobber if the user closed or switched files mid-reload.
+      setPreview((cur) => (cur && cur.path === reloadPath ? { ...cur, content } : cur));
+    }).catch(() => { /* swallow read errors, matching handleFileClick */ });
+  }, [preview, wslDistro]);
+
+  const handleFileClick = useCallback((filePath: string, fileName: string) => {
+    // Try to preview any file — fileRead returns null for binary/large files
+    (window.terminalAPI as any).fileRead(filePath, wslDistro).then((content: string | null) => {
+      if (content !== null) {
+        setPreview({ name: fileName, path: filePath, content });
+      } else {
+        openFileExternally(filePath);
+      }
+    }).catch(() => {
+      openFileExternally(filePath);
+    });
+  }, [wslDistro, openFileExternally]);
+
+  const handleResizeStart = useCallback((e: React.MouseEvent) => {
+    e.preventDefault();
+    const startX = e.clientX;
+    const startWidth = width;
+    setResizing(true);
+    const handleMouseMove = (moveEvent: MouseEvent) => {
+      const newWidth = Math.max(MIN_WIDTH, Math.min(MAX_WIDTH, startWidth + (moveEvent.clientX - startX)));
+      setWidth(newWidth);
+    };
+    const handleMouseUp = () => {
+      setResizing(false);
+      window.removeEventListener('mousemove', handleMouseMove);
+      window.removeEventListener('mouseup', handleMouseUp);
+    };
+    window.addEventListener('mousemove', handleMouseMove);
+    window.addEventListener('mouseup', handleMouseUp);
+  }, [width]);
+
+  // Close context menu on outside click
+  useEffect(() => {
+    if (!ctxMenu) return;
+    const handler = (e: MouseEvent) => {
+      if (ctxRef.current && !ctxRef.current.contains(e.target as Node)) setCtxMenu(null);
+    };
+    document.addEventListener('mousedown', handler);
+    return () => document.removeEventListener('mousedown', handler);
+  }, [ctxMenu]);
+
+  if (!show) return null;
+
+  const tokens = tokenizeAnd(filter);
+
+  const renderEntry = (entry: FileEntry, depth: number, parentMatches?: boolean): React.ReactNode => {
+    const nameMatches = tokens.length === 0 || matchesAllTokens(entry.name.toLowerCase(), tokens);
+    if (!nameMatches && !parentMatches) {
+      if (entry.isDirectory && children[entry.path]) {
+        const hasMatch = children[entry.path].some((c) => matchesAllTokens(c.name.toLowerCase(), tokens));
+        if (!hasMatch) return null;
+      } else if (!entry.isDirectory) {
+        return null;
+      } else {
+        // Unloaded directory that doesn't match — hide it
+        return null;
+      }
+    }
+
+    const ext = entry.name.includes('.') ? entry.name.split('.').pop()?.toLowerCase() : '';
+    const fileIconClass = entry.isDirectory
+      ? (expanded[entry.path] ? 'folder-open' : 'folder')
+      : (ext || 'default');
+
+    return (
+      <div key={entry.path}>
+        <div
+          className={`file-entry${entry.isDirectory ? ' dir' : ' file'}${preview?.path === entry.path ? ' previewing' : ''}`}
+          style={{ paddingLeft: 12 + depth * 16 }}
+          onClick={() => {
+            if (entry.isDirectory) {
+              toggleDir(entry.path);
+            } else {
+              handleFileClick(entry.path, entry.name);
+            }
+          }}
+          onDoubleClick={() => {
+            if (entry.isDirectory) {
+              navigateTo(entry.path);
+            } else {
+              openFileExternally(entry.path);
+            }
+          }}
+          onContextMenu={(e) => {
+            e.preventDefault();
+            e.stopPropagation();
+            setCtxMenu({ x: e.clientX, y: e.clientY, entry });
+          }}
+        >
+          {entry.isDirectory && (
+            <span className="file-chevron">{expanded[entry.path] ? '\u25BC' : '\u25B6'}</span>
+          )}
+          <span className={`file-type-icon ${fileIconClass}`} />
+          {renamingPath === entry.path ? (
+            <input
+              ref={renameInputRef}
+              className="file-rename-input"
+              value={renameValue}
+              onChange={(e) => setRenameValue(e.target.value)}
+              onClick={(e) => e.stopPropagation()}
+              onDoubleClick={(e) => e.stopPropagation()}
+              onKeyDown={(e) => {
+                e.stopPropagation();
+                if (e.key === 'Enter') {
+                  e.preventDefault();
+                  void commitRename(entry);
+                } else if (e.key === 'Escape') {
+                  e.preventDefault();
+                  setRenamingPath(null);
+                }
+              }}
+              onBlur={() => { void commitRename(entry); }}
+            />
+          ) : (
+            <span className="file-name">{entry.name}</span>
+          )}
+        </div>
+        {entry.isDirectory && expanded[entry.path] && children[entry.path] && (
+          <div className="file-children" style={{ borderLeft: '1px solid var(--border-color)', marginLeft: 19 + depth * 16 }}>
+            {children[entry.path].map((child) => renderEntry(child, depth + 1, nameMatches))}
+          </div>
+        )}
+      </div>
+    );
+  };
+
+  const pathParts = currentPath.split(/[/\\]/).filter(Boolean);
+  // On Windows, first part is drive letter like "C:"
+  const breadcrumbs = pathParts.map((part, i) => ({
+    label: part,
+    path: pathParts.slice(0, i + 1).join('\\') + (i === 0 && part.endsWith(':') ? '\\' : ''),
+  }));
+
+  return (
+    <div className={`file-explorer-panel${resizing ? ' resizing' : ''}`} style={{ width, minWidth: width }}>
+      <div className="file-explorer-resize" onMouseDown={handleResizeStart} />
+      <div className="file-explorer-header">
+        <div className="file-explorer-nav">
+          <button className="file-explorer-nav-btn" onClick={() => { setExpanded({}); }} title="Collapse all">&#8722;</button>
+          <button className="file-explorer-nav-btn" onClick={navigateUp} title="Go up">&#8593;</button>
+          <button className="file-explorer-nav-btn" onClick={() => navigateTo(terminalCwd)} title="Go to terminal CWD">&#8962;</button>
+        </div>
+        {editingPath ? (
+          <input
+            ref={pathInputRef}
+            className="file-explorer-path-input"
+            value={pathInputValue}
+            onChange={(e) => setPathInputValue(e.target.value)}
+            onKeyDown={(e) => {
+              e.stopPropagation();
+              if (e.key === 'Enter' && pathInputValue.trim()) {
+                navigateTo(pathInputValue.trim());
+                setEditingPath(false);
+              }
+              if (e.key === 'Escape') setEditingPath(false);
+            }}
+            onBlur={() => setEditingPath(false)}
+          />
+        ) : (
+          <div
+            className="file-explorer-breadcrumbs"
+            onClick={() => { setEditingPath(true); setPathInputValue(currentPath); requestAnimationFrame(() => pathInputRef.current?.focus()); }}
+            title="Click to edit path"
+          >
+            {breadcrumbs.map((bc, i) => (
+              <span key={i}>
+                <span
+                  className="file-explorer-crumb"
+                  onClick={(e) => { e.stopPropagation(); navigateTo(bc.path); }}
+                >{bc.label}</span>
+                {i < breadcrumbs.length - 1 && <span className="file-explorer-sep">/</span>}
+              </span>
+            ))}
+          </div>
+        )}
+        <div style={{ display: 'flex', gap: '2px' }}>
+          <button
+            className="file-explorer-nav-btn"
+            onClick={() => {
+              void reloadDir(currentPath);
+              // Also re-expand any expanded folders
+              for (const dirPath of Object.keys(expanded)) {
+                if (expanded[dirPath]) void reloadDir(dirPath);
+              }
+            }}
+            title="Refresh"
+          >&#x21BB;</button>
+          <button className="file-explorer-nav-btn" onClick={() => setShowHidden((v) => !v)} title={showHidden ? 'Hide dotfiles' : 'Show dotfiles'}>{showHidden ? '\u25C9' : '\u25CB'}</button>
+          <button className="dir-panel-close" onClick={() => useTerminalStore.getState().toggleFileExplorer()}>&#10005;</button>
+        </div>
+      </div>
+      <input
+        ref={filterRef}
+        className="dir-panel-search"
+        type="text"
+        placeholder="Filter files..."
+        value={filter}
+        onChange={(e) => setFilter(e.target.value)}
+        onKeyDown={(e) => { if (e.key === 'Escape') { setFilter(''); e.stopPropagation(); } }}
+      />
+      <div className="file-explorer-list" style={{ flex: 1 }}>
+        {files.map((entry) => renderEntry(entry, 0))}
+        {files.length === 0 && <div className="dir-panel-empty">No files</div>}
+      </div>
+      {preview && ReactDOM.createPortal(
+        /\.md$/i.test(preview.name) ? (
+          <MarkdownPreview
+            content={preview.content}
+            fileName={preview.name}
+            filePath={preview.path}
+            onClose={() => setPreview(null)}
+            onOpenExternally={openFileExternally}
+            onReload={handlePreviewReload}
+            side={previewSide}
+            onToggleSide={() => setPreviewSide((s) => s === 'right' ? 'left' : 'right')}
+            width={`${previewWidth}%`}
+          />
+        ) : (
+        <div
+          ref={previewOverlayRef}
+          className={`file-preview-overlay ${previewSide}`}
+          style={{
+            width: `${previewWidth}%`,
+            ...(previewSide === 'left' ? { left: width + 1 } : {}),
+          }}
+          tabIndex={0}
+          onKeyDown={(e) => { if (e.key === 'Escape') setPreview(null); }}
+        >
+          <div
+            className="file-preview-resize"
+            onMouseDown={(e) => {
+              e.preventDefault();
+              const startX = e.clientX;
+              const startWidth = previewWidth;
+              const handleMove = (me: MouseEvent) => {
+                const delta = previewSide === 'right' ? startX - me.clientX : me.clientX - startX;
+                const newWidth = Math.max(20, Math.min(80, startWidth + (delta / window.innerWidth) * 100));
+                setPreviewWidth(newWidth);
+              };
+              const handleUp = () => {
+                window.removeEventListener('mousemove', handleMove);
+                window.removeEventListener('mouseup', handleUp);
+              };
+              window.addEventListener('mousemove', handleMove);
+              window.addEventListener('mouseup', handleUp);
+            }}
+          />
+          <div className="file-preview-sidebar">
+            <div className="file-preview-header">
+              <span className="file-preview-name">{preview.name}</span>
+              <div style={{ display: 'flex', gap: 6, flexShrink: 0, alignItems: 'center' }}>
+                <ZoomControls zoomPercent={previewZoom} onZoomIn={previewZoomIn} onZoomOut={previewZoomOut} onZoomReset={previewZoomReset} />
+                <button className="file-preview-btn" onClick={handlePreviewReload} title="Reload from disk" aria-label="Reload from disk">&#x21BB;</button>
+                <button className="file-preview-btn" onClick={() => openFileExternally(preview.path)} title="Open externally">&#8599;</button>
+                <button className="file-preview-btn" onClick={() => setPreviewSide((s) => s === 'right' ? 'left' : 'right')} title="Move to other side">{previewSide === 'right' ? '\u25C0' : '\u25B6'}</button>
+                <button className="file-preview-btn close" onClick={() => setPreview(null)} title="Close (Esc)">&#10005;</button>
+              </div>
+            </div>
+            <pre className="file-preview-content" style={{ fontSize: previewFontSize(12) }}>{preview.content}</pre>
+          </div>
+        </div>
+        ),
+        document.body,
+      )}
+      {ctxMenu && (
+        <div ref={ctxRef} className="context-menu" style={{ left: ctxMenu.x, top: ctxMenu.y, zIndex: 1000 }}>
+          {!ctxMenu.entry.isDirectory && (
+            <button className="context-menu-item" onClick={() => {
+              handleFileClick(ctxMenu.entry.path, ctxMenu.entry.name);
+              setCtxMenu(null);
+            }}>
+              &#128065; Preview
+            </button>
+          )}
+          <button className="context-menu-item" onClick={() => {
+            if (ctxMenu.entry.isDirectory) {
+              openFileExternally(ctxMenu.entry.path);
+            } else {
+              openFileExternally(ctxMenu.entry.path);
+            }
+            setCtxMenu(null);
+          }}>
+            {ctxMenu.entry.isDirectory ? '\uD83D\uDCC2 Open Folder' : '\u2197 Open in Editor'}
+          </button>
+          {ctxMenu.entry.isDirectory && (
+            <button className="context-menu-item" onClick={() => {
+              navigateTo(ctxMenu.entry.path);
+              setCtxMenu(null);
+            }}>
+              &#128194; Browse Here
+            </button>
+          )}
+          {ctxMenu.entry.isDirectory && (
+            <button className="context-menu-item" onClick={() => {
+              // cd to this directory in the focused terminal
+              const tid = useTerminalStore.getState().focusedTerminalId;
+              if (tid) {
+                const cdPath = wslDistro ? ctxMenu.entry.path : ctxMenu.entry.path;
+                window.terminalAPI.writePty(tid, `cd "${cdPath}"\r`);
+              }
+              setCtxMenu(null);
+            }}>
+              &#9654; CD Here
+            </button>
+          )}
+          <button className="context-menu-item" onClick={() => {
+            window.terminalAPI.clipboardWrite(ctxMenu.entry.path);
+            setCtxMenu(null);
+          }}>
+            &#128203; Copy Path
+          </button>
+          <button className="context-menu-item" onClick={() => {
+            revealEntry(ctxMenu.entry);
+            setCtxMenu(null);
+          }}>
+            &#128194; Reveal in File Explorer
+          </button>
+          <button className="context-menu-item" onClick={() => {
+            beginRename(ctxMenu.entry);
+          }}>
+            &#9999;&#65039; Rename
+          </button>
+          <button className="context-menu-item danger" onClick={() => {
+            const entry = ctxMenu.entry;
+            setCtxMenu(null);
+            void deleteEntry(entry);
+          }}>
+            &#128465;&#65039; Delete
+          </button>
+        </div>
+      )}
+    </div>
+  );
+};
+
+export default FileExplorer;

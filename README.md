@@ -23,8 +23,9 @@ fragment) and rejects WebSocket upgrades from foreign `Origin`s. An open termina
 | Path | Content |
 |---|---|
 | `src/Tmax.Core` | UI-independent services (PTY so far). Also the future home of what the MCP server will use. |
-| `src/Tmax.App` | Entry point: Kestrel + RPC + Photino window |
-| `frontend` | Vite/TypeScript frontend (currently a single xterm.js proof of concept) |
+| `src/Tmax.App` | Entry point: Kestrel + RPC + Photino window. `Rpc/PendingChannels.cs` lists the channels whose service is not ported yet |
+| `frontend/src/renderer`, `frontend/src/shared` | The original tmax React renderer, copied with minimal changes (marked `tmax.net:`) |
+| `frontend/src/bridge` | `window.terminalAPI` on top of the WebSocket (same surface as the Electron preload), clipboard, context menu |
 | `tests/Tmax.Core.Tests` | xUnit tests for the core services |
 
 ## Build & run
@@ -35,6 +36,7 @@ Requirements: .NET SDK 10 (see `global.json`), Node.js 20+.
 dotnet build                       # also builds the frontend into wwwroot
 dotnet run --project src/Tmax.App  # opens the window
 dotnet test                        # core tests
+cd frontend && npm test            # renderer unit tests (vitest)
 cd frontend && npm run test:rpc    # end-to-end smoke test over the real WebSocket protocol
 ```
 
@@ -52,10 +54,20 @@ Do not enable Native AOT — on Windows it requires the MSVC linker (Visual Stud
 
 Linux needs `libwebkit2gtk-4.1` at runtime.
 
+Data lives in `~/Library/Application Support/tmax.net` (macOS), `%APPDATA%\tmax.net` (Windows) or
+`~/.config/tmax.net` (Linux); override with `TMAX_DATA_DIR`. `--no-restore` starts without the saved session.
+
+### Differences to the Electron version
+
+- Clipboard: the WebView can read the clipboard synchronously only inside a `paste` event.
+  Ctrl/Cmd+V and the context menu use `terminalAPI.clipboardSnapshot()` (async) instead.
+- The terminal context menu is HTML instead of a native menu.
+- `npm run typecheck` reports 16 errors that already exist in the original renderer; the build does not run tsc (as in the original).
+
 ## Roadmap
 
 1. ✅ Proof of concept: window + backend + one PTY over WebSocket (verified on macOS)
-2. `terminalAPI` shim over the WebSocket, port the tmax React renderer
+2. ✅ `terminalAPI` shim over the WebSocket, original React renderer running; config + session persistence
 3. Port services: PTY → Config → Watcher → Git/Worktrees → WSL → SQLite/session monitors → Backlog
 4. Build & CI for all three platforms, installer/updates
 5. Later: MCP server on top of `Tmax.Core`, so agents running in a tmax terminal can control it
