@@ -1,6 +1,6 @@
 # Changelog
 
-## 0.1.0 (unreleased)
+## 0.1.0 (2026-11-27)
 
 First version of tmax.net, the .NET 10 + React port of tmax.
 

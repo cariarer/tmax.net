@@ -1,47 +1,65 @@
 name: Release
 
-# Push a tag like v0.2.0 to build installers for all platforms and publish them as a GitHub
-# release. Installed apps update themselves from these releases (Velopack).
+# Push a tag like v0.2.0 (or run this workflow manually with a version) to build installers for
+# all platforms and publish them as one GitHub release. Installed apps update themselves from
+# these releases (Velopack): each platform has its own channel, and the build bakes this
+# repository's URL into the app.
 on:
   push:
     tags: ['v*']
   workflow_dispatch:
     inputs:
       version:
-        description: 'Version to build (without v), e.g. 0.2.0'
+        description: 'Version to release (SemVer, without v), e.g. 0.2.0'
         required: true
 
 permissions:
   contents: write
 
+concurrency:
+  group: release
+  cancel-in-progress: false
+
+env:
+  VPK_VERSION: 1.2.161 # keep in sync with the Velopack package in src/Tmax.App
+  DOTNET_NOLOGO: 1
+  DOTNET_CLI_TELEMETRY_OPTOUT: 1
+
 jobs:
-  release:
+  build:
+    name: build (${{ matrix.rid }})
     strategy:
-      fail-fast: false
+      fail-fast: true
       matrix:
         include:
-          - { os: windows-latest, rid: win-x64,     channel: win,       exe: tmax.exe }
-          - { os: windows-latest, rid: win-arm64,   channel: win-arm64, exe: tmax.exe }
-          - { os: macos-latest,   rid: osx-arm64,   channel: osx,       exe: tmax }
-          - { os: macos-13,       rid: osx-x64,     channel: osx-x64,   exe: tmax }
-          - { os: ubuntu-latest,  rid: linux-x64,   channel: linux,     exe: tmax }
+          - { os: windows-latest, rid: win-x64,   channel: win,       exe: tmax.exe }
+          - { os: windows-latest, rid: win-arm64, channel: win-arm64, exe: tmax.exe }
+          - { os: macos-latest,   rid: osx-arm64, channel: osx,       exe: tmax }
+          - { os: macos-26-intel, rid: osx-x64,   channel: osx-x64,   exe: tmax }
+          - { os: ubuntu-latest,  rid: linux-x64, channel: linux,     exe: tmax }
     runs-on: ${{ matrix.os }}
-    env:
-      VERSION: ${{ github.event.inputs.version || github.ref_name }}
     steps:
-      - uses: actions/checkout@v4
-      - uses: actions/setup-dotnet@v4
+      - uses: actions/checkout@v7
+      - uses: actions/setup-dotnet@v6
         with:
           global-json-file: global.json
-      - uses: actions/setup-node@v4
+      - uses: actions/setup-node@v7
         with:
           node-version: '22'
           cache: npm
           cache-dependency-path: frontend/package-lock.json
 
-      - name: Normalize version
+      - name: Determine version
         shell: bash
-        run: echo "VERSION=${VERSION#v}" >> "$GITHUB_ENV"
+        run: |
+          v="${{ github.event.inputs.version || github.ref_name }}"
+          v="${v#v}"
+          if ! [[ "$v" =~ ^[0-9]+\.[0-9]+\.[0-9]+(-[0-9A-Za-z.-]+)?$ ]]; then echo "::error::'$v' is not a SemVer version"; exit 1; fi
+          echo "VERSION=$v" >> "$GITHUB_ENV"
+
+      - name: Test
+        if: matrix.rid != 'win-arm64' # can't run arm64 binaries on the x64 runner
+        run: dotnet test -c Release
 
       - name: Publish self-contained app
         shell: bash
@@ -51,23 +69,53 @@ jobs:
           -p:TmaxUpdateRepo=${{ github.server_url }}/${{ github.repository }}
 
       - name: Install Velopack CLI
-        run: dotnet tool install -g vpk
+        run: dotnet tool install -g vpk --version ${{ env.VPK_VERSION }}
 
-      # Previous release lets vpk build delta packages (small updates).
+      # The previous release of this channel lets vpk build a small delta update.
       - name: Download previous release
         shell: bash
         continue-on-error: true
-        run: vpk download github --repoUrl ${{ github.server_url }}/${{ github.repository }} --channel ${{ matrix.channel }} --token ${{ secrets.GITHUB_TOKEN }}
+        run: >
+          vpk download github --repoUrl ${{ github.server_url }}/${{ github.repository }}
+          --channel ${{ matrix.channel }} --token ${{ secrets.GITHUB_TOKEN }} --outputDir Releases
 
       - name: Pack installer
         shell: bash
         run: >
           vpk pack --packId tmax.net --packVersion $VERSION --packDir publish --mainExe ${{ matrix.exe }}
-          --packTitle tmax --channel ${{ matrix.channel }}
+          --packTitle tmax --runtime ${{ matrix.rid }} --channel ${{ matrix.channel }} --outputDir Releases
           ${{ startsWith(matrix.rid, 'win') && '--icon assets/icon.ico' || '' }}
 
+      - uses: actions/upload-artifact@v7
+        with:
+          name: releases-${{ matrix.channel }}
+          path: Releases/
+          if-no-files-found: error
+
+  publish:
+    needs: build
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/setup-dotnet@v6
+        with:
+          dotnet-version: '10.0.x'
+      - uses: actions/download-artifact@v8
+        with:
+          pattern: releases-*
+      - name: Install Velopack CLI
+        run: dotnet tool install -g vpk --version ${{ env.VPK_VERSION }}
+
+      # One release, one channel after the other; it is published only after the last upload,
+      # so nobody sees (or updates to) a half-filled release.
       - name: Upload to GitHub release
         shell: bash
-        run: >
-          vpk upload github --repoUrl ${{ github.server_url }}/${{ github.repository }} --channel ${{ matrix.channel }}
-          --publish --merge --releaseName "tmax.net $VERSION" --tag v$VERSION --token ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          v="${{ github.event.inputs.version || github.ref_name }}"; v="${v#v}"
+          channels=(win win-arm64 osx osx-x64 linux)
+          for i in "${!channels[@]}"; do
+            c="${channels[$i]}"
+            publish=""; [ "$i" -eq $(( ${#channels[@]} - 1 )) ] && publish="--publish"
+            vpk upload github --repoUrl ${{ github.server_url }}/${{ github.repository }} \
+              --outputDir "releases-$c" --channel "$c" --merge $publish \
+              --releaseName "tmax.net $v" --tag "v$v" --token ${{ secrets.GITHUB_TOKEN }}
+          done

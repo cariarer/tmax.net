@@ -69,11 +69,19 @@ Data lives in `~/Library/Application Support/tmax.net` (macOS), `%APPDATA%\tmax.
 
 ## Releases and updates
 
-Push a tag `vX.Y.Z` (or run the *Release* workflow manually). `.github/workflows/release.yml` publishes
-self-contained builds for win-x64, win-arm64, osx-arm64, osx-x64 and linux-x64, packs them with
-[Velopack](https://velopack.io) and uploads installers plus update packages to the GitHub release.
+Push a tag `vX.Y.Z` (or run the *Release* workflow manually with a version). `.github/workflows/release.yml`
+builds and tests on each platform, publishes self-contained apps for win-x64, win-arm64, osx-arm64,
+osx-x64 and linux-x64, packs them with [Velopack](https://velopack.io) (one update channel per
+platform, delta updates from the previous release) and uploads everything into a single GitHub
+release, which is published after the last upload. Per platform you get a setup
+(`tmax.net-<channel>-Setup.exe` / `.pkg` / `.AppImage`), a portable zip and the update packages.
 The build bakes the repository URL into the app (`-p:TmaxUpdateRepo=…`), so installed copies update
-themselves from that repo's releases. Dev builds never update. There is no telemetry.
+themselves from this repo's releases. Dev builds never update. There is no telemetry. Installers are
+not code-signed yet.
+
+```sh
+git tag v0.2.0 && git push origin v0.2.0
+```
 
 `.github/workflows/ci.yml` builds and runs all tests (xUnit, vitest, RPC smoke test) on Windows, macOS and Linux.
 
