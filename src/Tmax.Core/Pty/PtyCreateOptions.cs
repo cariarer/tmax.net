@@ -19,9 +19,15 @@ public sealed record PtyCreateOptions
 
     public IReadOnlyDictionary<string, string>? Env { get; init; }
 
+    /// <summary>Windows only: run the WSL distro with this name (Cwd is then a Linux path).</summary>
+    public string? WslDistro { get; init; }
+
     public int Cols { get; init; } = 80;
 
     public int Rows { get; init; } = 24;
 }
+
+/// <summary>Counters for the diagnostics overlay (same fields as the original PtyStats). Times in Unix ms.</summary>
+public sealed record PtyStats(int Pid, long WriteCount, long LastWriteTime, long DataCount, long LastDataTime, long DataBytes);
 
 public sealed record PtyInfo(string Id, int Pid, string ShellPath, string Cwd, int Cols, int Rows);

@@ -64,7 +64,14 @@ public static class Program
         builder.Services.AddSingleton(_ => new ConfigStore());
         builder.Services.AddSingleton(_ => new SessionStore());
         // Spawning is limited to the shells in the config, read fresh on every spawn.
-        builder.Services.AddSingleton(sp => new PtyManager(() => sp.GetRequiredService<ConfigStore>().Shells));
+        builder.Services.AddSingleton(sp =>
+        {
+            var rpc = sp.GetRequiredService<RpcServer>();
+            var titles = new PaneTitleFiles(
+                PaneTitleFiles.PrepareProcessDir(Path.Combine(AppPaths.DataDir, "pane-titles")),
+                (id, title) => rpc.Broadcast(PtyChannels.ExternalTitle, id, title));
+            return new PtyManager(() => sp.GetRequiredService<ConfigStore>().Shells, titles);
+        });
 
         var app = builder.Build();
         var rpc = app.Services.GetRequiredService<RpcServer>();

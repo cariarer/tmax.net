@@ -1,3 +1,5 @@
+using System.Collections.Concurrent;
+using System.Text;
 using Tmax.Core.Pty;
 
 namespace Tmax.App.Rpc;
@@ -11,11 +13,17 @@ public static class PtyChannels
     public const string Resize = "pty:resize";
     public const string Kill = "pty:kill";
     public const string Exit = "pty:exit";
+    public const string ExternalTitle = "pty:externalTitle";
 
     public static void Register(RpcServer rpc, PtyManager pty)
     {
-        pty.DataReceived += (id, data) => rpc.Broadcast(Data, id, data);
-        pty.Exited += (id, code) => rpc.Broadcast(Exit, id, code);
+        var batcher = new OutputBatcher((id, data) => rpc.Broadcast(Data, id, data));
+        pty.DataReceived += batcher.Add;
+        pty.Exited += (id, code) =>
+        {
+            batcher.Remove(id); // last output goes out before the exit event
+            rpc.Broadcast(Exit, id, code);
+        };
 
         rpc.Handle(Create, async (args, ct) =>
         {
@@ -33,5 +41,58 @@ public static class PtyChannels
             pty.Kill(args.Get<string>(0));
             return Task.CompletedTask;
         });
+        rpc.Handle("pty:getDiag", (args, _) => Task.FromResult<object?>(pty.GetStats(args.Get<string>(0))));
+        rpc.Handle("pty:getChildProcesses", async (args, _) => await pty.GetChildProcessNamesAsync(args.Get<string>(0)));
+        rpc.Handle("pty:getExternalTitle", (args, _) => Task.FromResult<object?>(pty.GetExternalTitle(args.Get<string>(0))));
+        rpc.Handle("pty:disableExternalTitle", (args, _) =>
+        {
+            pty.DisableExternalTitle(args.Get<string>(0));
+            return Task.CompletedTask;
+        });
+    }
+
+    /// <summary>
+    /// Coalesces output per pane and flushes at most every 12 ms (as the original did), so bursts
+    /// (e.g. `cat` of a large file, resume from sleep) become a few big frames instead of thousands.
+    /// </summary>
+    private sealed class OutputBatcher(Action<string, string> flush)
+    {
+        private const int IntervalMs = 12;
+        private readonly ConcurrentDictionary<string, StringBuilder> _pending = new();
+        private int _scheduled;
+
+        public void Add(string id, string data)
+        {
+            var sb = _pending.GetOrAdd(id, _ => new StringBuilder());
+            lock (sb) sb.Append(data);
+            if (Interlocked.Exchange(ref _scheduled, 1) == 0)
+                _ = Task.Delay(IntervalMs).ContinueWith(_ => FlushAll(), TaskScheduler.Default);
+        }
+
+        public void Flush(string id)
+        {
+            if (!_pending.TryGetValue(id, out var sb)) return;
+            string text;
+            lock (sb)
+            {
+                if (sb.Length == 0) return;
+                text = sb.ToString();
+                sb.Clear();
+            }
+            flush(id, text);
+        }
+
+        private void FlushAll()
+        {
+            Volatile.Write(ref _scheduled, 0);
+            foreach (var id in _pending.Keys) Flush(id);
+        }
+
+        /// <summary>Flushes and forgets a pane (on exit; no output can follow).</summary>
+        public void Remove(string id)
+        {
+            Flush(id);
+            _pending.TryRemove(id, out _);
+        }
     }
 }

@@ -22,7 +22,7 @@ public static class PendingChannels
             "copilot:getRecentPrompts", "claude-code:listSessions", "claude-code:searchSessions",
             "claude-code:getPrompts",
             // process tree, fonts
-            "pty:getChildProcesses", "system:getFonts",
+"system:getFonts",
             // files, git, backlog
             "backlog:listTasks");
 
@@ -30,12 +30,11 @@ public static class PendingChannels
             "copilot:getSession", "copilot:startWatching", "copilot:stopWatching", "claude-code:getSession",
             "claude-code:startWatching", "claude-code:stopWatching", "ai:invalidateCaches", "ai:getSessionTimeline",
             "version:getUpdate", "version:checkNow", "version:restartAndUpdate",
-            "pty:getDiag", "pty:disableExternalTitle",
             "transparency:setMaterial",
             "backlog:getTask", "backlog:pickFolder",
             "detach:close", "detach:focus", "backlogWindow:close");
 
-        Value(rpc, "", "pty:getExternalTitle", "version:getChangelog", "diag:getLogPath", "diag:readTail");
+        Value(rpc, "", "version:getChangelog", "diag:getLogPath", "diag:readTail");
         Value(rpc, false, "transparency:platformSupports");
 
         Value(rpc, notOk,

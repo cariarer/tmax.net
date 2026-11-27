@@ -11,6 +11,7 @@ public sealed class PtySession : IAsyncDisposable
     private readonly CancellationTokenSource _cts = new();
     private readonly Task _readLoop;
     private int _exited;
+    private long _writeCount, _lastWriteTime, _dataCount, _lastDataTime, _dataBytes;
 
     internal PtySession(PtyInfo info, IPtyConnection connection, Action<PtySession, string> onData, Action<PtySession, int?> onExit)
     {
@@ -28,9 +29,14 @@ public sealed class PtySession : IAsyncDisposable
 
     public bool HasExited => Volatile.Read(ref _exited) == 1;
 
+    public PtyStats Stats => new(Info.Pid, Interlocked.Read(ref _writeCount), Interlocked.Read(ref _lastWriteTime),
+        Interlocked.Read(ref _dataCount), Interlocked.Read(ref _lastDataTime), Interlocked.Read(ref _dataBytes));
+
     public async Task WriteAsync(string data, CancellationToken ct = default)
     {
         if (HasExited) return;
+        Interlocked.Increment(ref _writeCount);
+        Interlocked.Exchange(ref _lastWriteTime, DateTimeOffset.UtcNow.ToUnixTimeMilliseconds());
         var bytes = Encoding.UTF8.GetBytes(data);
         await _writeLock.WaitAsync(ct).ConfigureAwait(false);
         try
@@ -74,6 +80,9 @@ public sealed class PtySession : IAsyncDisposable
             {
                 var read = await _connection.ReaderStream.ReadAsync(bytes, _cts.Token).ConfigureAwait(false);
                 if (read <= 0) break;
+                Interlocked.Increment(ref _dataCount);
+                Interlocked.Add(ref _dataBytes, read);
+                Interlocked.Exchange(ref _lastDataTime, DateTimeOffset.UtcNow.ToUnixTimeMilliseconds());
                 var count = decoder.GetChars(bytes, 0, read, chars, 0, flush: false);
                 if (count == 0) continue;
                 var text = new string(chars, 0, count);
