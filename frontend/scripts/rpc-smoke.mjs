@@ -84,8 +84,11 @@ await invoke('session:save', { tabs: ['a'] });
 if ((await invoke('session:load'))?.tabs?.[0] !== 'a') fail('session round trip');
 console.log('ok  session save/load');
 
-if (!Array.isArray(await invoke('copilot:listSessions'))) fail('pending channel should answer []');
-console.log('ok  not-yet-ported channels answer with defaults');
+for (const provider of ['copilot', 'claude-code']) {
+  const list = await invoke(`${provider}:listSessions`, 5);
+  if (!Array.isArray(list?.sessions) || typeof list.totalEligible !== 'number') fail(`${provider}:listSessions has the wrong shape`);
+}
+console.log('ok  AI session lists have the renderer shape');
 
 try {
   await invoke('pty:create', { id: 'x', shellPath: '/usr/bin/env', cols: 80, rows: 24 });

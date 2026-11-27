@@ -104,6 +104,8 @@ public static class Program
         GitFileChannels.Register(rpc);
         WindowChannels.Register(rpc, app.Services.GetRequiredService<WindowManager>());
         BacklogChannels.Register(rpc, app.Services.GetRequiredService<WindowManager>());
+        AiSessionChannels.Register(rpc, config, app.Services.GetRequiredService<SessionStore>(), pty,
+            app.Services.GetRequiredService<WindowManager>(), app.Services.GetRequiredService<ILoggerFactory>().CreateLogger("ai-sessions"));
         PendingChannels.Register(rpc);
 
         app.UseWebSockets();

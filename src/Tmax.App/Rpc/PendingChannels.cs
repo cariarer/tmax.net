@@ -13,20 +13,7 @@ public static class PendingChannels
 
     public static void Register(RpcServer rpc)
     {
-        var emptyList = Array.Empty<object>();
-
-        Value(rpc, emptyList,
-            // AI session monitors
-            "copilot:listSessions", "copilot:searchSessions", "copilot:getPrompts", "copilot:searchPrompts",
-            "copilot:getRecentPrompts", "claude-code:listSessions", "claude-code:searchSessions",
-            "claude-code:getPrompts");
-
-        Value(rpc, null,
-            "copilot:getSession", "copilot:startWatching", "copilot:stopWatching", "claude-code:getSession",
-            "claude-code:startWatching", "claude-code:stopWatching", "ai:invalidateCaches", "ai:getSessionTimeline",
-            "version:getUpdate", "version:checkNow", "version:restartAndUpdate",
-            "transparency:setMaterial");
-
+        Value(rpc, null, "version:getUpdate", "version:checkNow", "version:restartAndUpdate", "transparency:setMaterial");
         Value(rpc, "", "version:getChangelog");
         Value(rpc, false, "transparency:platformSupports");
     }

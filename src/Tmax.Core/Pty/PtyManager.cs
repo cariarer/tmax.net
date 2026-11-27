@@ -83,6 +83,17 @@ public sealed partial class PtyManager : IAsyncDisposable
     /// <summary>Raised once per session when its process exits.</summary>
     public event Action<string, int?>? Exited;
 
+    /// <summary>True when the first WSL pane opens, false when the last one closes (TASK-158).</summary>
+    public event Action<bool>? WslActiveChanged;
+
+    private readonly ConcurrentDictionary<string, byte> _wslPanes = new();
+
+    private void TrackWsl(string id, bool add)
+    {
+        if (add ? _wslPanes.TryAdd(id, 0) && _wslPanes.Count == 1 : _wslPanes.TryRemove(id, out _) && _wslPanes.IsEmpty)
+            WslActiveChanged?.Invoke(add);
+    }
+
     public IReadOnlyList<ShellProfile> Profiles => _profiles();
 
     public IReadOnlyCollection<PtySession> Sessions => _sessions.Values.ToArray();
@@ -184,6 +195,7 @@ public sealed partial class PtyManager : IAsyncDisposable
             onExit: (s, code) =>
             {
                 _sessions.TryRemove(s.Id, out _);
+                TrackWsl(s.Id, add: false);
                 _titleFiles?.Release(s.Id);
                 Exited?.Invoke(s.Id, code);
             });
@@ -194,6 +206,7 @@ public sealed partial class PtyManager : IAsyncDisposable
             throw new InvalidOperationException($"Pane id already in use: {opts.Id}");
         }
 
+        if (isWsl) TrackWsl(opts.Id, add: true);
         if (!isWsl && shellName.StartsWith("zsh"))
             _ = InjectZshIntegrationAsync(session);
 

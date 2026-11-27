@@ -75,6 +75,9 @@ public sealed class WindowManager(RpcServer rpc, ILogger<WindowManager> logger)
         return result is { Length: > 0 } ? result[0] : null;
     }
 
+    /// <summary>OS notification (toast / Notification Center / libnotify) via the main window.</summary>
+    public void Notify(string title, string body) => OnUi(() => _main?.SendNotification(title, body));
+
     public static string DetachedKey(string terminalId) => DetachedPrefix + terminalId;
 
     /// <summary>Title of the window a renderer runs in (renderers mirror document.title here).</summary>

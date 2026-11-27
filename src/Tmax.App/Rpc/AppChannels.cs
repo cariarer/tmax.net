@@ -59,8 +59,6 @@ public static class AppChannels
             return Task.CompletedTask;
         });
         rpc.Handle("session:load", (_, _) => Task.FromResult<object?>(noRestore ? null : session.Load()));
-        // Used by OS notifications for AI sessions (not ported yet); accepted and ignored.
-        rpc.Handle("session:nameOverridesSync", (_, _) => Task.CompletedTask);
 
         // ── Shell ────────────────────────────────────────────────────
         rpc.Handle("shell:openPath", (args, _) =>
