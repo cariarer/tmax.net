@@ -6,7 +6,7 @@ public sealed class BacklogTests : IDisposable
 {
     private readonly string _project = Directory.CreateTempSubdirectory("tmax-backlog-").FullName;
 
-    public void Dispose() => Directory.Delete(_project, recursive: true);
+    public void Dispose() => TestDirs.Delete(_project);
 
     private string TasksDir => Path.Combine(_project, "backlog", "tasks");
 

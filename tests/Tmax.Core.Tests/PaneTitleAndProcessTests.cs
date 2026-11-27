@@ -13,7 +13,7 @@ public sealed class PaneTitleAndProcessTests : IDisposable
 
     public void Dispose()
     {
-        try { Directory.Delete(_dir, recursive: true); } catch (IOException) { }
+        TestDirs.Delete(_dir);
     }
 
     private PaneTitleFiles Create() => new(Path.Combine(_dir, "p"), (id, t) => _events.Enqueue((id, t)));

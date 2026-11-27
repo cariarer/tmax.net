@@ -13,7 +13,7 @@ public sealed class AiSessionTests : IDisposable
     public void Dispose()
     {
         SqliteConnection.ClearAllPools();
-        try { Directory.Delete(_dir, recursive: true); } catch (IOException) { }
+        TestDirs.Delete(_dir);
     }
 
     private string WriteJsonl(string path, params object[] lines)

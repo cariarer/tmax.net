@@ -11,7 +11,7 @@ public sealed class ConfigStoreTests : IDisposable
 
     private static JsonObject Defaults() => DefaultConfig.Create([new ShellProfile("sh", "sh", "/bin/sh", [])]);
 
-    public void Dispose() => Directory.Delete(_dir, recursive: true);
+    public void Dispose() => TestDirs.Delete(_dir);
 
     [Fact]
     public void First_start_writes_defaults_in_the_original_shape()

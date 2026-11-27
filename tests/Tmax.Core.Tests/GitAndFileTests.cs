@@ -23,7 +23,7 @@ public sealed class GitAndFileTests : IDisposable
 
     public void Dispose()
     {
-        try { Directory.Delete(_root, recursive: true); } catch (IOException) { }
+        TestDirs.Delete(_root);
     }
 
     private void Git(params string[] args) => ProcessRunner.RunAsync("git", args, Repo).GetAwaiter().GetResult();

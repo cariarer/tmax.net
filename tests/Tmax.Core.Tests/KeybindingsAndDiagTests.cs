@@ -7,7 +7,7 @@ public sealed class KeybindingsAndDiagTests : IDisposable
 {
     private readonly string _dir = Directory.CreateTempSubdirectory("tmax-kb-").FullName;
 
-    public void Dispose() => Directory.Delete(_dir, recursive: true);
+    public void Dispose() => TestDirs.Delete(_dir);
 
     [Fact]
     public void Comments_trailing_commas_and_bad_entries_are_tolerated()
