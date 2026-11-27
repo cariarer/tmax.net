@@ -103,6 +103,7 @@ public static class Program
             app.Services.GetRequiredService<ILoggerFactory>().CreateLogger("tmax"));
         GitFileChannels.Register(rpc);
         WindowChannels.Register(rpc, app.Services.GetRequiredService<WindowManager>());
+        BacklogChannels.Register(rpc, app.Services.GetRequiredService<WindowManager>());
         PendingChannels.Register(rpc);
 
         app.UseWebSockets();

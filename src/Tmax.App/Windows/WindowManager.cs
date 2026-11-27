@@ -66,6 +66,15 @@ public sealed class WindowManager(RpcServer rpc, ILogger<WindowManager> logger)
         w.SetTopMost(false);
     }
 
+    /// <summary>Native "choose folder" dialog on the main window; null when cancelled or unavailable.</summary>
+    public async Task<string?> PickFolderAsync(string title, string? defaultPath)
+    {
+        var main = _main ?? throw new InvalidOperationException("Folder picker is only available in the desktop app.");
+        var start = !string.IsNullOrEmpty(defaultPath) && Directory.Exists(defaultPath) ? Path.GetFullPath(defaultPath) : null;
+        var result = await main.ShowOpenFolderAsync(title, start, false);
+        return result is { Length: > 0 } ? result[0] : null;
+    }
+
     public static string DetachedKey(string terminalId) => DetachedPrefix + terminalId;
 
     /// <summary>Title of the window a renderer runs in (renderers mirror document.title here).</summary>
