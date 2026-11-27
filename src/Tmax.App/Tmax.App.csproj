@@ -1,0 +1,45 @@
+<Project Sdk="Microsoft.NET.Sdk.Web">
+
+  <PropertyGroup>
+    <TargetFramework>net10.0</TargetFramework>
+    <Nullable>enable</Nullable>
+    <ImplicitUsings>enable</ImplicitUsings>
+    <AssemblyName>tmax</AssemblyName>
+    <RootNamespace>Tmax.App</RootNamespace>
+    <!-- No console window on Windows; plain executable elsewhere. -->
+    <OutputType Condition="$([MSBuild]::IsOSPlatform('Windows')) Or $(RuntimeIdentifier.StartsWith('win'))">WinExe</OutputType>
+    <OutputType Condition="'$(OutputType)' == ''">Exe</OutputType>
+    <FrontendDir>$(MSBuildThisFileDirectory)..\..\frontend\</FrontendDir>
+  </PropertyGroup>
+
+  <ItemGroup>
+    <ProjectReference Include="..\Tmax.Core\Tmax.Core.csproj" />
+    <PackageReference Include="Photino.NET" Version="4.0.16" />
+  </ItemGroup>
+
+  <!--
+    The React frontend is built by Vite into frontend/dist and served by Kestrel from wwwroot.
+    Pass -p:SkipFrontend=true when iterating on the backend only (or when using TMAX_DEV_URL).
+  -->
+  <!--
+    Plain copy instead of Content items: the Web SDK's static-web-assets pipeline only sees files
+    that exist at evaluation time and rejects ones injected later.
+  -->
+  <Target Name="BuildFrontend" AfterTargets="Build" Condition="'$(SkipFrontend)' != 'true'">
+    <Exec Command="npm ci --no-audit --no-fund" WorkingDirectory="$(FrontendDir)" Condition="!Exists('$(FrontendDir)node_modules')" />
+    <Exec Command="npm run build" WorkingDirectory="$(FrontendDir)" />
+    <ItemGroup>
+      <_FrontendFiles Include="$(FrontendDir)dist\**\*" />
+    </ItemGroup>
+    <RemoveDir Directories="$(OutDir)wwwroot" />
+    <Copy SourceFiles="@(_FrontendFiles)" DestinationFiles="@(_FrontendFiles->'$(OutDir)wwwroot\%(RecursiveDir)%(Filename)%(Extension)')" />
+  </Target>
+
+  <Target Name="PublishFrontend" AfterTargets="Publish">
+    <ItemGroup>
+      <_FrontendPublishFiles Include="$(OutDir)wwwroot\**\*" />
+    </ItemGroup>
+    <Copy SourceFiles="@(_FrontendPublishFiles)" DestinationFiles="@(_FrontendPublishFiles->'$(PublishDir)wwwroot\%(RecursiveDir)%(Filename)%(Extension)')" />
+  </Target>
+
+</Project>

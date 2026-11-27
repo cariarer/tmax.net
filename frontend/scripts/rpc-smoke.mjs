@@ -1,0 +1,92 @@
+// End-to-end smoke test of the backend over the real WebSocket protocol.
+// Starts `tmax --headless`, connects like the frontend would, spawns a shell,
+// runs a command and checks the output. Also checks that a wrong token and a
+// shell outside the profiles are refused. Usage: npm run test:rpc  (after dotnet build)
+import { spawn } from 'node:child_process';
+import { existsSync } from 'node:fs';
+import { dirname, join } from 'node:path';
+import { fileURLToPath } from 'node:url';
+
+const root = join(dirname(fileURLToPath(import.meta.url)), '..', '..');
+const binDir = join(root, 'src', 'Tmax.App', 'bin', 'Debug', 'net10.0');
+const exe = join(binDir, process.platform === 'win32' ? 'tmax.exe' : 'tmax');
+if (!existsSync(exe)) throw new Error(`Build first: ${exe} not found`);
+
+const host = spawn(exe, ['--headless'], { stdio: ['ignore', 'pipe', 'inherit'] });
+const fail = (msg) => {
+  console.error(`FAIL: ${msg}`);
+  host.kill();
+  process.exit(1);
+};
+setTimeout(() => fail('timeout'), 20000).unref();
+
+const uiUrl = await new Promise((resolve) => {
+  let buf = '';
+  host.stdout.on('data', (chunk) => {
+    buf += chunk;
+    const m = buf.match(/TMAX_UI_URL=(\S+)/);
+    if (m) resolve(m[1]);
+  });
+});
+const params = new URLSearchParams(new URL(uiUrl).hash.slice(1));
+const port = params.get('port');
+const token = params.get('token');
+
+const rejected = (url) =>
+  new Promise((resolve) => {
+    const ws = new WebSocket(url);
+    ws.onopen = () => { ws.close(); resolve(false); };
+    ws.onerror = () => resolve(true);
+  });
+
+if (!(await rejected(`ws://127.0.0.1:${port}/ws?token=wrong`))) fail('wrong token was accepted');
+console.log('ok  wrong token refused');
+
+const ws = new WebSocket(`ws://127.0.0.1:${port}/ws?token=${token}`);
+await new Promise((resolve, reject) => { ws.onopen = resolve; ws.onerror = reject; });
+console.log('ok  connected with token');
+
+let nextId = 1;
+const pending = new Map();
+let output = '';
+const invoke = (channel, ...args) => new Promise((resolve, reject) => {
+  const id = nextId++;
+  pending.set(id, { resolve, reject });
+  ws.send(JSON.stringify({ type: 'invoke', id, channel, args }));
+});
+ws.onmessage = (ev) => {
+  const msg = JSON.parse(ev.data);
+  if (msg.type === 'reply') {
+    const p = pending.get(msg.id);
+    pending.delete(msg.id);
+    msg.error != null ? p.reject(new Error(msg.error)) : p.resolve(msg.result);
+  } else if (msg.channel === 'pty:data') {
+    output += msg.args[1];
+  }
+};
+
+const info = await invoke('platform:getInfo');
+console.log(`ok  platform:getInfo -> ${info.platform}`);
+
+try {
+  await invoke('pty:create', { id: 'x', shellPath: '/usr/bin/env', cols: 80, rows: 24 });
+  fail('shell outside profiles was accepted');
+} catch {
+  console.log('ok  foreign shell refused');
+}
+
+const created = await invoke('pty:create', { id: 'smoke', shellPath: '', cols: 80, rows: 24 });
+console.log(`ok  pty:create -> pid ${created.pid}`);
+const cmd = process.platform === 'win32' ? 'echo tmax-%TMAX_PANE_ID%-ok\r' : 'echo tmax-$TMAX_PANE_ID-ok\r';
+ws.send(JSON.stringify({ type: 'send', channel: 'pty:write', args: ['smoke', cmd] }));
+
+const deadline = Date.now() + 10000;
+while (!output.includes('tmax-smoke-ok') && Date.now() < deadline) await new Promise((r) => setTimeout(r, 50));
+if (!output.includes('tmax-smoke-ok')) fail(`marker not seen; output:\n${output}`);
+console.log('ok  command output received');
+
+await invoke('pty:kill', 'smoke');
+ws.close();
+host.kill();
+console.log('PASS');
+process.exit(0);

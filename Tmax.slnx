@@ -1,0 +1,9 @@
+<Solution>
+  <Folder Name="/src/">
+    <Project Path="src/Tmax.App/Tmax.App.csproj" />
+    <Project Path="src/Tmax.Core/Tmax.Core.csproj" />
+  </Folder>
+  <Folder Name="/tests/">
+    <Project Path="tests/Tmax.Core.Tests/Tmax.Core.Tests.csproj" />
+  </Folder>
+</Solution>
