@@ -165,4 +165,10 @@ public static class RpcArgs
         index < args.Length
             ? args[index].Deserialize<T>(RpcServer.Json) ?? throw new ArgumentException($"Argument {index} is null")
             : throw new ArgumentException($"Missing argument {index}");
+
+    /// <summary>Optional argument: missing, null or undefined (sent as null) give default.</summary>
+    public static T? Opt<T>(this JsonElement[] args, int index) =>
+        index < args.Length && args[index].ValueKind is not (JsonValueKind.Null or JsonValueKind.Undefined)
+            ? args[index].Deserialize<T>(RpcServer.Json)
+            : default;
 }

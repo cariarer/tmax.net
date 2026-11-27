@@ -56,6 +56,21 @@ public class PtyManagerTests
     }
 
     [Fact]
+    public async Task Writes_racing_with_shell_exit_do_not_throw()
+    {
+        await using var manager = new PtyManager([TestShell()]);
+        await manager.CreateAsync(new PtyCreateOptions { Id = "t5" });
+        var session = manager.Get("t5")!;
+
+        await session.WriteAsync("exit\r");
+        var deadline = DateTime.UtcNow + Timeout;
+        while (!session.HasExited && DateTime.UtcNow < deadline)
+            await session.WriteAsync("x"); // keeps writing straight through the exit
+
+        Assert.True(session.HasExited);
+    }
+
+    [Fact]
     public async Task Shell_outside_profiles_is_rejected()
     {
         await using var manager = new PtyManager([TestShell()]);

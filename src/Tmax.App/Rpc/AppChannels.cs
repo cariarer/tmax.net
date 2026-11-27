@@ -2,7 +2,7 @@ using System.Reflection;
 using System.Security.Cryptography;
 using System.Text.Json;
 using System.Text.Json.Nodes;
-using Tmax.App.Platform;
+using Tmax.Core.Platform;
 using Tmax.Core.Config;
 
 namespace Tmax.App.Rpc;

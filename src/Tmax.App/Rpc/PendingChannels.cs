@@ -24,7 +24,7 @@ public static class PendingChannels
             // process tree, fonts
             "pty:getChildProcesses", "system:getFonts",
             // files, git, backlog
-            "file:list", "git:getBranches", "backlog:listTasks");
+            "backlog:listTasks");
 
         Value(rpc, null,
             "copilot:getSession", "copilot:startWatching", "copilot:stopWatching", "claude-code:getSession",
@@ -32,22 +32,19 @@ public static class PendingChannels
             "version:getUpdate", "version:checkNow", "version:restartAndUpdate",
             "pty:getDiag", "pty:disableExternalTitle",
             "transparency:setMaterial",
-            "file:read", "backlog:getTask", "backlog:pickFolder",
+            "backlog:getTask", "backlog:pickFolder",
             "detach:close", "detach:focus", "backlogWindow:close");
 
         Value(rpc, "", "pty:getExternalTitle", "version:getChangelog", "diag:getLogPath", "diag:readTail");
         Value(rpc, false, "transparency:platformSupports");
 
         Value(rpc, notOk,
-            "file:reveal", "file:rename", "file:delete",
             "backlog:editTask", "backlog:createTask", "backlog:archiveTask", "backlog:deleteTask",
             "backlog:validateProject", "backlog:initProject", "backlog:saveImage");
-        Value(rpc, new { success = false, error = NotYet }, "git:createWorktree", "git:deleteWorktree");
 
         // Things the user explicitly triggered: fail visibly instead of silently doing nothing.
         Fail(rpc,
-            "diff:resolveGitRoot", "diff:getCodeChanges", "diff:getDiff", "diff:getAnnotatedFile",
-            "git:listWorktrees", "detach:create", "backlogWindow:open");
+            "detach:create", "backlogWindow:open");
     }
 
     private static void Value(RpcServer rpc, object? value, params string[] channels)

@@ -74,6 +74,7 @@ public static class Program
         PlatformChannels.Register(rpc, pty);
         AppChannels.Register(rpc, config, app.Services.GetRequiredService<SessionStore>(),
             app.Services.GetRequiredService<ILoggerFactory>().CreateLogger("tmax"));
+        GitFileChannels.Register(rpc);
         PendingChannels.Register(rpc);
 
         app.UseWebSockets();

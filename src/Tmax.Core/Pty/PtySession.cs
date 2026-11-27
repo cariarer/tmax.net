@@ -38,6 +38,11 @@ public sealed class PtySession : IAsyncDisposable
             await _connection.WriterStream.WriteAsync(bytes, ct).ConfigureAwait(false);
             await _connection.WriterStream.FlushAsync(ct).ConfigureAwait(false);
         }
+        // The shell can exit between the HasExited check and the write. Writing to the closed
+        // PTY then fails with EBADF, which .NET surfaces as UnauthorizedAccessException.
+        catch (Exception ex) when (ex is IOException or UnauthorizedAccessException or ObjectDisposedException)
+        {
+        }
         finally
         {
             _writeLock.Release();
@@ -77,7 +82,8 @@ public sealed class PtySession : IAsyncDisposable
             }
         }
         catch (OperationCanceledException) { }
-        catch (IOException) { /* PTY closed underneath us: normal on exit */ }
+        // PTY closed underneath us (exit or dispose). EBADF arrives as UnauthorizedAccessException.
+        catch (Exception ex) when (ex is IOException or UnauthorizedAccessException) { }
         catch (ObjectDisposedException) { }
 
         // EOF can arrive before ProcessExited; whichever comes first reports the exit.
