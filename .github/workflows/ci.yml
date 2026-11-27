@@ -1,0 +1,44 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  build:
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [windows-latest, macos-latest, ubuntu-latest]
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-dotnet@v4
+        with:
+          global-json-file: global.json
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '22'
+          cache: npm
+          cache-dependency-path: frontend/package-lock.json
+
+      - name: Build (backend + frontend)
+        run: dotnet build -c Release
+
+      - name: Backend tests
+        run: dotnet test -c Release --no-build
+
+      - name: Frontend unit tests
+        working-directory: frontend
+        run: npm test
+
+      - name: End-to-end RPC smoke test
+        working-directory: frontend
+        env:
+          TMAX_SMOKE_CONFIG: Release
+        run: npm run test:rpc

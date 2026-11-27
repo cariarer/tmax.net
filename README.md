@@ -67,18 +67,31 @@ Data lives in `~/Library/Application Support/tmax.net` (macOS), `%APPDATA%\tmax.
 - `TMAX_PRINT_URL=1` prints the UI URL (with token) for test scripts; never set it in normal use.
 - `npm run typecheck` reports 16 errors that already exist in the original renderer; the build does not run tsc (as in the original).
 
-## Roadmap
+## Releases and updates
 
-1. ✅ Proof of concept: window + backend + one PTY over WebSocket (verified on macOS)
-2. ✅ `terminalAPI` shim over the WebSocket, original React renderer running; config + session persistence
-3. Port services
-   - ✅ PTY (shell integration, title files, process tree, batching), config, session, keybindings.json, diag log
-   - ✅ Git diff, worktrees, file explorer, Backlog board, detached terminal/backlog windows, window titles
-   - ⏳ Copilot / Claude Code session monitors (+ SQLite, WSL sessions, OS notifications)
-   - ⏳ Windows 11 background material (Mica/Acrylic)
-   - ❓ Telemetry and update checker (both talk to the upstream author's services)
-4. Build & CI for all three platforms, installer/updates
-5. Later: MCP server on top of `Tmax.Core`, so agents running in a tmax terminal can control it
+Push a tag `vX.Y.Z` (or run the *Release* workflow manually). `.github/workflows/release.yml` publishes
+self-contained builds for win-x64, win-arm64, osx-arm64, osx-x64 and linux-x64, packs them with
+[Velopack](https://velopack.io) and uploads installers plus update packages to the GitHub release.
+The build bakes the repository URL into the app (`-p:TmaxUpdateRepo=…`), so installed copies update
+themselves from that repo's releases. Dev builds never update. There is no telemetry.
+
+`.github/workflows/ci.yml` builds and runs all tests (xUnit, vitest, RPC smoke test) on Windows, macOS and Linux.
+
+## Status
+
+All IPC channels of the original are implemented (see `src/Tmax.App/Rpc/*Channels.cs`):
+PTY (shell integration, `TMAX_TITLE_FILE`, process tree, batching), config, session, keybindings.json,
+diagnostics log, git diff, worktrees, file explorer, Backlog board, detached terminal/backlog windows,
+Copilot CLI and Claude Code session monitors (SQLite, WSL distros, OS notifications), Windows 11
+backdrop materials, auto-update.
+
+Known gaps:
+- Clicking an OS notification does not focus tmax (Photino has no click callback).
+- Installers are not code-signed: macOS Gatekeeper and Windows SmartScreen will warn on first start.
+- Turning on a Windows backdrop material from "none" takes effect after a restart (WebView2 limitation).
+- The native window was verified on macOS only; Windows/Linux are covered by CI builds and headless tests.
+
+Next: an MCP server on top of `Tmax.Core`, so agents running in a tmax pane can drive tmax.
 
 ## License
 

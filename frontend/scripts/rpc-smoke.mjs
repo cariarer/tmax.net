@@ -10,7 +10,7 @@ import { dirname, join } from 'node:path';
 import { fileURLToPath } from 'node:url';
 
 const root = join(dirname(fileURLToPath(import.meta.url)), '..', '..');
-const binDir = join(root, 'src', 'Tmax.App', 'bin', 'Debug', 'net10.0');
+const binDir = join(root, 'src', 'Tmax.App', 'bin', process.env.TMAX_SMOKE_CONFIG || 'Debug', 'net10.0');
 const exe = join(binDir, process.platform === 'win32' ? 'tmax.exe' : 'tmax');
 if (!existsSync(exe)) throw new Error(`Build first: ${exe} not found`);
 
@@ -99,7 +99,8 @@ try {
 
 const created = await invoke('pty:create', { id: 'smoke', shellPath: '', cols: 80, rows: 24 });
 console.log(`ok  pty:create -> pid ${created.pid}`);
-const cmd = process.platform === 'win32' ? 'echo tmax-%TMAX_PANE_ID%-ok\r' : 'echo tmax-$TMAX_PANE_ID-ok\r';
+// Windows' default profile is PowerShell (pwsh or Windows PowerShell), Unix a POSIX shell.
+const cmd = process.platform === 'win32' ? 'echo "tmax-$env:TMAX_PANE_ID-ok"\r' : 'echo tmax-$TMAX_PANE_ID-ok\r';
 ws.send(JSON.stringify({ type: 'send', channel: 'pty:write', args: ['smoke', cmd] }));
 
 const deadline = Date.now() + 10000;
