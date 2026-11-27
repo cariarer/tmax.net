@@ -25,6 +25,7 @@ const fail = (msg) => {
 setTimeout(() => fail('timeout'), 20000).unref();
 
 const uiUrl = await new Promise((resolve) => {
+  host.once('exit', (code) => fail(`backend exited early (code ${code}); is DOTNET_ROOT set for .NET 10?`));
   let buf = '';
   host.stdout.on('data', (chunk) => {
     buf += chunk;
@@ -107,6 +108,7 @@ await invoke('pty:kill', 'smoke');
 
 // Graceful shutdown must not hang on open connections (it did until the sockets were tied to app shutdown).
 if (process.platform !== 'win32') {
+  host.removeAllListeners('exit');
   const exited = new Promise((resolve) => host.once('exit', resolve));
   const closed = new Promise((resolve) => { ws.onclose = resolve; });
   host.kill('SIGTERM');
