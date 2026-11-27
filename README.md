@@ -62,13 +62,21 @@ Data lives in `~/Library/Application Support/tmax.net` (macOS), `%APPDATA%\tmax.
 - Clipboard: the WebView can read the clipboard synchronously only inside a `paste` event.
   Ctrl/Cmd+V and the context menu use `terminalAPI.clipboardSnapshot()` (async) instead.
 - The terminal context menu is HTML instead of a native menu.
+- File delete uses `/usr/bin/trash` (macOS 15+) or Finder, `gio trash` on Linux, the Recycle Bin on Windows.
+- Process tree on Windows uses a Toolhelp32 snapshot instead of `wmic`.
+- `TMAX_PRINT_URL=1` prints the UI URL (with token) for test scripts; never set it in normal use.
 - `npm run typecheck` reports 16 errors that already exist in the original renderer; the build does not run tsc (as in the original).
 
 ## Roadmap
 
 1. ✅ Proof of concept: window + backend + one PTY over WebSocket (verified on macOS)
 2. ✅ `terminalAPI` shim over the WebSocket, original React renderer running; config + session persistence
-3. Port services: PTY → Config → Watcher → Git/Worktrees → WSL → SQLite/session monitors → Backlog
+3. Port services
+   - ✅ PTY (shell integration, title files, process tree, batching), config, session, keybindings.json, diag log
+   - ✅ Git diff, worktrees, file explorer, Backlog board, detached terminal/backlog windows, window titles
+   - ⏳ Copilot / Claude Code session monitors (+ SQLite, WSL sessions, OS notifications)
+   - ⏳ Windows 11 background material (Mica/Acrylic)
+   - ❓ Telemetry and update checker (both talk to the upstream author's services)
 4. Build & CI for all three platforms, installer/updates
 5. Later: MCP server on top of `Tmax.Core`, so agents running in a tmax terminal can control it
 
